@@ -63,8 +63,7 @@ async fn main() {
         eprintln!("failed to set pid: {e}");
         std::process::exit(2);
     }
-    if let Err(e) =
-        mo_core::db::update_status(&conn, &cfg.session_id, SessionStatus::Running, None)
+    if let Err(e) = mo_core::db::update_status(&conn, &cfg.session_id, SessionStatus::Running, None)
     {
         eprintln!("failed to set running status: {e}");
         std::process::exit(2);
@@ -110,7 +109,8 @@ async fn main() {
 
     match agent::run_agent(agent_cfg, &mut journal).await {
         Ok(()) => {
-            let _ = mo_core::db::update_status(&conn, &cfg.session_id, SessionStatus::Completed, None);
+            let _ =
+                mo_core::db::update_status(&conn, &cfg.session_id, SessionStatus::Completed, None);
             let _ = journal.append(JournalEventKind::StatusChange {
                 status: SessionStatus::Completed,
                 error: None,

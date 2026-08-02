@@ -14,9 +14,12 @@ const OUTPUT_CAP: usize = 1024 * 1024; // 1 MB
 /// resolved by canonicalization. Returns the resolved path (parent-canonical,
 /// file name preserved).
 pub fn resolve_path(workdir: &Path, raw: &str) -> Result<PathBuf, String> {
-    let workdir_canon = workdir
-        .canonicalize()
-        .map_err(|e| format!("working directory does not exist: {} ({e})", workdir.display()))?;
+    let workdir_canon = workdir.canonicalize().map_err(|e| {
+        format!(
+            "working directory does not exist: {} ({e})",
+            workdir.display()
+        )
+    })?;
     if raw.trim().is_empty() {
         return Err("path must not be empty".to_string());
     }
@@ -29,9 +32,12 @@ pub fn resolve_path(workdir: &Path, raw: &str) -> Result<PathBuf, String> {
     let parent = candidate
         .parent()
         .ok_or_else(|| format!("path has no parent: {raw}"))?;
-    let parent_canon = parent
-        .canonicalize()
-        .map_err(|e| format!("parent directory does not exist: {} ({e})", parent.display()))?;
+    let parent_canon = parent.canonicalize().map_err(|e| {
+        format!(
+            "parent directory does not exist: {} ({e})",
+            parent.display()
+        )
+    })?;
     if !parent_canon.starts_with(&workdir_canon) {
         return Err(format!("path escapes the working directory: {raw}"));
     }
@@ -58,8 +64,7 @@ pub fn resolve_existing(workdir: &Path, raw: &str) -> Result<PathBuf, String> {
 /// Read a UTF-8 file (capped at ~1 MB with an explicit truncation note).
 pub fn read_file(workdir: &Path, raw: &str) -> Result<String, String> {
     let full = resolve_existing(workdir, raw)?;
-    let content = fs::read_to_string(&full)
-        .map_err(|e| format!("failed to read {raw}: {e}"))?;
+    let content = fs::read_to_string(&full).map_err(|e| format!("failed to read {raw}: {e}"))?;
     Ok(cap_output(&content))
 }
 
@@ -76,8 +81,7 @@ pub fn edit_file(
         return Err("old_string must not be empty".to_string());
     }
     let full = resolve_existing(workdir, raw)?;
-    let content = fs::read_to_string(&full)
-        .map_err(|e| format!("failed to read {raw}: {e}"))?;
+    let content = fs::read_to_string(&full).map_err(|e| format!("failed to read {raw}: {e}"))?;
     let matches = content.matches(old_string).count();
     let updated = if replace_all {
         if matches == 0 {
@@ -125,7 +129,10 @@ mod tests {
     #[test]
     fn read_relative_and_absolute() {
         let (_dir, workdir) = setup();
-        assert_eq!(read_file(&workdir, "notes.txt").unwrap(), "line one\nline two\n");
+        assert_eq!(
+            read_file(&workdir, "notes.txt").unwrap(),
+            "line one\nline two\n"
+        );
         assert_eq!(
             read_file(&workdir, &workdir.join("notes.txt").display().to_string()).unwrap(),
             "line one\nline two\n"
@@ -150,7 +157,8 @@ mod tests {
     fn rejects_symlink_escape() {
         let (dir, workdir) = setup();
         fs::write(dir.path().join("secret.txt"), "secret").unwrap();
-        std::os::unix::fs::symlink(dir.path().join("secret.txt"), workdir.join("link.txt")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("secret.txt"), workdir.join("link.txt"))
+            .unwrap();
         assert!(read_file(&workdir, "link.txt").is_err());
     }
 

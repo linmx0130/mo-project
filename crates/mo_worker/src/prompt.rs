@@ -9,10 +9,7 @@ pub fn build_system_prompt(workdir: &Path, subagent_depth: u32) -> String {
         "You are an autonomous coding agent running inside the mo harness. \
          You complete tasks by reasoning and by calling the provided tools.\n\n",
     );
-    prompt.push_str(&format!(
-        "Working directory: {}\n",
-        workdir.display()
-    ));
+    prompt.push_str(&format!("Working directory: {}\n", workdir.display()));
     prompt.push_str(
         "You may read and write files only inside the working directory. \
          Never attempt to access files or run commands that escape it.\n\n",

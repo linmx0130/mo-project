@@ -5,10 +5,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use mo_core::{
-    JournalEventKind, Session, SessionStatus,
-    db, open_db,
-};
+use mo_core::{JournalEventKind, Session, SessionStatus, db, open_db};
 use uuid::Uuid;
 
 use crate::config::MAX_SUBAGENT_DEPTH;
@@ -53,7 +50,8 @@ pub async fn spawn_subagent(ctx: &ToolContext, prompt: &str) -> Result<String, S
 
     // 2. Spawn the child worker (same binary, child session id, depth + 1).
     std::fs::create_dir_all(&session_dir).map_err(|e| e.to_string())?;
-    let log_file = std::fs::File::create(session_dir.join("worker.log")).map_err(|e| e.to_string())?;
+    let log_file =
+        std::fs::File::create(session_dir.join("worker.log")).map_err(|e| e.to_string())?;
     let stderr_file = log_file.try_clone().map_err(|e| e.to_string())?;
     let exe = std::env::current_exe()
         .map_err(|e| format!("cannot resolve worker executable path: {e}"))?;
@@ -105,7 +103,9 @@ pub async fn spawn_subagent(ctx: &ToolContext, prompt: &str) -> Result<String, S
             Some(msg) if !msg.trim().is_empty() => {
                 Ok(format!("[subagent {status}] {msg}{error_note}"))
             }
-            _ => Ok(format!("[subagent {status} — no final message]{error_note}")),
+            _ => Ok(format!(
+                "[subagent {status} — no final message]{error_note}"
+            )),
         };
     }
 }

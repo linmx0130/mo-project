@@ -26,14 +26,17 @@ pub async fn bash(workdir: &Path, command: &str, timeout: Duration) -> Result<St
         .map_err(|e| format!("failed to spawn sh: {e}"))?;
 
     let run = async {
-        child.wait_with_output().await.map_err(|e| format!("failed to wait for command: {e}"))
+        child
+            .wait_with_output()
+            .await
+            .map_err(|e| format!("failed to wait for command: {e}"))
     };
     let output = match tokio::time::timeout(timeout, run).await {
         Err(_) => {
             return Err(format!(
                 "command timed out after {}s: {command}",
                 timeout.as_secs()
-            ))
+            ));
         }
         Ok(result) => result?,
     };
@@ -45,7 +48,10 @@ pub async fn bash(workdir: &Path, command: &str, timeout: Duration) -> Result<St
     ));
     text.push_str(&String::from_utf8_lossy(&output.stdout));
     if !output.stderr.is_empty() {
-        text.push_str(&format!("[stderr]\n{}", String::from_utf8_lossy(&output.stderr)));
+        text.push_str(&format!(
+            "[stderr]\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
     if text.len() > OUTPUT_CAP {
         let cut = text.floor_char_boundary(OUTPUT_CAP);

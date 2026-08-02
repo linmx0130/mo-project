@@ -7,12 +7,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use futures_util::{StreamExt, pin_mut};
-use mo_core::{
-    JournalEventKind, JournalMessage, JournalWriter, Session, ToolCallInfo,
-};
+use mo_core::{JournalEventKind, JournalMessage, JournalWriter, Session, ToolCallInfo};
 use nah_chat::{
-    ChatClient, ChatCompletionParamsBuilder, ChatMessage, ChatMessageContentValue,
-    ToolCallRequest,
+    ChatClient, ChatCompletionParamsBuilder, ChatMessage, ChatMessageContentValue, ToolCallRequest,
 };
 use serde_json::{Value, json};
 
@@ -185,7 +182,7 @@ mod tests {
     };
 
     use axum::{Router, routing::post};
-    use mo_core::{SessionStatus, open_db, db};
+    use mo_core::{SessionStatus, db, open_db};
     use serde_json::{Value, json};
 
     fn delta_role(role: &str) -> Value {
@@ -263,31 +260,24 @@ mod tests {
         let router = Router::new()
             .route(
                 "/chat/completions",
-                post(
-                    |calls: axum::extract::State<Arc<AtomicUsize>>| async move {
-                        let n = calls.fetch_add(1, Ordering::SeqCst);
-                        let body = if n == 0 {
-                            sse_payload(&[
-                                delta_role("assistant"),
-                                delta_tool_call(
-                                    0,
-                                    "call_1",
-                                    "read_file",
-                                    r#"{"path":"notes.txt"}"#,
-                                ),
-                            ])
-                        } else {
-                            sse_payload(&[
-                                delta_role("assistant"),
-                                delta_content("The file says: hello world from notes.\n"),
-                            ])
-                        };
-                        (
-                            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                            body,
-                        )
-                    },
-                ),
+                post(|calls: axum::extract::State<Arc<AtomicUsize>>| async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    let body = if n == 0 {
+                        sse_payload(&[
+                            delta_role("assistant"),
+                            delta_tool_call(0, "call_1", "read_file", r#"{"path":"notes.txt"}"#),
+                        ])
+                    } else {
+                        sse_payload(&[
+                            delta_role("assistant"),
+                            delta_content("The file says: hello world from notes.\n"),
+                        ])
+                    };
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        body,
+                    )
+                }),
             )
             .with_state(calls.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -305,8 +295,7 @@ mod tests {
             auth_token: None,
             subagent_depth: 0,
         };
-        let mut journal =
-            JournalWriter::open(std::path::Path::new(&session.journal_path)).unwrap();
+        let mut journal = JournalWriter::open(std::path::Path::new(&session.journal_path)).unwrap();
         run_agent(agent_cfg, &mut journal).await.unwrap();
 
         // Journal: message(tool-call assistant), tool_call_start, tool_result, message(final).
