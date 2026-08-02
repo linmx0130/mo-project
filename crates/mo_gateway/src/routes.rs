@@ -134,19 +134,17 @@ async fn get_session(
         Some(session) => session,
         None => return Err(ApiError::not_found("session not found")),
     };
-    if session.status == SessionStatus::Running {
-        if let Some(pid) = session.pid {
-            if !process::is_pid_alive(pid) {
-                let _ = db::update_status(
-                    &conn,
-                    &id,
-                    SessionStatus::Failed,
-                    Some("worker died".to_string()),
-                );
-                session.status = SessionStatus::Failed;
-                session.error = Some("worker died".to_string());
-            }
-        }
+    if session.status == SessionStatus::Running
+        && session.pid.is_some_and(|pid| !process::is_pid_alive(pid))
+    {
+        let _ = db::update_status(
+            &conn,
+            &id,
+            SessionStatus::Failed,
+            Some("worker died".to_string()),
+        );
+        session.status = SessionStatus::Failed;
+        session.error = Some("worker died".to_string());
     }
     Ok(Json(session))
 }

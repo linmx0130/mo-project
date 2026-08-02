@@ -33,14 +33,14 @@ pub fn build_system_prompt(workdir: &Path, subagent_depth: u32) -> String {
         ));
     }
     let agents_md = workdir.join("AGENTS.md");
-    if let Ok(content) = std::fs::read_to_string(&agents_md) {
-        if !content.trim().is_empty() {
-            prompt.push_str(&format!(
-                "Project instructions from {}/AGENTS.md:\n{}\n\n",
-                workdir.display(),
-                content.trim()
-            ));
-        }
+    if let Ok(content) = std::fs::read_to_string(&agents_md)
+        && !content.trim().is_empty()
+    {
+        prompt.push_str(&format!(
+            "Project instructions from {}/AGENTS.md:\n{}\n\n",
+            workdir.display(),
+            content.trim()
+        ));
     }
     prompt
 }

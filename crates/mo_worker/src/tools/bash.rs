@@ -15,7 +15,7 @@ pub async fn bash(workdir: &Path, command: &str, timeout: Duration) -> Result<St
     if command.trim().is_empty() {
         return Err("command must not be empty".to_string());
     }
-    let mut child = tokio::process::Command::new("sh")
+    let child = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(command)
         .current_dir(workdir)

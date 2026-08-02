@@ -90,18 +90,16 @@ pub async fn events(
                 warn!(session = %id, "session row missing during SSE; closing");
                 break;
             };
-            if row.status == SessionStatus::Running {
-                if let Some(pid) = row.pid {
-                    if !process::is_pid_alive(pid) {
-                        let conn = db_state.db.lock().unwrap_or_else(|e| e.into_inner());
-                        let _ = db::update_status(
-                            &conn,
-                            &id,
-                            SessionStatus::Failed,
-                            Some("worker died".to_string()),
-                        );
-                    }
-                }
+            if row.status == SessionStatus::Running
+                && row.pid.is_some_and(|pid| !process::is_pid_alive(pid))
+            {
+                let conn = db_state.db.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = db::update_status(
+                    &conn,
+                    &id,
+                    SessionStatus::Failed,
+                    Some("worker died".to_string()),
+                );
             }
             let should_synthesize = match journal_status {
                 None => row.status.rank() > SessionStatus::Pending.rank(),
