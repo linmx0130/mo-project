@@ -294,6 +294,28 @@ async fn sse_streams_journal_events_and_closes_on_terminal() {
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains("\"role\":\"assistant\""), "got: {text}");
     assert!(text.contains("\"status\":\"completed\""), "got: {text}");
+
+    // Connecting with a cursor past everything must NOT re-synthesize the
+    // journaled terminal status (the first poll seeds journal_status from
+    // the whole journal).
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/sessions/{id}/events?after_seq=1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        !text.contains("status_change"),
+        "terminal status should not be re-synthesized, got: {text}"
+    );
 }
 
 fn process_is_alive(pid: u32) -> bool {

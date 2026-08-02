@@ -50,8 +50,12 @@ pub async fn events(
 
     let db_state = state.clone();
     let stream = async_stream::stream! {
-        // None = not yet synced: the first poll reads the whole journal.
-        let mut last_seq: Option<u64> = query.after_seq;
+        // Cursor into the journal. `synced` is false until the first poll,
+        // which reads the whole journal: it seeds journal_status (so a
+        // terminal status the client already saw via history is never
+        // re-synthesized) while only emitting events after the cursor.
+        let mut cursor: Option<u64> = query.after_seq;
+        let mut synced = false;
         let mut journal_status: Option<SessionStatus> = None;
         let mut idle_polls: u32 = 0;
         let mut interval = tokio::time::interval(POLL_INTERVAL);
@@ -61,21 +65,31 @@ pub async fn events(
 
             // 1. Journal tail: emit new events, track last journaled status.
             let mut any_new = false;
-            let events = match last_seq {
-                None => mo_core::read_events(std::path::Path::new(&journal_path)),
-                Some(seq) => read_events_after(std::path::Path::new(&journal_path), seq),
+            let events = if synced {
+                read_events_after(
+                    std::path::Path::new(&journal_path),
+                    cursor.unwrap_or(0),
+                )
+            } else {
+                mo_core::read_events(std::path::Path::new(&journal_path))
             };
             match events {
                 Ok(events) => {
                     for event in events {
-                        last_seq = Some(event.seq);
-                        any_new = true;
                         if let JournalEventKind::StatusChange { status, .. } = &event.kind {
                             journal_status = Some(*status);
                         }
+                        if !synced
+                            && cursor.is_some_and(|c| event.seq <= c)
+                        {
+                            continue;
+                        }
+                        cursor = Some(event.seq);
+                        any_new = true;
                         let payload = serde_json::to_string(&event).unwrap_or_default();
                         yield Ok(Event::default().data(payload));
                     }
+                    synced = true;
                 }
                 Err(e) => warn!(session = %id, "journal read error: {e}"),
             }
@@ -90,7 +104,8 @@ pub async fn events(
                 warn!(session = %id, "session row missing during SSE; closing");
                 break;
             };
-            if row.status == SessionStatus::Running
+            if (row.status == SessionStatus::Running
+                || row.status == SessionStatus::Pending)
                 && row.pid.is_some_and(|pid| !process::is_pid_alive(pid))
             {
                 let conn = db_state.db.lock().unwrap_or_else(|e| e.into_inner());

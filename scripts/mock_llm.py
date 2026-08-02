@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Tiny OpenAI-compatible mock LLM server for manual smoke tests.
+
+Replays canned chat-completion SSE responses. Behavior is keyed on the
+session prompt and a per-connection request counter (ThreadingHTTPServer
+gives each worker its own thread/connection, so parent and subagent
+workers each get their own sequence):
+
+  * prompt contains "subagent" -> request 1 asks to spawn a subagent,
+    request 2 gives the final answer
+  * prompt contains "slow"     -> request 1 asks for `bash sleep 60`
+                                 (use this to test cancel)
+  * otherwise                  -> read_file greeting.txt, then
+                                 bash wc -w greeting.txt, then final answer
+
+Usage: python3 scripts/mock_llm.py [port]
+"""
+import json
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 9001
+
+state = threading.local()
+
+
+def sse(deltas):
+    payload = "".join(
+        f"data: {json.dumps({'choices': [{'delta': d}]})}\n\n" for d in deltas
+    )
+    return (payload + "data: [DONE]\n\n").encode()
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, format, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("content-length", 0))
+        body = json.loads(self.rfile.read(length) or b"{}")
+        n = getattr(state, "count", 0)
+        state.count = n + 1
+        user_msgs = [m for m in body.get("messages", []) if m.get("role") == "user"]
+        prompt = user_msgs[0].get("content", "") if user_msgs else ""
+
+        if "slow" in prompt:
+            deltas = [
+                {"role": "assistant"},
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_slow",
+                            "type": "function",
+                            "function": {
+                                "name": "bash",
+                                "arguments": '{"command": "sleep 60"}',
+                            },
+                        }
+                    ]
+                },
+            ]
+        elif "subagent" in prompt:
+            if n == 0:
+                deltas = [
+                    {"role": "assistant"},
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_sub",
+                                "type": "function",
+                                "function": {
+                                    "name": "spawn_subagent",
+                                    "arguments": (
+                                        '{"prompt": "Subagent task: report the '
+                                        'word count of greeting.txt using bash."}'
+                                    ),
+                                },
+                            }
+                        ]
+                    },
+                ]
+            else:
+                deltas = [
+                    {"role": "assistant"},
+                    {"content": "The subagent reported its result. Everything works."},
+                ]
+        elif n == 0:
+            deltas = [
+                {"role": "assistant"},
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": '{"path": "greeting.txt"}',
+                            },
+                        }
+                    ]
+                },
+            ]
+        elif n == 1:
+            deltas = [
+                {"role": "assistant"},
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_2",
+                            "type": "function",
+                            "function": {
+                                "name": "bash",
+                                "arguments": '{"command": "wc -w greeting.txt"}',
+                            },
+                        }
+                    ]
+                },
+            ]
+        else:
+            deltas = [
+                {"role": "assistant"},
+                {
+                    "content": (
+                        "Smoke test complete: read the greeting and counted "
+                        "its words. All tools worked."
+                    )
+                },
+            ]
+
+        payload = sse(deltas)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+if __name__ == "__main__":
+    print(f"mock LLM listening on http://127.0.0.1:{PORT}", flush=True)
+    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

@@ -134,7 +134,9 @@ async fn get_session(
         Some(session) => session,
         None => return Err(ApiError::not_found("session not found")),
     };
-    if session.status == SessionStatus::Running
+    // Liveness check: a session whose pid is dead is flipped to failed,
+    // whether it ever reached `running` or not.
+    if (session.status == SessionStatus::Running || session.status == SessionStatus::Pending)
         && session.pid.is_some_and(|pid| !process::is_pid_alive(pid))
     {
         let _ = db::update_status(

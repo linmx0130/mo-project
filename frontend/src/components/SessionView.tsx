@@ -54,11 +54,13 @@ export default function SessionView({ session, onStatusChange }: Props) {
   const [cancelling, setCancelling] = useState(false)
   const lastSeqRef = useRef<number | null>(null)
   const terminalSeenRef = useRef(isTerminal(session.status))
-  const closedRef = useRef(false)
 
   useEffect(() => {
+    // Per-instance flag: StrictMode double-mounts effects in dev; a shared
+    // ref would let the first mount's late async work slip through and
+    // duplicate events.
+    let cancelled = false
     let es: EventSource | null = null
-    closedRef.current = false
 
     ;(async () => {
       try {
@@ -66,7 +68,7 @@ export default function SessionView({ session, onStatusChange }: Props) {
           getSession(session.id),
           getHistory(session.id),
         ])
-        if (closedRef.current) return
+        if (cancelled) return
         setStatus(current.status)
         setEvents(history)
         lastSeqRef.current =
@@ -98,14 +100,14 @@ export default function SessionView({ session, onStatusChange }: Props) {
           }
         }
       } catch (err) {
-        if (!closedRef.current) {
+        if (!cancelled) {
           setError(err instanceof Error ? err.message : String(err))
         }
       }
     })()
 
     return () => {
-      closedRef.current = true
+      cancelled = true
       es?.close()
     }
   }, [session.id, onStatusChange])
