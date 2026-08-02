@@ -1,0 +1,23 @@
+[package]
+name = "mo_gateway"
+edition = "2024"
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-stream = "0.3.6"
+axum = "0.8.9"
+futures-util.workspace = true
+libc = "0.2.189"
+mo_core = { version = "0.1.0", path = "../mo_core" }
+serde.workspace = true
+serde_json.workspace = true
+tempfile = "3.27.0"
+tokio.workspace = true
+tower-http = { version = "0.7.0", features = ["cors", "trace"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.24.0", features = ["v4"] }
+
+[dev-dependencies]
+tower = "0.5.3"
