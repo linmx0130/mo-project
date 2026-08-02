@@ -46,6 +46,14 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
         },
         ChatMessage::user_text_message(&config.session.prompt),
     ];
+    // Journal the user prompt so the journal is a self-contained history.
+    journal.append(JournalEventKind::Message(JournalMessage {
+        role: "user".to_string(),
+        content: config.session.prompt.clone(),
+        reasoning_content: None,
+        tool_call_id: None,
+        tool_calls: None,
+    }))?;
     let tools = tools::tool_definitions();
     let tool_ctx = ToolContext {
         workdir: config.workdir.clone(),
@@ -298,20 +306,25 @@ mod tests {
         let mut journal = JournalWriter::open(std::path::Path::new(&session.journal_path)).unwrap();
         run_agent(agent_cfg, &mut journal).await.unwrap();
 
-        // Journal: message(tool-call assistant), tool_call_start, tool_result, message(final).
+        // Journal sequence: user message, assistant(tool call), tool_call_start,
+        // tool_result, assistant(final).
         let events = mo_core::read_events(std::path::Path::new(&session.journal_path)).unwrap();
-        assert_eq!(events.len(), 4, "events: {events:#?}");
+        assert_eq!(events.len(), 5, "events: {events:#?}");
+        let kinds: Vec<&JournalEventKind> = events.iter().map(|e| &e.kind).collect();
         assert!(
-            matches!(&events[0].kind, JournalEventKind::Message(m) if m.role == "assistant" && m.tool_calls.as_ref().is_some_and(|t| t.len() == 1))
+            matches!(kinds[0], JournalEventKind::Message(m) if m.role == "user" && m.content.contains("Read notes.txt"))
         );
         assert!(
-            matches!(&events[1].kind, JournalEventKind::ToolCallStart { name, .. } if name == "read_file")
+            matches!(kinds[1], JournalEventKind::Message(m) if m.role == "assistant" && m.tool_calls.as_ref().is_some_and(|t| t.len() == 1))
         );
         assert!(
-            matches!(&events[2].kind, JournalEventKind::ToolResult { ok: true, output, .. } if output.contains("hello world from notes"))
+            matches!(kinds[2], JournalEventKind::ToolCallStart { name, .. } if name == "read_file")
         );
         assert!(
-            matches!(&events[3].kind, JournalEventKind::Message(m) if m.role == "assistant" && m.content.contains("hello world from notes"))
+            matches!(kinds[3], JournalEventKind::ToolResult { ok: true, output, .. } if output.contains("hello world from notes"))
+        );
+        assert!(
+            matches!(kinds[4], JournalEventKind::Message(m) if m.role == "assistant" && m.content.contains("hello world from notes"))
         );
     }
 }
