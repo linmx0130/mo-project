@@ -818,11 +818,18 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "chrono",
+ "futures-util",
  "mo_core",
  "nah_chat",
+ "serde",
  "serde_json",
  "tempfile",
+ "thiserror",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
