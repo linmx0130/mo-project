@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import type { JournalEvent, JournalMessage, Session, SessionStatus } from '../api'
 import { cancelSession, getHistory, getSession, postMessage } from '../api'
 import Composer from './Composer'
@@ -234,7 +236,7 @@ function MessageRow({ message }: { message: JournalMessage }) {
       </div>
     )
   }
-  // assistant
+  // assistant — rendered as Markdown (the worker's LLM output is Markdown)
   return (
     <div className="msg msg-assistant">
       <div className="msg-label">assistant</div>
@@ -244,7 +246,13 @@ function MessageRow({ message }: { message: JournalMessage }) {
           <pre>{message.reasoning_content}</pre>
         </details>
       )}
-      {message.content && <div className="msg-content">{message.content}</div>}
+      {message.content && (
+        <div className="msg-content markdown">
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+            {message.content}
+          </ReactMarkdown>
+        </div>
+      )}
     </div>
   )
 }

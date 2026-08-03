@@ -23,6 +23,12 @@ export interface Session {
   error: string | null
 }
 
+/** Static gateway metadata (GET /api/meta). */
+export interface Meta {
+  /** Absolute path of the gateway's startup directory. */
+  cwd: string
+}
+
 export interface ToolCallInfo {
   id: string
   name: string
@@ -68,6 +74,10 @@ async function http<T>(url: string, init?: RequestInit): Promise<T> {
 
 export function listSessions(): Promise<Session[]> {
   return http('/api/sessions')
+}
+
+export function getMeta(): Promise<Meta> {
+  return http('/api/meta')
 }
 
 export function getSession(id: string): Promise<Session> {

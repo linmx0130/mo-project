@@ -13,7 +13,7 @@ use axum::{
 use mo_core::{
     JournalEvent, JournalEventKind, JournalMessage, JournalWriter, Session, SessionStatus, db,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::warn;
@@ -27,6 +27,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     let cors = CorsLayer::permissive();
     Router::new()
         .route("/", get(root))
+        .route("/api/meta", get(meta))
         .route("/api/sessions", post(create_session).get(list_sessions))
         .route("/api/sessions/{id}", get(get_session))
         .route("/api/sessions/{id}/history", get(history))
@@ -40,6 +41,20 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 
 async fn root() -> &'static str {
     "mo gateway — agent harness API"
+}
+
+#[derive(Serialize)]
+struct MetaResponse {
+    /// Absolute path of the directory the gateway process was started in —
+    /// the frontend pre-fills it as the default session workdir.
+    cwd: String,
+}
+
+/// GET /api/meta — static gateway metadata (currently just the cwd).
+async fn meta(State(state): State<Arc<AppState>>) -> Json<MetaResponse> {
+    Json(MetaResponse {
+        cwd: state.cwd.display().to_string(),
+    })
 }
 
 #[derive(Deserialize)]

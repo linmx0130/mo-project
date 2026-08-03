@@ -122,6 +122,7 @@ $HOME/.agents/
 
 | Endpoint | Description |
 | --- | --- |
+| `GET /api/meta` | static gateway metadata: `{cwd}` (gateway startup dir, used as the default session workdir) |
 | `POST /api/sessions` `{workdir, prompt}` | create session + spawn worker |
 | `GET /api/sessions` | list (newest first) |
 | `GET /api/sessions/:id` | detail; liveness check flips dead workers to `failed` |

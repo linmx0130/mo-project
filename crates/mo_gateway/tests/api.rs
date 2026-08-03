@@ -40,6 +40,7 @@ fn setup(sleep: bool) -> (tempfile::TempDir, Router) {
         data_dir,
         db: Mutex::new(conn),
         worker_bin,
+        cwd: std::env::current_dir().unwrap(),
     });
     (dir, create_router(state))
 }
@@ -65,6 +66,15 @@ async fn request(
         .unwrap();
     let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, value)
+}
+
+#[tokio::test]
+async fn meta_reports_gateway_cwd() {
+    let (_dir, app) = setup(false);
+    let (status, meta) = request(&app, Method::GET, "/api/meta", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let cwd = meta["cwd"].as_str().expect("meta.cwd should be a string");
+    assert_eq!(cwd, std::env::current_dir().unwrap().to_string_lossy());
 }
 
 #[tokio::test]

@@ -27,6 +27,8 @@ async fn main() {
         .unwrap_or_else(|_| PathBuf::from("./data"));
     std::fs::create_dir_all(&data_dir).expect("failed to create data dir");
 
+    let cwd = std::env::current_dir().expect("cannot resolve current directory");
+
     let conn = mo_core::open_db(&data_dir.join("mo.db")).expect("failed to open DB");
     let worker_bin = match std::env::var("MO_WORKER_BIN") {
         Ok(path) => PathBuf::from(path),
@@ -42,6 +44,7 @@ async fn main() {
         data_dir,
         db: Mutex::new(conn),
         worker_bin,
+        cwd,
     });
     let app = create_router(state);
 
