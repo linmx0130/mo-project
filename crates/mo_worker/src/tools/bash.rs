@@ -14,8 +14,14 @@ use std::time::Duration;
 use mo_core::JournalEventKind;
 use tokio::io::AsyncReadExt;
 
-const OUTPUT_CAP: usize = 1024 * 1024; // 1 MB
+const OUTPUT_CAP: usize = 1024 * 1024; // 1 MB — retained result/model context
 const CHUNK_SIZE: usize = 8192;
+
+/// Live delta-stream budget: total bytes of `tool_output_delta` journaled
+/// per command before a single marker replaces further output. Streaming
+/// stays live up to this cap; the journal and the browser are protected
+/// from unbounded growth beyond it.
+pub const DELTA_STREAM_CAP: usize = 10 * 1024 * 1024; // 10 MB
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -125,47 +131,82 @@ pub async fn bash(
     // chunks and never touch `on_delta` or `child`.
     drop((stdout_reader, stderr_reader));
 
+    // Retained output buffers live OUTSIDE the timeout future so the
+    // partial output can be reported when the command times out (previously
+    // they were dropped with the future and the model saw only the timeout
+    // string). They are capped at `OUTPUT_CAP`; the live delta stream is
+    // capped separately at `DELTA_STREAM_CAP`.
+    let mut stdout_buf: Vec<u8> = Vec::new();
+    let mut stderr_buf: Vec<u8> = Vec::new();
+    let mut retained_truncated = false;
+    let mut streamed_bytes: usize = 0;
+    let mut stream_capped = false;
+
     let run = async {
-        let mut stdout_buf: Vec<u8> = Vec::new();
-        let mut stderr_buf: Vec<u8> = Vec::new();
         while let Some((src, chunk)) = rx.recv().await {
-            let text = String::from_utf8_lossy(&chunk);
-            on_delta(JournalEventKind::ToolOutputDelta {
-                id: tool_call_id.to_string(),
-                name: "bash".to_string(),
-                output: text.into_owned(),
-            });
-            if src == 0 {
-                stdout_buf.extend_from_slice(&chunk);
+            // Live stream first: journal every chunk (bounded at
+            // DELTA_STREAM_CAP, then a single marker), so the UI keeps
+            // filling in while the command runs.
+            if streamed_bytes < DELTA_STREAM_CAP {
+                streamed_bytes += chunk.len();
+                let text = String::from_utf8_lossy(&chunk);
+                on_delta(JournalEventKind::ToolOutputDelta {
+                    id: tool_call_id.to_string(),
+                    name: "bash".to_string(),
+                    output: text.into_owned(),
+                });
+            } else if !stream_capped {
+                stream_capped = true;
+                on_delta(JournalEventKind::ToolOutputDelta {
+                    id: tool_call_id.to_string(),
+                    name: "bash".to_string(),
+                    output: "\n[output capped at 10 MB — further output is suppressed]\n"
+                        .to_string(),
+                });
+            }
+            // Retained copy for the final result/model context (bounded at
+            // OUTPUT_CAP; overflow is dropped, the live stream is not).
+            let retained = if src == 0 {
+                &mut stdout_buf
             } else {
-                stderr_buf.extend_from_slice(&chunk);
-            }
-        }
-        Ok::<_, String>((stdout_buf, stderr_buf))
-    };
-    let (stdout_buf, stderr_buf) = match tokio::time::timeout(timeout, run).await {
-        Err(_) => {
-            // Kill the whole process group: the direct child is `sh`, and
-            // its pipeline children (gradlew, tail, ...) would otherwise
-            // survive as orphans — `kill_on_drop` only reaches `sh`.
-            if let Some(pid) = child.id() {
-                unsafe {
-                    libc::kill(-(pid as i32), libc::SIGKILL);
+                &mut stderr_buf
+            };
+            if retained.len() < OUTPUT_CAP {
+                let room = OUTPUT_CAP - retained.len();
+                retained.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                if retained.len() >= OUTPUT_CAP {
+                    retained_truncated = true;
                 }
+            } else {
+                retained_truncated = true;
             }
-            let _ = child.kill().await;
-            let _ = child.wait().await; // reap
-            return Err(format!(
-                "command timed out after {}s: {command}\n\
-                 (the command's process group was killed; note that piping \
-                 output through `tail`/`head` hides all output until the \
-                 command finishes — run long builds with `nohup ... > log \
-                 2>&1 &` and poll the log instead)",
-                timeout.as_secs()
-            ));
         }
-        Ok(result) => result?,
+        Ok::<_, String>(())
     };
+    let timed_out = match tokio::time::timeout(timeout, run).await {
+        Err(_) => true,
+        Ok(result) => {
+            result?;
+            false
+        }
+    };
+    if timed_out {
+        // Kill the whole process group: the direct child is `sh`, and its
+        // pipeline children (gradlew, tail, ...) would otherwise survive as
+        // orphans — `kill_on_drop` only reaches `sh`.
+        if let Some(pid) = child.id() {
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+        let _ = child.kill().await;
+        let _ = child.wait().await; // reap
+        return Err(format!(
+            "command timed out after {}s: {command}\n{}",
+            timeout.as_secs(),
+            partial_output(&stdout_buf, &stderr_buf, retained_truncated)
+        ));
+    }
 
     let status = child
         .wait()
@@ -191,6 +232,39 @@ pub async fn bash(
         );
     }
     Ok(text)
+}
+
+/// Build the `[partial output]` section of a timeout error from the
+/// retained buffers — the model gets to see what the command produced
+/// before it was killed — or a hint when nothing was captured (the command
+/// may be buffering through `tail`/`head`, or hung before producing any
+/// output at all).
+fn partial_output(stdout_buf: &[u8], stderr_buf: &[u8], truncated: bool) -> String {
+    let stdout = String::from_utf8_lossy(stdout_buf);
+    let stderr = String::from_utf8_lossy(stderr_buf);
+    let mut out = String::new();
+    if stdout.trim().is_empty() && stderr.trim().is_empty() {
+        out.push_str(
+            "(no output was received — the command may be buffering through \
+             `tail`/`head` or hung before producing output; run long builds \
+             with `nohup ... > log 2>&1 &` and poll the log instead)",
+        );
+        return out;
+    }
+    if !stdout.trim().is_empty() {
+        out.push_str("[partial output]\n");
+        out.push_str(stdout.trim_end());
+        out.push('\n');
+    }
+    if !stderr.trim().is_empty() {
+        out.push_str("[partial stderr]\n");
+        out.push_str(stderr.trim_end());
+        out.push('\n');
+    }
+    if truncated {
+        out.push_str("[output capped at 1 MB — the live UI stream continues]\n");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -303,5 +377,116 @@ mod tests {
             stdout.trim().is_empty(),
             "orphaned sleep survived the timeout: {stdout}"
         );
+    }
+
+    #[tokio::test]
+    async fn timeout_reports_partial_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = |_: JournalEventKind| {};
+        let err = bash(
+            dir.path(),
+            "printf 'downloading deps...\\n'; sleep 30",
+            Duration::from_millis(500),
+            "call_1",
+            &mut sink,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("timed out"), "got: {err}");
+        // The output produced before the kill must reach the model.
+        assert!(
+            err.contains("downloading deps..."),
+            "partial output missing from timeout error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_with_no_output_hints_at_buffering() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = |_: JournalEventKind| {};
+        let err = bash(
+            dir.path(),
+            "sleep 30",
+            Duration::from_millis(300),
+            "call_1",
+            &mut sink,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("timed out"), "got: {err}");
+        assert!(
+            err.contains("no output was received"),
+            "missing buffering hint: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_output_streams_while_retained_is_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let total = OUTPUT_CAP + 256 * 1024; // ~1.25 MB
+        let mut streamed: usize = 0;
+        let out = {
+            let mut sink = |kind: JournalEventKind| {
+                if let JournalEventKind::ToolOutputDelta { output, .. } = kind {
+                    streamed += output.len();
+                }
+            };
+            bash(
+                dir.path(),
+                &format!("head -c {total} /dev/zero | tr '\\0' 'x'"),
+                Duration::from_secs(30),
+                "call_1",
+                &mut sink,
+            )
+            .await
+            .unwrap()
+        };
+        // Every byte streamed to the UI/journal...
+        assert!(streamed >= total, "streamed only {streamed} of {total}");
+        // ...while the canonical result stays bounded at ~1 MB.
+        assert!(
+            out.len() < OUTPUT_CAP + 2048,
+            "result too big: {}",
+            out.len()
+        );
+        assert!(
+            out.contains("output truncated"),
+            "missing truncation note in result: {}",
+            &out[out.len().saturating_sub(200)..]
+        );
+    }
+
+    #[tokio::test]
+    async fn delta_stream_is_capped_with_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let total = DELTA_STREAM_CAP + 1024 * 1024;
+        let mut streamed: usize = 0;
+        let out = {
+            let mut sink = |kind: JournalEventKind| {
+                if let JournalEventKind::ToolOutputDelta { output, .. } = kind {
+                    streamed += output.len();
+                }
+            };
+            bash(
+                dir.path(),
+                &format!("head -c {total} /dev/zero | tr '\\0' 'x'"),
+                Duration::from_secs(30),
+                "call_1",
+                &mut sink,
+            )
+            .await
+            .unwrap()
+        };
+        // The marker replaced further deltas once the budget ran out.
+        assert!(
+            streamed < DELTA_STREAM_CAP + 4096,
+            "delta stream not capped: {streamed} bytes"
+        );
+        assert!(
+            streamed >= DELTA_STREAM_CAP,
+            "delta stream stopped early: {streamed} bytes"
+        );
+        // The retained result is still bounded at ~1 MB.
+        assert!(out.len() < 2 * 1024 * 1024, "result too big: {}", out.len());
     }
 }

@@ -763,6 +763,10 @@ p {
   animation: mo-pulse 1.2s ease-in-out infinite;
 }
 
+.tool-status.muted {
+  color: var(--muted);
+}
+
 .tool-status.ok {
   color: var(--status-completed);
 }

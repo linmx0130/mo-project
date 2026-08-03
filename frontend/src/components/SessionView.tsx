@@ -23,6 +23,8 @@ interface ToolBlock {
   ok?: boolean
   /** True while output deltas are still arriving (tool still running). */
   streaming?: boolean
+  /** Epoch ms of the `tool_call_start` event, for the elapsed badge. */
+  startedAt?: number
 }
 
 /** An assistant message as rendered; `streaming` marks a message whose
@@ -102,6 +104,7 @@ function buildTimeline(events: JournalEvent[]): TimelineItem[] {
           id: kind.id,
           name: kind.name,
           arguments: kind.arguments,
+          startedAt: new Date(ev.ts).getTime(),
         }
         pending.set(kind.id, block)
         items.push({ type: 'tool', block })
@@ -118,9 +121,17 @@ function buildTimeline(events: JournalEvent[]): TimelineItem[] {
       case 'tool_result': {
         const block = pending.get(kind.id)
         if (block) {
-          block.output = kind.output
           block.ok = kind.ok
           block.streaming = false
+          // The canonical result is capped at ~1 MB while the delta stream
+          // is not; keep whichever is longer so the tail is never lost when
+          // the result lands (small commands still get the canonical text,
+          // including the exit-code line).
+          if (!block.output || kind.output.length >= block.output.length) {
+            block.output = kind.output
+          } else {
+            block.output = `${block.output}\n\n[tool result was truncated by the harness — showing the full streamed output]`
+          }
           pending.delete(kind.id)
         }
         break
@@ -143,6 +154,10 @@ export default function SessionView({ session, onStatusChange }: Props) {
   const [runId, setRunId] = useState(0)
   const lastSeqRef = useRef<number | null>(null)
   const terminalSeenRef = useRef(isTerminal(session.status))
+  // Tick while any tool block is streaming, so running badges show how
+  // long a command has been executing (a long silent command no longer
+  // looks dead).
+  const [now, setNow] = useState(() => Date.now())
 
   useEffect(() => {
     // Per-instance flag: StrictMode double-mounts effects in dev; a shared
@@ -239,6 +254,16 @@ export default function SessionView({ session, onStatusChange }: Props) {
 
   const running = status === 'running' || status === 'pending'
   const timeline = buildTimeline(events)
+  // While any tool is still streaming, re-render once per second so the
+  // elapsed badge ticks; stop when everything settles.
+  const anyToolStreaming = timeline.some(
+    (item) => item.type === 'tool' && item.block.streaming,
+  )
+  useEffect(() => {
+    if (!anyToolStreaming) return
+    const id = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(id)
+  }, [anyToolStreaming])
   // Stick to the bottom while events stream in, unless the user scrolled up.
   const timelineRef = useRef<HTMLDivElement | null>(null)
   const stickToBottomRef = useRef(true)
@@ -247,7 +272,7 @@ export default function SessionView({ session, onStatusChange }: Props) {
     if (el && stickToBottomRef.current) {
       el.scrollTop = el.scrollHeight
     }
-  }, [events])
+  }, [events, now])
 
   return (
     <div className="session-view">
@@ -286,7 +311,11 @@ export default function SessionView({ session, onStatusChange }: Props) {
               // Tool-call ids come from the model and repeat across followup
               // runs (e.g. a mock replaying `call_slow`), so disambiguate.
               return (
-                <ToolBlockRow key={`${item.block.id}-${i}`} block={item.block} />
+                <ToolBlockRow
+                  key={`${item.block.id}-${i}`}
+                  block={item.block}
+                  now={now}
+                />
               )
             case 'event':
               return (
@@ -384,7 +413,11 @@ function MessageRow({ message }: { message: MessageBlock }) {
   )
 }
 
-function ToolBlockRow({ block }: { block: ToolBlock }) {
+function ToolBlockRow({ block, now }: { block: ToolBlock; now: number }) {
+  const elapsedSecs =
+    block.startedAt !== undefined
+      ? Math.max(0, Math.floor((now - block.startedAt) / 1000))
+      : 0
   // While output is streaming, force the block open so the user sees it
   // fill in live; once the result lands the `open` prop is removed and the
   // details become uncontrolled again, staying open until the user
@@ -397,7 +430,14 @@ function ToolBlockRow({ block }: { block: ToolBlock }) {
       <summary>
         <span className="tool-name">{block.name}</span>
         <code className="tool-args">{block.arguments}</code>
-        {block.streaming && <span className="tool-status running">running</span>}
+        {block.streaming && (
+          <span className="tool-status running">
+            running{elapsedSecs > 0 ? ` ${elapsedSecs}s` : ''}
+          </span>
+        )}
+        {block.streaming && !block.output && elapsedSecs >= 5 && (
+          <span className="tool-status muted">no output yet</span>
+        )}
         {block.ok !== undefined && (
           <span className={`tool-status ${block.ok ? 'ok' : 'err'}`}>
             {block.ok ? 'ok' : 'error'}
