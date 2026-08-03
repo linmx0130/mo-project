@@ -17,8 +17,6 @@ use serde_json::{Value, json};
 use crate::prompt::build_system_prompt;
 use crate::tools::{self, ToolContext};
 
-/// Safety cap on tool-call turns so a misbehaving model cannot loop forever.
-const MAX_TURNS: usize = 50;
 /// Backoff schedule for LLM request failures: 5s / 15s / 30s.
 const RETRY_DELAYS_SECS: [u64; 3] = [5, 15, 30];
 
@@ -66,7 +64,7 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
         auth_token: config.auth_token.clone(),
     };
 
-    for _ in 0..MAX_TURNS {
+    loop {
         let assistant = generate(&chat_client, &config.model_name, &messages, &tools)
             .await
             .context("LLM generation failed after retries")?;
@@ -107,7 +105,6 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
         messages.push(assistant);
         messages.extend(tool_messages);
     }
-    bail!("agent exceeded {MAX_TURNS} tool-call turns without producing a final answer");
 }
 
 /// Rebuild the chat context from a session journal. `message` events map
