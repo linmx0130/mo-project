@@ -547,10 +547,9 @@ p {
   border: 1px solid var(--border);
   border-radius: 6px;
   color: var(--muted);
-  font: inherit;
-  font-size: 12px;
-  line-height: 1.4;
-  padding: 2px 8px;
+  font-size: 14px;
+  line-height: 1;
+  padding: 3px 7px;
   cursor: pointer;
 }
 

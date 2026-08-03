@@ -77,9 +77,10 @@ export default function CopyButton({ content, disabled = false }: Props) {
         className={`copy-btn${copied ? ' copied' : ''}`}
         onClick={() => void copy()}
         disabled={disabled}
+        aria-label={copied ? 'Copied to clipboard' : 'Copy raw content'}
         title={copied ? 'Copied to clipboard' : 'Copy raw content'}
       >
-        {copied ? 'Copied ✓' : 'Copy content'}
+        {copied ? '✅' : '📋'}
       </button>
       {dialogOpen && (
         <div className="dialog-overlay" onClick={() => setDialogOpen(false)}>
