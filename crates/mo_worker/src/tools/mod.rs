@@ -17,11 +17,14 @@ pub const TOOL_BASH: &str = "bash";
 pub const TOOL_SPAWN_SUBAGENT: &str = "spawn_subagent";
 
 /// Everything a tool needs to run: the sandboxed workdir, the shared data
-/// dir (for subagent sessions), this worker's session row, and model config.
+/// dir (for subagent sessions), the global agents dir (passed down so
+/// subagents inject the same global instructions/skills), this worker's
+/// session row, and model config.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub workdir: PathBuf,
     pub data_dir: PathBuf,
+    pub agents_dir: PathBuf,
     pub session: Session,
     pub subagent_depth: u32,
     pub model_base_url: String,
@@ -184,6 +187,7 @@ mod tests {
         let ctx = ToolContext {
             workdir: PathBuf::from("/tmp"),
             data_dir: PathBuf::from("/tmp/data"),
+            agents_dir: PathBuf::from("/tmp/agents"),
             session: Session {
                 id: "s".into(),
                 parent_id: None,

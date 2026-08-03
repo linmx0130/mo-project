@@ -87,12 +87,34 @@ worker.
 | Var | Used by | Default |
 | --- | --- | --- |
 | `MO_DATA_DIR` | gateway + worker | `./data` |
+| `MO_AGENTS_DIR` | worker | `$HOME/.agents` |
 | `MO_MODEL_BASE_URL` | worker (required) | — |
 | `MO_MODEL_NAME` | worker (required) | — |
 | `MO_AUTH_TOKEN` | worker | unset |
 | `MO_SUBAGENT_DEPTH` | worker | `0` (hard cap `3`) |
 | `MO_WORKER_BIN` | gateway | sibling of `mo_gateway` exe named `mo_worker` |
 | `MO_PORT` | gateway | `3000` |
+
+## Global agent data (`$HOME/.agents`)
+
+Global (user-level) instructions and skills live in a global agents dir —
+`$HOME/.agents` by default, overridable with `MO_AGENTS_DIR`. The worker
+injects them into every system prompt (root sessions **and** subagents):
+
+```
+$HOME/.agents/
+  AGENTS.md                    # global instructions (optional)
+  <skill-name>/SKILL.md        # global skill (optional)
+  skills/<skill-name>/SKILL.md # global skill, alternate layout (optional)
+```
+
+- `AGENTS.md` is included verbatim as "Global instructions".
+- Each skill's `SKILL.md` is parsed for YAML frontmatter (`name`,
+  `description`); the name + description metadata and the full body are
+  included in the system prompt so the model can follow them directly
+  (tools are sandboxed to the session workdir, so skills must be inlined).
+- Project instructions (`<workdir>/AGENTS.md`) come after the global
+  instructions, so project rules can refine or override user defaults.
 
 ## API
 
@@ -123,4 +145,5 @@ cd frontend && npm run lint && npm run build
 No worker pool, no auth, no token-by-token streaming to the frontend, no
 message compaction beyond the 1 MB tool-output cap, no static-file serving
 from the gateway, no multi-user support. Extension points (more tools,
-compaction, skills, prompt templates) are future experiments.
+compaction, on-demand skill loading, prompt templates) are future
+experiments.

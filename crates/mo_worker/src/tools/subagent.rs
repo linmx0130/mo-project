@@ -60,6 +60,7 @@ pub async fn spawn_subagent(ctx: &ToolContext, prompt: &str) -> Result<String, S
         .arg(&id)
         .env("MO_SUBAGENT_DEPTH", (ctx.subagent_depth + 1).to_string())
         .env("MO_DATA_DIR", &ctx.data_dir)
+        .env("MO_AGENTS_DIR", &ctx.agents_dir)
         .env("MO_MODEL_BASE_URL", &ctx.model_base_url)
         .env("MO_MODEL_NAME", &ctx.model_name)
         .stdout(Stdio::from(log_file))
@@ -127,6 +128,7 @@ mod tests {
         let ctx = ToolContext {
             workdir: std::path::PathBuf::from("/tmp"),
             data_dir: std::path::PathBuf::from("/tmp/data"),
+            agents_dir: std::path::PathBuf::from("/tmp/agents"),
             session: Session {
                 id: "s".into(),
                 parent_id: None,

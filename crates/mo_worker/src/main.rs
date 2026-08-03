@@ -105,6 +105,7 @@ async fn main() {
         session: session.clone(),
         workdir,
         data_dir: cfg.data_dir.clone(),
+        agents_dir: cfg.agents_dir,
         model_base_url: cfg.model_base_url,
         model_name: cfg.model_name,
         auth_token: cfg.auth_token,

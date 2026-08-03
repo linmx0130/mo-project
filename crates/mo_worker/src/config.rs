@@ -8,16 +8,29 @@
 //! * `MO_MODEL_NAME` — model name to request.
 //! * `MO_AUTH_TOKEN` — optional Bearer token / API key.
 //! * `MO_SUBAGENT_DEPTH` — subagent nesting depth (default 0, hard cap 3).
+//! * `MO_AGENTS_DIR` — global agents dir (default `$HOME/.agents`); holds the
+//!   global `AGENTS.md` and global skills (`<dir>/<skill>/SKILL.md` or
+//!   `<dir>/skills/<skill>/SKILL.md`), injected into the system prompt.
 
 use std::env;
 use std::path::PathBuf;
 
 pub const MAX_SUBAGENT_DEPTH: u32 = 3;
 
+/// Default global agents dir when `MO_AGENTS_DIR` is unset: `$HOME/.agents`.
+/// Falls back to `./.agents` when `$HOME` is not set either.
+pub fn default_agents_dir() -> PathBuf {
+    match env::var("HOME") {
+        Ok(home) if !home.is_empty() => PathBuf::from(home).join(".agents"),
+        _ => PathBuf::from(".agents"),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
     pub session_id: String,
     pub data_dir: PathBuf,
+    pub agents_dir: PathBuf,
     pub model_base_url: String,
     pub model_name: String,
     pub auth_token: Option<String>,
@@ -49,6 +62,9 @@ pub fn parse_config() -> Result<WorkerConfig, ConfigError> {
     let data_dir = env::var("MO_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("./data"));
+    let agents_dir = env::var("MO_AGENTS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| default_agents_dir());
     let model_base_url = env::var("MO_MODEL_BASE_URL").map_err(|_| ConfigError::MissingBaseUrl)?;
     let model_name = env::var("MO_MODEL_NAME").map_err(|_| ConfigError::MissingModelName)?;
     let auth_token = env::var("MO_AUTH_TOKEN").ok().filter(|v| !v.is_empty());
@@ -60,6 +76,7 @@ pub fn parse_config() -> Result<WorkerConfig, ConfigError> {
     Ok(WorkerConfig {
         session_id,
         data_dir,
+        agents_dir,
         model_base_url,
         model_name,
         auth_token,

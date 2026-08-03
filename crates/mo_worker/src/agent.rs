@@ -25,6 +25,7 @@ pub struct AgentConfig {
     pub session: Session,
     pub workdir: PathBuf,
     pub data_dir: PathBuf,
+    pub agents_dir: PathBuf,
     pub model_base_url: String,
     pub model_name: String,
     pub auth_token: Option<String>,
@@ -35,7 +36,8 @@ pub struct AgentConfig {
 /// The caller is responsible for DB status transitions.
 pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Result<()> {
     let chat_client = ChatClient::init(config.model_base_url.clone(), config.auth_token.clone());
-    let system_prompt = build_system_prompt(&config.workdir, config.subagent_depth);
+    let system_prompt =
+        build_system_prompt(&config.workdir, &config.agents_dir, config.subagent_depth);
     let mut messages: Vec<ChatMessage> = vec![
         ChatMessage {
             role: "system".to_string(),
@@ -58,6 +60,7 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
     let tool_ctx = ToolContext {
         workdir: config.workdir.clone(),
         data_dir: config.data_dir.clone(),
+        agents_dir: config.agents_dir.clone(),
         session: config.session.clone(),
         subagent_depth: config.subagent_depth,
         model_base_url: config.model_base_url.clone(),
@@ -254,6 +257,13 @@ mod tests {
         std::fs::create_dir_all(&workdir).unwrap();
         std::fs::write(workdir.join("notes.txt"), "hello world from notes\n").unwrap();
         let data_dir = dir.path().join("data");
+        let agents_dir = dir.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("AGENTS.md"),
+            "Global rule: answer in lowercase.\n",
+        )
+        .unwrap();
 
         let conn = open_db(&data_dir.join("mo.db")).unwrap();
         let session = sample_session(
@@ -263,29 +273,47 @@ mod tests {
         db::create_session(&conn, &session).unwrap();
         drop(conn);
 
-        // Mock LLM server: stateful across the two requests.
+        // Mock LLM server: stateful across the two requests. Each request is
+        // checked to carry the global AGENTS.md inside the system prompt.
         let calls = Arc::new(AtomicUsize::new(0));
         let router = Router::new()
             .route(
                 "/chat/completions",
-                post(|calls: axum::extract::State<Arc<AtomicUsize>>| async move {
-                    let n = calls.fetch_add(1, Ordering::SeqCst);
-                    let body = if n == 0 {
-                        sse_payload(&[
-                            delta_role("assistant"),
-                            delta_tool_call(0, "call_1", "read_file", r#"{"path":"notes.txt"}"#),
-                        ])
-                    } else {
-                        sse_payload(&[
-                            delta_role("assistant"),
-                            delta_content("The file says: hello world from notes.\n"),
-                        ])
-                    };
-                    (
-                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                        body,
-                    )
-                }),
+                post(
+                    |calls: axum::extract::State<Arc<AtomicUsize>>,
+                     body: axum::extract::Json<Value>| async move {
+                        let system = body["messages"]
+                            .as_array()
+                            .and_then(|msgs| msgs.iter().find(|m| m["role"] == "system"))
+                            .and_then(|m| m["content"].as_str())
+                            .unwrap_or("");
+                        assert!(
+                            system.contains("Global rule: answer in lowercase."),
+                            "system prompt missing global AGENTS.md: {system}"
+                        );
+                        let n = calls.fetch_add(1, Ordering::SeqCst);
+                        let body = if n == 0 {
+                            sse_payload(&[
+                                delta_role("assistant"),
+                                delta_tool_call(
+                                    0,
+                                    "call_1",
+                                    "read_file",
+                                    r#"{"path":"notes.txt"}"#,
+                                ),
+                            ])
+                        } else {
+                            sse_payload(&[
+                                delta_role("assistant"),
+                                delta_content("The file says: hello world from notes.\n"),
+                            ])
+                        };
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                            body,
+                        )
+                    },
+                ),
             )
             .with_state(calls.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -298,6 +326,7 @@ mod tests {
             session: session.clone(),
             workdir: workdir.clone(),
             data_dir: data_dir.clone(),
+            agents_dir,
             model_base_url: format!("http://{addr}"),
             model_name: "mock-model".to_string(),
             auth_token: None,
