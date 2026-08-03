@@ -528,6 +528,47 @@ p {
   margin-bottom: 6px;
 }
 
+/* Header row inside a message: label on the left, actions on the right. */
+.msg-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.msg-head .msg-label {
+  margin-bottom: 0;
+}
+
+.copy-btn {
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.copy-btn:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.copy-btn.copied {
+  color: var(--status-completed);
+  border-color: var(--status-completed);
+}
+
+.copy-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .msg-content {
   color: var(--text-h);
   white-space: pre-wrap;
@@ -777,4 +818,114 @@ p {
   50% {
     opacity: 0.25;
   }
+}
+
+/* ---------- dialog (manual-copy fallback) ---------- */
+
+/* Shown when the clipboard API is unavailable and the raw message content
+   must be copied by hand. */
+.dialog-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.dialog {
+  width: min(680px, 100%);
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px 16px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+}
+
+.dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.dialog-title {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-h);
+}
+
+.dialog-close {
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+  padding: 4px 6px;
+  cursor: pointer;
+}
+
+.dialog-close:hover {
+  color: var(--text-h);
+  background: var(--bg);
+}
+
+.dialog-textarea {
+  width: 100%;
+  min-height: 240px;
+  resize: vertical;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font: 12.5px/1.55 var(--mono);
+  padding: 10px 12px;
+}
+
+.dialog-textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.dialog-hint {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.dialog-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+
+.dialog-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.dialog-btn.primary {
+  background: var(--accent-bg);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
 }

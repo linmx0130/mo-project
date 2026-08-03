@@ -4,6 +4,7 @@ import remarkGfm from 'remark-gfm'
 import type { JournalEvent, JournalMessage, Session, SessionStatus } from '../api'
 import { cancelSession, getHistory, getSession, postMessage } from '../api'
 import Composer from './Composer'
+import CopyButton from './CopyButton'
 
 interface Props {
   session: Session
@@ -348,7 +349,18 @@ function MessageRow({ message }: { message: MessageBlock }) {
   // assistant — rendered as Markdown (the worker's LLM output is Markdown)
   return (
     <div className="msg msg-assistant">
-      <div className="msg-label">assistant</div>
+      <div className="msg-head">
+        <div className="msg-label">assistant</div>
+        {message.content && (
+          // The button copies the raw Markdown source, not the rendered
+          // HTML. Disabled while the message is still streaming so the
+          // user can't grab a partial reply.
+          <CopyButton
+            content={message.content}
+            disabled={message.streaming}
+          />
+        )}
+      </div>
       {message.reasoning_content && (
         // While reasoning is streaming, force the block open so the tokens
         // are visible as they arrive; once the run settles the `open` prop
