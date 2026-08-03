@@ -130,6 +130,13 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
 /// events become the `tool`-role messages that must follow an assistant tool
 /// call. The journal interleaves them in the correct order, so a completed
 /// session can be resumed exactly where it left off.
+///
+/// A worker that died or was stopped mid-tool leaves the journal ending
+/// with an assistant `tool_calls` message that no `tool_result` ever
+/// answered. Such a message is dropped here (together with any partial tool
+/// results that followed it), because the model API rejects `tool_calls`
+/// without matching tool messages — a followup on a killed session would
+/// otherwise fail with "insufficient tool messages following tool_calls".
 fn history_from_journal(journal_path: &Path) -> Result<Vec<ChatMessage>> {
     let events = mo_core::read_events(journal_path).context("failed to read session journal")?;
     let mut messages = Vec::new();
@@ -164,7 +171,49 @@ fn history_from_journal(journal_path: &Path) -> Result<Vec<ChatMessage>> {
             _ => {}
         }
     }
-    Ok(messages)
+    // Drop dangling tool-call messages (and the partial tool results that
+    // followed them) so the rebuilt context never carries `tool_calls`
+    // without matching tool messages.
+    let mut i = 0;
+    let mut cleaned = Vec::with_capacity(messages.len());
+    while i < messages.len() {
+        if messages[i].role == "assistant" && !tool_calls_answered(&messages, i) {
+            i += 1;
+            while i < messages.len() && messages[i].role == "tool" {
+                i += 1;
+            }
+            continue;
+        }
+        cleaned.push(messages[i].clone());
+        i += 1;
+    }
+    Ok(cleaned)
+}
+
+/// True when the assistant message at `idx` had every tool call answered by
+/// the immediately following tool messages (one message per call id, in any
+/// order). False when the journal ends mid-tool-call — the worker died or
+/// was stopped before the results landed.
+fn tool_calls_answered(messages: &[ChatMessage], idx: usize) -> bool {
+    let calls = match &messages[idx].tool_calls {
+        Some(calls) if !calls.is_empty() => calls,
+        _ => return true,
+    };
+    let mut remaining: Vec<&str> = calls.iter().map(|c| c.id.as_str()).collect();
+    for m in &messages[idx + 1..] {
+        if m.role != "tool" {
+            break;
+        }
+        if let Some(id) = m.tool_call_id.as_deref()
+            && let Some(pos) = remaining.iter().position(|r| *r == id)
+        {
+            remaining.remove(pos);
+        }
+        if remaining.is_empty() {
+            return true;
+        }
+    }
+    false
 }
 
 /// One LLM call with retry/backoff (3 tries, 5s/15s/30s).
@@ -325,6 +374,139 @@ mod tests {
             heartbeat_at: None,
             error: None,
         }
+    }
+
+    /// A journal whose last assistant message carries tool_calls that were
+    /// never answered (the worker died or was stopped mid-tool) must rebuild
+    /// without that dangling message — the model API rejects tool_calls
+    /// without matching tool messages, which is exactly what broke followups
+    /// on sessions that were killed while a bash command was running.
+    #[test]
+    fn history_drops_dangling_tool_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let mut journal = JournalWriter::open(&path).unwrap();
+        journal
+            .append(JournalEventKind::Message(JournalMessage {
+                role: "user".to_string(),
+                content: "first message".to_string(),
+                reasoning_content: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }))
+            .unwrap();
+        // The worker journaled the assistant tool call, then died before
+        // the tool_result (only the tool_call_start made it out).
+        journal
+            .append(JournalEventKind::Message(JournalMessage {
+                role: "assistant".to_string(),
+                content: String::new(),
+                reasoning_content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCallInfo {
+                    id: "call_1".to_string(),
+                    name: "bash".to_string(),
+                    arguments: r#"{"command":"./gradlew assembleDebug"}"#.to_string(),
+                }]),
+            }))
+            .unwrap();
+        journal
+            .append(JournalEventKind::ToolCallStart {
+                id: "call_1".to_string(),
+                name: "bash".to_string(),
+                arguments: r#"{"command":"./gradlew assembleDebug"}"#.to_string(),
+            })
+            .unwrap();
+        // The user's followup ("Continue") is journaled by the gateway when
+        // the session is resumed.
+        journal
+            .append(JournalEventKind::Message(JournalMessage {
+                role: "user".to_string(),
+                content: "Continue".to_string(),
+                reasoning_content: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }))
+            .unwrap();
+        drop(journal);
+
+        let messages = history_from_journal(&path).unwrap();
+        assert_eq!(messages.len(), 2, "messages: {messages:#?}");
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content.to_string(), "first message");
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[1].content.to_string(), "Continue");
+        // No assistant message with tool_calls may survive.
+        for m in &messages {
+            assert!(
+                !(m.role == "assistant" && m.tool_calls.as_ref().is_some_and(|c| !c.is_empty())),
+                "dangling tool call survived: {messages:#?}"
+            );
+        }
+    }
+
+    /// A completed tool round-trip (assistant tool_calls followed by the
+    /// matching tool_result) must be preserved verbatim.
+    #[test]
+    fn history_keeps_answered_tool_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let mut journal = JournalWriter::open(&path).unwrap();
+        journal
+            .append(JournalEventKind::Message(JournalMessage {
+                role: "user".to_string(),
+                content: "do it".to_string(),
+                reasoning_content: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }))
+            .unwrap();
+        journal
+            .append(JournalEventKind::Message(JournalMessage {
+                role: "assistant".to_string(),
+                content: String::new(),
+                reasoning_content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCallInfo {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: r#"{"path":"notes.txt"}"#.to_string(),
+                }]),
+            }))
+            .unwrap();
+        journal
+            .append(JournalEventKind::ToolResult {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                ok: true,
+                output: "file contents".to_string(),
+            })
+            .unwrap();
+        journal
+            .append(JournalEventKind::Message(JournalMessage {
+                role: "assistant".to_string(),
+                content: "done".to_string(),
+                reasoning_content: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }))
+            .unwrap();
+        drop(journal);
+
+        let messages = history_from_journal(&path).unwrap();
+        assert_eq!(messages.len(), 4, "messages: {messages:#?}");
+        assert_eq!(messages[1].role, "assistant");
+        assert!(
+            messages[1]
+                .tool_calls
+                .as_ref()
+                .is_some_and(|c| c.len() == 1),
+            "answered tool call must be kept: {messages:#?}"
+        );
+        assert_eq!(messages[2].role, "tool");
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(messages[3].role, "assistant");
+        assert_eq!(messages[3].content.to_string(), "done");
     }
 
     /// End-to-end agent loop test against a tiny mock LLM server that

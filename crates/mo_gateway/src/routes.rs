@@ -299,7 +299,8 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> ApiResult<Json<Vec
 }
 
 /// GET /api/sessions/:id — detail plus a liveness check: a session marked
-/// `running` whose pid is dead is flipped to `failed` ("worker died").
+/// `running` whose worker died (pid gone) or stalled (process alive but no
+/// heartbeats) is flipped to `failed`.
 async fn get_session(
     State(state): State<Arc<AppState>>,
     PathParam(id): PathParam<String>,
@@ -309,15 +310,23 @@ async fn get_session(
         Some(session) => session,
         None => return Err(ApiError::not_found("session not found")),
     };
-    // Liveness check: a session whose pid is dead is flipped to failed,
-    // whether it ever reached `running` or not.
-    if (session.status == SessionStatus::Running || session.status == SessionStatus::Pending)
-        && session.pid.is_some_and(|pid| !process::is_pid_alive(pid))
-    {
-        let error = process::worker_died_error(&state.data_dir, &id);
-        let _ = db::update_status(&conn, &id, SessionStatus::Failed, Some(error.clone()));
-        session.status = SessionStatus::Failed;
-        session.error = Some(error);
+    // Liveness check: a session whose worker died is flipped to failed,
+    // whether it ever reached `running` or not; a worker that is alive but
+    // stopped heartbeating (wedged async runtime) is flipped too, so the
+    // session never gets stuck at `running` forever.
+    if session.status == SessionStatus::Running || session.status == SessionStatus::Pending {
+        let dead = session.pid.is_some_and(|pid| !process::is_pid_alive(pid));
+        let stalled = process::is_heartbeat_stale(&session.heartbeat_at);
+        if dead || stalled {
+            let error = if dead {
+                process::worker_died_error(&state.data_dir, &id)
+            } else {
+                process::worker_stalled_error(&state.data_dir, &id, &session.heartbeat_at)
+            };
+            let _ = db::update_status(&conn, &id, SessionStatus::Failed, Some(error.clone()));
+            session.status = SessionStatus::Failed;
+            session.error = Some(error);
+        }
     }
     Ok(Json(session))
 }

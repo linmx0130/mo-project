@@ -107,7 +107,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": TOOL_BASH,
-                "description": "Run a shell command via sh -c in the working directory. 120s timeout. Returns stdout, stderr and the exit code.",
+                "description": "Run a shell command via sh -c in the working directory. 120s timeout — the whole process group is killed on timeout. Avoid piping output through `tail`/`head`: it buffers everything, so nothing is streamed to the UI until the command ends (and a timeout looks like a hang). For long-running builds (Gradle, etc.), run them in the background (`nohup ... > build.log 2>&1 &`) and poll the log file. Returns stdout, stderr and the exit code.",
                 "parameters": {
                     "type": "object",
                     "properties": {

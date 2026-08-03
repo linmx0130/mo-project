@@ -86,6 +86,29 @@ async fn main() {
         });
     }
 
+    // SIGTERM handler: the gateway asks for a cancel by signalling the
+    // worker's process group (SIGTERM → SIGKILL). Installing a handler keeps
+    // the worker from being killed mid-journal-write, and gives us a chance
+    // to kill any running bash command's process group first — pipeline
+    // children (gradlew, tail, ...) would otherwise survive as orphans once
+    // the worker dies. Exiting here also guarantees the worker never
+    // finishes the loop and overwrites the session's `cancelled` status.
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        tokio::spawn(async move {
+            let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
+                return;
+            };
+            sigterm.recv().await;
+            if let Some(pgid) = crate::tools::bash::active_bash_pgid() {
+                unsafe {
+                    libc::kill(-(pgid as i32), libc::SIGKILL);
+                }
+            }
+            std::process::exit(0);
+        });
+    }
+
     let mut journal = match JournalWriter::open(Path::new(&session.journal_path)) {
         Ok(journal) => journal,
         Err(e) => {

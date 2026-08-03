@@ -100,21 +100,32 @@ pub async fn events(
                 let conn = db_state.db.lock().unwrap_or_else(|e| e.into_inner());
                 db::get_session(&conn, &id).ok().flatten()
             };
-            let Some(row) = row else {
+            let Some(mut row) = row else {
                 warn!(session = %id, "session row missing during SSE; closing");
                 break;
             };
-            if (row.status == SessionStatus::Running
-                || row.status == SessionStatus::Pending)
-                && row.pid.is_some_and(|pid| !process::is_pid_alive(pid))
-            {
-                let conn = db_state.db.lock().unwrap_or_else(|e| e.into_inner());
-                let _ = db::update_status(
-                    &conn,
-                    &id,
-                    SessionStatus::Failed,
-                    Some(process::worker_died_error(&db_state.data_dir, &id)),
-                );
+            if row.status == SessionStatus::Running || row.status == SessionStatus::Pending {
+                let dead = row.pid.is_some_and(|pid| !process::is_pid_alive(pid));
+                let stalled = process::is_heartbeat_stale(&row.heartbeat_at);
+                if dead || stalled {
+                    let error = if dead {
+                        process::worker_died_error(&db_state.data_dir, &id)
+                    } else {
+                        process::worker_stalled_error(&db_state.data_dir, &id, &row.heartbeat_at)
+                    };
+                    {
+                        let conn = db_state.db.lock().unwrap_or_else(|e| e.into_inner());
+                        let _ = db::update_status(&conn, &id, SessionStatus::Failed, Some(error));
+                    }
+                    // Re-fetch so the synthesized event below carries the
+                    // flipped status rather than the stale `running` one.
+                    if let Some(fresh) = {
+                        let conn = db_state.db.lock().unwrap_or_else(|e| e.into_inner());
+                        db::get_session(&conn, &id).ok().flatten()
+                    } {
+                        row = fresh;
+                    }
+                }
             }
             let should_synthesize = match journal_status {
                 None => row.status.rank() > SessionStatus::Pending.rank(),

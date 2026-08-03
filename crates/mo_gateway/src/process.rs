@@ -3,10 +3,34 @@
 use std::process::Stdio;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use mo_core::Session;
 use tracing::warn;
 
 use crate::state::AppState;
+
+/// Heartbeat staleness threshold. The worker writes a heartbeat every 5s
+/// from a dedicated task that is independent of tool execution, so a
+/// `running` worker that has not heartbeated for this long is considered
+/// *stalled*: the process is alive (the pid-based liveness check passes)
+/// but its async runtime is not making progress. Without this signal a
+/// wedged worker would leave the session `running` forever.
+pub const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(30);
+
+/// True when the session's worker has stopped heartbeating (the process is
+/// alive but wedged). A worker that never produced a heartbeat (`None`) is
+/// not flagged here: a freshly spawned worker takes a moment to start, and
+/// a worker that died before its first beat is caught by the pid check.
+pub fn is_heartbeat_stale(heartbeat_at: &Option<String>) -> bool {
+    let Some(ts) = heartbeat_at else {
+        return false;
+    };
+    let Ok(t) = DateTime::parse_from_rfc3339(ts) else {
+        return false;
+    };
+    let age = Utc::now().signed_duration_since(t.with_timezone(&Utc));
+    age > chrono::Duration::from_std(HEARTBEAT_STALE_AFTER).unwrap_or_default()
+}
 
 /// Spawn `mo_worker --session-id <id>` with stdout/stderr going to
 /// `data/sessions/<id>/worker.log`. The worker gets its own process group
@@ -70,8 +94,37 @@ pub fn is_pid_alive(pid: u32) -> bool {
 /// "worker died" error enriched with the tail of the worker's log so the
 /// UI surfaces the real cause (e.g. a missing env var or a startup error).
 pub fn worker_died_error(data_dir: &std::path::Path, id: &str) -> String {
+    format!("worker died{}", worker_log_tail(data_dir, id))
+}
+
+/// "worker stalled" error: the process is alive but stopped heartbeating,
+/// so its async runtime is presumably frozen — the pid-based liveness check
+/// alone would keep the session `running` forever.
+pub fn worker_stalled_error(
+    data_dir: &std::path::Path,
+    id: &str,
+    heartbeat_at: &Option<String>,
+) -> String {
+    let age_secs = heartbeat_at
+        .as_ref()
+        .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+        .map(|t| {
+            Utc::now()
+                .signed_duration_since(t.with_timezone(&Utc))
+                .num_seconds()
+        })
+        .unwrap_or(-1);
+    format!(
+        "worker stalled: no heartbeat for {age_secs}s (process alive but unresponsive){}",
+        worker_log_tail(data_dir, id)
+    )
+}
+
+/// The tail of the session's worker log, or an empty string when there is
+/// nothing to show. Shared by the "died" and "stalled" failure messages.
+fn worker_log_tail(data_dir: &std::path::Path, id: &str) -> String {
     let log_path = data_dir.join("sessions").join(id).join("worker.log");
-    let tail = std::fs::read_to_string(&log_path)
+    std::fs::read_to_string(&log_path)
         .ok()
         .map(|content| {
             content
@@ -86,8 +139,7 @@ pub fn worker_died_error(data_dir: &std::path::Path, id: &str) -> String {
         })
         .filter(|tail| !tail.trim().is_empty())
         .map(|tail| format!(": {tail}"))
-        .unwrap_or_default();
-    format!("worker died{tail}")
+        .unwrap_or_default()
 }
 
 /// SIGTERM the process group, give it a grace period, then SIGKILL the

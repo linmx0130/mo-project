@@ -8,6 +8,7 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use mo_core::JournalEventKind;
@@ -18,9 +19,33 @@ const CHUNK_SIZE: usize = 8192;
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The process-group id of the currently running bash child, if any. The
+/// worker's SIGTERM handler kills this group so a cancel also stops the
+/// command's pipeline children (gradlew, tail, ...), which would otherwise
+/// survive as orphans once the worker process dies. The value lives in a
+/// shared static (rather than a tokio channel) so the signal handler can
+/// read it even when the runtime is under load.
+pub static ACTIVE_BASH_PGID: Mutex<Option<u32>> = Mutex::new(None);
+
+pub fn active_bash_pgid() -> Option<u32> {
+    *ACTIVE_BASH_PGID.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn set_active_bash_pgid(pgid: Option<u32>) {
+    *ACTIVE_BASH_PGID.lock().unwrap_or_else(|e| e.into_inner()) = pgid;
+}
+
+/// Clears `ACTIVE_BASH_PGID` when a bash call ends (any return path).
+struct BashPgidGuard;
+impl Drop for BashPgidGuard {
+    fn drop(&mut self) {
+        set_active_bash_pgid(None);
+    }
+}
+
 /// Run `command` via `sh -c` in `workdir`. Returns stdout+stderr plus the
-/// exit code, capped at ~1 MB. On timeout the child is killed and an error
-/// is returned.
+/// exit code, capped at ~1 MB. On timeout the child's whole process group
+/// is killed and an error is returned.
 ///
 /// While the command runs, raw stdout/stderr chunks are forwarded to
 /// `on_delta` as `ToolOutputDelta { id: tool_call_id, name: "bash", .. }`
@@ -41,9 +66,15 @@ pub async fn bash(
         .current_dir(workdir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // Own process group: the timeout and the worker's SIGTERM handler
+        // kill the whole group, so pipeline children (`gradlew | tail`,
+        // background jobs, ...) never outlive the tool call.
+        .process_group(0)
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("failed to spawn sh: {e}"))?;
+    set_active_bash_pgid(child.id());
+    let _pgid_guard = BashPgidGuard;
 
     let mut stdout = child
         .stdout
@@ -110,21 +141,36 @@ pub async fn bash(
                 stderr_buf.extend_from_slice(&chunk);
             }
         }
-        let status = child
-            .wait()
-            .await
-            .map_err(|e| format!("failed to wait for command: {e}"))?;
-        Ok::<_, String>((status, stdout_buf, stderr_buf))
+        Ok::<_, String>((stdout_buf, stderr_buf))
     };
-    let (status, stdout_buf, stderr_buf) = match tokio::time::timeout(timeout, run).await {
+    let (stdout_buf, stderr_buf) = match tokio::time::timeout(timeout, run).await {
         Err(_) => {
+            // Kill the whole process group: the direct child is `sh`, and
+            // its pipeline children (gradlew, tail, ...) would otherwise
+            // survive as orphans — `kill_on_drop` only reaches `sh`.
+            if let Some(pid) = child.id() {
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+            let _ = child.kill().await;
+            let _ = child.wait().await; // reap
             return Err(format!(
-                "command timed out after {}s: {command}",
+                "command timed out after {}s: {command}\n\
+                 (the command's process group was killed; note that piping \
+                 output through `tail`/`head` hides all output until the \
+                 command finishes — run long builds with `nohup ... > log \
+                 2>&1 &` and poll the log instead)",
                 timeout.as_secs()
             ));
         }
         Ok(result) => result?,
     };
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("failed to wait for command: {e}"))?;
 
     let mut text = String::new();
     text.push_str(&format!("exit code: {}\n", status.code().unwrap_or(-1)));
@@ -227,5 +273,35 @@ mod tests {
         .await;
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_whole_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = |_: JournalEventKind| {};
+        let err = bash(
+            dir.path(),
+            "sleep 30 & echo $!; wait",
+            Duration::from_millis(300),
+            "call_1",
+            &mut sink,
+        )
+        .await;
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("timed out"));
+
+        // The backgrounded `sleep 30` shares the bash child's process group,
+        // so the timeout must have killed it too — no orphan survives.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("pgrep -f '^sleep 30$' || true")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.trim().is_empty(),
+            "orphaned sleep survived the timeout: {stdout}"
+        );
     }
 }

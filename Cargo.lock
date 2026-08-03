@@ -824,6 +824,7 @@ dependencies = [
  "axum",
  "chrono",
  "futures-util",
+ "libc",
  "mo_core",
  "nah_chat",
  "serde",

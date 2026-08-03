@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use mo_core::{JournalEventKind, JournalWriter, ModelConfig, SessionStatus, db, open_db};
+use mo_core::{JournalEventKind, JournalWriter, ModelConfig, Session, SessionStatus, db, open_db};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -184,6 +184,116 @@ async fn worker_died_is_marked_failed() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(seen_failed, "session was never marked failed");
+}
+
+/// Insert a session row directly (no worker spawn) whose pid is the test
+/// process itself — alive — but whose heartbeat is long stale. This models
+/// a worker whose process survived while its async runtime froze.
+fn insert_stalled_session(data_dir: &Path, id: &str) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let session = Session {
+        id: id.to_string(),
+        parent_id: None,
+        workdir: "/tmp".to_string(),
+        prompt: "stalled".to_string(),
+        model: "default-model".to_string(),
+        status: SessionStatus::Running,
+        pid: Some(std::process::id()),
+        journal_path: data_dir
+            .join("sessions")
+            .join(id)
+            .join("journal.jsonl")
+            .display()
+            .to_string(),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        heartbeat_at: Some((chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339()),
+        error: None,
+    };
+    let conn = open_db(&data_dir.join("mo.db")).unwrap();
+    db::create_session(&conn, &session).unwrap();
+    drop(conn);
+}
+
+#[tokio::test]
+async fn stalled_worker_is_marked_failed_via_get() {
+    let (_dir, app) = setup(false);
+    let id = "stalled-get";
+    insert_stalled_session(&_dir.path().join("data"), id);
+
+    // The pid (this test process) is alive, so only the stale heartbeat
+    // flags the worker as stalled — the session must not stay `running`.
+    let (_, detail) = request(&app, Method::GET, &format!("/api/sessions/{id}"), None).await;
+    assert_eq!(detail["status"], "failed");
+    let error = detail["error"].as_str().unwrap();
+    assert!(error.contains("worker stalled"), "got: {error}");
+    assert!(error.contains("no heartbeat"), "got: {error}");
+}
+
+#[tokio::test]
+async fn stalled_worker_is_marked_failed_via_sse() {
+    let (_dir, app) = setup(false);
+    let id = "stalled-sse";
+    insert_stalled_session(&_dir.path().join("data"), id);
+
+    // The SSE tail must synthesize the failed status change on its own (the
+    // frontend relies on this to recover a stuck session without a reload).
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/sessions/{id}/events"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("\"status\":\"failed\""), "got: {text}");
+    assert!(text.contains("worker stalled"), "got: {text}");
+}
+
+#[tokio::test]
+async fn fresh_heartbeat_is_not_flagged_stalled() {
+    let (_dir, app) = setup(false);
+    let id = "healthy-heartbeat";
+    let now = chrono::Utc::now().to_rfc3339();
+    let session = Session {
+        id: id.to_string(),
+        parent_id: None,
+        workdir: "/tmp".to_string(),
+        prompt: "healthy".to_string(),
+        model: "default-model".to_string(),
+        status: SessionStatus::Running,
+        pid: Some(std::process::id()),
+        journal_path: _dir
+            .path()
+            .join("data")
+            .join("sessions")
+            .join(id)
+            .join("journal.jsonl")
+            .display()
+            .to_string(),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        heartbeat_at: Some(now),
+        error: None,
+    };
+    {
+        let conn = open_db(&_dir.path().join("data").join("mo.db")).unwrap();
+        db::create_session(&conn, &session).unwrap();
+        drop(conn);
+    }
+
+    let (_, detail) = request(&app, Method::GET, &format!("/api/sessions/{id}"), None).await;
+    assert_eq!(
+        detail["status"], "running",
+        "a worker with a fresh heartbeat must not be flagged stalled: {detail}"
+    );
 }
 
 #[tokio::test]

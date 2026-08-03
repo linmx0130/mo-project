@@ -133,10 +133,12 @@ pub fn set_pid(conn: &Connection, id: &str, pid: u32) -> Result<()> {
 
 /// Clear the pid (and any error) before re-running a terminal session, so
 /// the gateway's liveness check does not see the stale pid of a dead worker
-/// and flip the freshly-queued session to `failed`.
+/// and flip the freshly-queued session to `failed`. The stale heartbeat is
+/// cleared too: it belongs to the previous worker, and the stall check must
+/// not flag the freshly-spawned worker before its first heartbeat lands.
 pub fn clear_pid(conn: &Connection, id: &str) -> Result<()> {
     conn.execute(
-        "UPDATE sessions SET pid = NULL, error = NULL, updated_at = ?1 WHERE id = ?2",
+        "UPDATE sessions SET pid = NULL, error = NULL, heartbeat_at = NULL, updated_at = ?1 WHERE id = ?2",
         params![chrono::Utc::now().to_rfc3339(), id],
     )?;
     Ok(())
