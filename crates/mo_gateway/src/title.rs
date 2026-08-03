@@ -17,17 +17,11 @@ use nah_chat::{ChatClient, ChatCompletionParamsBuilder, ChatMessage, ChatMessage
 use crate::state::AppState;
 
 /// The model is asked for a bare title; the mock LLM keys on "short title"
-/// to recognize this request.
+/// to recognize this request. The length restriction lives here, in the
+/// prompt, rather than in a hard `max_tokens` cap: reasoning models may
+/// spend arbitrary tokens on `reasoning_content` before the title text.
 const TITLE_SYSTEM_PROMPT: &str = "Generate a short title for this chat session. Given the user's first \
      message, reply with only the title: at most 6 words, no quotes, no period.";
-
-/// Token budget for the title call. Must leave headroom for reasoning
-/// models: they stream `reasoning_content` before `content`, and a budget
-/// that is too small (e.g. 64) is exhausted by reasoning alone, so the
-/// stream ends (`finish_reason: "length"`) with an empty `content` and the
-/// placeholder title never gets replaced. 512 is plenty for a few reasoning
-/// tokens plus a title of at most 6 words.
-const TITLE_MAX_TOKENS: usize = 512;
 
 /// The placeholder title used from the moment the message is sent until the
 /// generated title lands (or generation is unavailable).
@@ -140,20 +134,16 @@ async fn generate_title(
     }
     let title = message.content.to_string().trim().to_string();
     if title.is_empty() {
-        // Empty content usually means the model spent its whole token
-        // budget on `reasoning_content` and the stream ended before any
-        // title text (`finish_reason: "length"`). Surface that so a too-
-        // small TITLE_MAX_TOKENS does not silently regress into placeholder
-        // titles everywhere.
+        // No hard `max_tokens` cap is set, so an empty content with
+        // reasoning means the model simply never produced title text.
+        // Surface that so odd model behavior is diagnosable instead of
+        // silently leaving every session with the placeholder title.
         if message
             .reasoning_content
             .as_deref()
             .is_some_and(|r| !r.trim().is_empty())
         {
-            tracing::warn!(
-                "title generation returned reasoning but no title content \
-                 (token budget may have been exhausted by reasoning)"
-            );
+            tracing::warn!("title generation returned reasoning but no title content");
         }
         return Ok(None);
     }
@@ -169,7 +159,7 @@ async fn generate_once(
     messages: &[ChatMessage],
 ) -> Result<ChatMessage> {
     let mut params = ChatCompletionParamsBuilder::new();
-    params.max_tokens(TITLE_MAX_TOKENS).temperature(0.0);
+    params.temperature(0.0);
     let stream = chat_client
         .chat_completion_stream(model, messages, &params)
         .await
@@ -209,10 +199,9 @@ mod tests {
 
     /// A tiny mock LLM: responses are keyed on the first user message so
     /// parallel tests stay deterministic. Each request also asserts it
-    /// carried the title system prompt and a token budget that leaves room
-    /// for reasoning models to emit content after their `reasoning_content`
-    /// (a budget of 64 was exhausted by reasoning alone, which is the
-    /// regression this guards against).
+    /// carried the title system prompt and no hard `max_tokens` cap (the
+    /// length restriction lives in the prompt; a cap is what broke title
+    /// generation for reasoning models).
     ///
     /// * message contains "tool"      -> assistant tool call (unusable title)
     /// * message contains "empty"     -> empty assistant content
@@ -231,10 +220,9 @@ mod tests {
                     system.contains("short title"),
                     "title request must carry the title system prompt: {system}"
                 );
-                let max_tokens = body["max_tokens"].as_u64().unwrap_or(0);
                 assert!(
-                    max_tokens >= 512,
-                    "title request needs a token budget that survives reasoning: {max_tokens}"
+                    body.get("max_tokens").is_none(),
+                    "title request must not hard-cap output tokens: {body:?}"
                 );
                 let user = body["messages"]
                     .as_array()
@@ -319,8 +307,7 @@ mod tests {
         let base_url = mock_llm().await;
         // A reasoning model streams `reasoning_content` first; the title
         // must be read from the `content` that follows, never from the
-        // reasoning text. With the old 64-token budget this stream would
-        // have ended (length) before any content arrived.
+        // reasoning text.
         let title = generate_title("reasoning model please", &base_url, "mock-model", None)
             .await
             .unwrap();

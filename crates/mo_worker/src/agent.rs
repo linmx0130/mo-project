@@ -205,10 +205,11 @@ async fn generate_once(
     journal: &mut JournalWriter,
 ) -> Result<ChatMessage> {
     let mut params = ChatCompletionParamsBuilder::new();
-    params
-        .max_tokens(8192)
-        .temperature(0.7)
-        .insert("tools", json!(tools));
+    // No hard `max_tokens` cap: reasoning models may spend arbitrary tokens
+    // on `reasoning_content` before the actual answer, and a cap truncates
+    // the stream before any content arrives. Let the model run until it
+    // finishes on its own.
+    params.temperature(0.7).insert("tools", json!(tools));
     let stream = chat_client
         .chat_completion_stream(model, messages, &params)
         .await
@@ -360,6 +361,10 @@ mod tests {
                         assert!(
                             system.contains("Global rule: answer in lowercase."),
                             "system prompt missing global AGENTS.md: {system}"
+                        );
+                        assert!(
+                            body.get("max_tokens").is_none(),
+                            "worker request must not hard-cap output tokens: {body:?}"
                         );
                         let n = calls.fetch_add(1, Ordering::SeqCst);
                         let body = if n == 0 {
