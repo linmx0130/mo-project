@@ -9,7 +9,7 @@ chrono = "0.4.45"
 dotenvy = "0.15.7"
 futures-util.workspace = true
 mo_core = { version = "0.1.0", path = "../mo_core" }
-nah_chat = { version = "0.7.0", path = "../../../nah/nah_chat" }
+nah_chat = { version = "0.7.0", git = "https://github.com/linmx0130/nah" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
