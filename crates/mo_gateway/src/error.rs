@@ -28,6 +28,13 @@ impl ApiError {
         }
     }
 
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.into(),
+        }
+    }
+
     pub fn internal(error: impl std::fmt::Display) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,

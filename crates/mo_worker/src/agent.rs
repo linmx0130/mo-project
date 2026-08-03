@@ -2,14 +2,15 @@
 //! execute any tool calls, feed results back, and repeat until the model
 //! produces a final answer.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use futures_util::{StreamExt, pin_mut};
 use mo_core::{JournalEventKind, JournalMessage, JournalWriter, Session, ToolCallInfo};
 use nah_chat::{
-    ChatClient, ChatCompletionParamsBuilder, ChatMessage, ChatMessageContentValue, ToolCallRequest,
+    ChatClient, ChatCompletionParamsBuilder, ChatMessage, ChatMessageContentValue,
+    FunctionCallRequest, ToolCallRequest,
 };
 use serde_json::{Value, json};
 
@@ -38,24 +39,21 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
     let chat_client = ChatClient::init(config.model_base_url.clone(), config.auth_token.clone());
     let system_prompt =
         build_system_prompt(&config.workdir, &config.agents_dir, config.subagent_depth);
-    let mut messages: Vec<ChatMessage> = vec![
-        ChatMessage {
-            role: "system".to_string(),
-            content: ChatMessageContentValue::Text(system_prompt),
-            reasoning_content: None,
-            tool_call_id: None,
-            tool_calls: None,
-        },
-        ChatMessage::user_text_message(&config.session.prompt),
-    ];
-    // Journal the user prompt so the journal is a self-contained history.
-    journal.append(JournalEventKind::Message(JournalMessage {
-        role: "user".to_string(),
-        content: config.session.prompt.clone(),
+    // The conversation context is the journal history: user messages are
+    // journaled by the gateway before the worker is spawned, and assistant /
+    // tool messages by previous runs of this session. Rebuilding the context
+    // from the journal makes every run — the first message and any followups
+    // on a completed session — a natural continuation of the same thread.
+    let mut messages = vec![ChatMessage {
+        role: "system".to_string(),
+        content: ChatMessageContentValue::Text(system_prompt),
         reasoning_content: None,
         tool_call_id: None,
         tool_calls: None,
-    }))?;
+    }];
+    messages.extend(history_from_journal(Path::new(
+        &config.session.journal_path,
+    ))?);
     let tools = tools::tool_definitions();
     let tool_ctx = ToolContext {
         workdir: config.workdir.clone(),
@@ -110,6 +108,48 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
         messages.extend(tool_messages);
     }
     bail!("agent exceeded {MAX_TURNS} tool-call turns without producing a final answer");
+}
+
+/// Rebuild the chat context from a session journal. `message` events map
+/// directly to user/assistant messages (tool calls included); `tool_result`
+/// events become the `tool`-role messages that must follow an assistant tool
+/// call. The journal interleaves them in the correct order, so a completed
+/// session can be resumed exactly where it left off.
+fn history_from_journal(journal_path: &Path) -> Result<Vec<ChatMessage>> {
+    let events = mo_core::read_events(journal_path).context("failed to read session journal")?;
+    let mut messages = Vec::new();
+    for event in events {
+        match event.kind {
+            JournalEventKind::Message(m) => messages.push(ChatMessage {
+                role: m.role,
+                content: ChatMessageContentValue::Text(m.content),
+                reasoning_content: m.reasoning_content,
+                tool_call_id: m.tool_call_id,
+                tool_calls: m.tool_calls.map(|calls| {
+                    calls
+                        .into_iter()
+                        .map(|tc: ToolCallInfo| ToolCallRequest {
+                            id: tc.id,
+                            _type: "function".to_string(),
+                            function: FunctionCallRequest {
+                                name: tc.name,
+                                arguments: tc.arguments,
+                            },
+                        })
+                        .collect()
+                }),
+            }),
+            JournalEventKind::ToolResult { id, output, .. } => messages.push(ChatMessage {
+                role: "tool".to_string(),
+                content: ChatMessageContentValue::Text(output),
+                reasoning_content: None,
+                tool_call_id: Some(id),
+                tool_calls: None,
+            }),
+            _ => {}
+        }
+    }
+    Ok(messages)
 }
 
 /// One LLM call with retry/backoff (3 tries, 5s/15s/30s).
@@ -333,6 +373,17 @@ mod tests {
             subagent_depth: 0,
         };
         let mut journal = JournalWriter::open(std::path::Path::new(&session.journal_path)).unwrap();
+        // The gateway journals the user message before spawning the worker;
+        // `run_agent` rebuilds its context from the journal.
+        journal
+            .append(JournalEventKind::Message(JournalMessage {
+                role: "user".to_string(),
+                content: "Read notes.txt and tell me what it says.".to_string(),
+                reasoning_content: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }))
+            .unwrap();
         run_agent(agent_cfg, &mut journal).await.unwrap();
 
         // Journal sequence: user message, assistant(tool call), tool_call_start,

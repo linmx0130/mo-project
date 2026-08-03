@@ -131,6 +131,27 @@ pub fn set_pid(conn: &Connection, id: &str, pid: u32) -> Result<()> {
     Ok(())
 }
 
+/// Clear the pid (and any error) before re-running a terminal session, so
+/// the gateway's liveness check does not see the stale pid of a dead worker
+/// and flip the freshly-queued session to `failed`.
+pub fn clear_pid(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET pid = NULL, error = NULL, updated_at = ?1 WHERE id = ?2",
+        params![chrono::Utc::now().to_rfc3339(), id],
+    )?;
+    Ok(())
+}
+
+/// Set `prompt` only when it is currently empty (a session's first message
+/// becomes its title; followups leave the title untouched).
+pub fn set_prompt_if_empty(conn: &Connection, id: &str, prompt: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET prompt = ?1, updated_at = ?2 WHERE id = ?3 AND prompt = ''",
+        params![prompt, chrono::Utc::now().to_rfc3339(), id],
+    )?;
+    Ok(())
+}
+
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     let status_str: String = row.get(5)?;
     let status = SessionStatus::from_str(&status_str).map_err(|e| {

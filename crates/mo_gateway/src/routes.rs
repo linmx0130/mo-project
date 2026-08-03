@@ -10,7 +10,9 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
-use mo_core::{JournalEvent, Session, SessionStatus, db};
+use mo_core::{
+    JournalEvent, JournalEventKind, JournalMessage, JournalWriter, Session, SessionStatus, db,
+};
 use serde::Deserialize;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -29,6 +31,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}", get(get_session))
         .route("/api/sessions/{id}/history", get(history))
         .route("/api/sessions/{id}/events", get(sse::events))
+        .route("/api/sessions/{id}/messages", post(send_message))
         .route("/api/sessions/{id}/cancel", post(cancel))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -93,7 +96,34 @@ async fn create_session(
         db::create_session(&conn, &session).map_err(ApiError::internal)?;
     }
 
-    match process::spawn_worker(&state, &session) {
+    // Journal the initial user message before the worker starts: the worker
+    // rebuilds its conversation context from the journal, so this is what
+    // makes the journal a self-contained history (and followups work the
+    // same way, via POST /api/sessions/:id/messages).
+    {
+        let mut journal =
+            JournalWriter::open(Path::new(&session.journal_path)).map_err(ApiError::internal)?;
+        journal
+            .append(JournalEventKind::Message(JournalMessage {
+                role: "user".to_string(),
+                content: session.prompt.clone(),
+                reasoning_content: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }))
+            .map_err(ApiError::internal)?;
+    }
+
+    spawn_and_patch(&state, &mut session);
+
+    Ok((StatusCode::CREATED, Json(session)))
+}
+
+/// Spawn the worker for a session and update the session struct with the
+/// resulting pid — or mark it `failed` (DB + struct) when spawning fails.
+fn spawn_and_patch(state: &AppState, session: &mut Session) {
+    let id = session.id.clone();
+    match process::spawn_worker(state, session) {
         Ok(pid) => {
             session.pid = Some(pid);
             let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
@@ -112,8 +142,76 @@ async fn create_session(
             session.error = Some(format!("failed to spawn worker: {e}"));
         }
     }
+}
 
-    Ok((StatusCode::CREATED, Json(session)))
+#[derive(Deserialize)]
+struct SendMessageRequest {
+    content: String,
+}
+
+/// POST /api/sessions/:id/messages — continue a terminal session with a new
+/// user message: journal it, reset the session to `pending`, and spawn a
+/// fresh worker that picks up the full journal history.
+async fn send_message(
+    State(state): State<Arc<AppState>>,
+    PathParam(id): PathParam<String>,
+    Json(payload): Json<SendMessageRequest>,
+) -> ApiResult<(StatusCode, Json<Session>)> {
+    if payload.content.trim().is_empty() {
+        return Err(ApiError::bad_request("message must not be empty"));
+    }
+    let (status, pid, journal_path) = {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        match db::get_session(&conn, &id).map_err(ApiError::internal)? {
+            Some(session) => (session.status, session.pid, session.journal_path),
+            None => return Err(ApiError::not_found("session not found")),
+        }
+    };
+    if status == SessionStatus::Running || status == SessionStatus::Pending {
+        return Err(ApiError::conflict("session is already running"));
+    }
+    // A just-cancelled session's worker may still be dying (cancel records
+    // the status before the kill finishes); refuse to overlap it.
+    if pid.is_some_and(process::is_pid_alive) {
+        return Err(ApiError::conflict("session worker is still shutting down"));
+    }
+
+    // Journal the user message; the worker's context is rebuilt from the
+    // journal, so this is what continues the conversation.
+    {
+        let mut journal =
+            JournalWriter::open(Path::new(&journal_path)).map_err(ApiError::internal)?;
+        journal
+            .append(JournalEventKind::Message(JournalMessage {
+                role: "user".to_string(),
+                content: payload.content.clone(),
+                reasoning_content: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }))
+            .map_err(ApiError::internal)?;
+    }
+
+    {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        // The first message of a session becomes its title (the sidebar and
+        // header render `prompt`); followups keep the original title.
+        let _ = db::set_prompt_if_empty(&conn, &id, &payload.content);
+        // Clear the stale pid of the dead worker so the liveness check does
+        // not flip the freshly-queued session to `failed`, then queue it.
+        db::clear_pid(&conn, &id).map_err(ApiError::internal)?;
+        db::update_status(&conn, &id, SessionStatus::Pending, None).map_err(ApiError::internal)?;
+    }
+
+    let mut session = {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::get_session(&conn, &id)
+            .map_err(ApiError::internal)?
+            .expect("session row exists")
+    };
+    spawn_and_patch(&state, &mut session);
+
+    Ok((StatusCode::ACCEPTED, Json(session)))
 }
 
 /// GET /api/sessions — newest first.
@@ -187,11 +285,16 @@ async fn cancel(
         }
     };
     if status == SessionStatus::Running || status == SessionStatus::Pending {
+        // Mark the session cancelled *before* killing: the kill has a grace
+        // period, and while it is in flight the liveness check would see a
+        // dead pid with a `running` status and race the session to `failed`.
+        {
+            let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = db::update_status(&conn, &id, SessionStatus::Cancelled, None);
+        }
         if let Some(pid) = pid {
             process::cancel_session_pid(pid).await;
         }
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = db::update_status(&conn, &id, SessionStatus::Cancelled, None);
     }
     let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
     let session = db::get_session(&conn, &id).map_err(ApiError::internal)?;

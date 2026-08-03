@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { JournalEvent, JournalMessage, Session, SessionStatus } from '../api'
-import { cancelSession, getHistory, getSession } from '../api'
+import { cancelSession, getHistory, getSession, postMessage } from '../api'
+import Composer from './Composer'
 
 interface Props {
   session: Session
@@ -52,6 +53,10 @@ export default function SessionView({ session, onStatusChange }: Props) {
   const [events, setEvents] = useState<JournalEvent[]>([])
   const [error, setError] = useState<string | null>(null)
   const [cancelling, setCancelling] = useState(false)
+  const [sending, setSending] = useState(false)
+  // Bumped on every send: a terminal session's SSE stream is closed, so a
+  // followup must re-arm it to watch the new run.
+  const [runId, setRunId] = useState(0)
   const lastSeqRef = useRef<number | null>(null)
   const terminalSeenRef = useRef(isTerminal(session.status))
 
@@ -61,6 +66,7 @@ export default function SessionView({ session, onStatusChange }: Props) {
     // duplicate events.
     let cancelled = false
     let es: EventSource | null = null
+    terminalSeenRef.current = false
 
     ;(async () => {
       try {
@@ -110,9 +116,10 @@ export default function SessionView({ session, onStatusChange }: Props) {
       cancelled = true
       es?.close()
     }
-  }, [session.id, onStatusChange])
+  }, [session.id, onStatusChange, runId])
 
-  const cancel = async () => {
+  /** Stop the running worker (SIGTERM → SIGKILL the process group). */
+  const stop = async () => {
     setCancelling(true)
     try {
       const updated = await cancelSession(session.id)
@@ -126,13 +133,34 @@ export default function SessionView({ session, onStatusChange }: Props) {
     }
   }
 
+  /** Send a followup message; the backend respawns the worker on the same
+   *  session, continuing from the journal history. */
+  const send = async (text: string): Promise<boolean> => {
+    setSending(true)
+    try {
+      const updated = await postMessage(session.id, text)
+      setStatus(updated.status)
+      // The previous SSE stream closed at the terminal status; re-arm it so
+      // the new run streams in.
+      setRunId((r) => r + 1)
+      onStatusChange()
+      return true
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      return false
+    } finally {
+      setSending(false)
+    }
+  }
+
+  const running = status === 'running' || status === 'pending'
   const timeline = buildTimeline(events)
 
   return (
     <div className="session-view">
       <header className="session-header">
         <div>
-          <h2>{session.prompt}</h2>
+          <h2>{session.prompt || 'Untitled session'}</h2>
           <p className="muted">
             {session.workdir}
             {session.model ? ` · ${session.model}` : ''} ·{' '}
@@ -142,16 +170,6 @@ export default function SessionView({ session, onStatusChange }: Props) {
         </div>
         <div className="header-actions">
           <span className={`badge badge-${status}`}>{status}</span>
-          {!isTerminal(status) && (
-            <button
-              type="button"
-              className="cancel"
-              onClick={cancel}
-              disabled={cancelling}
-            >
-              {cancelling ? 'Cancelling…' : 'Cancel'}
-            </button>
-          )}
         </div>
       </header>
 
@@ -162,13 +180,22 @@ export default function SessionView({ session, onStatusChange }: Props) {
           'kind' in item ? (
             <EventRow key={item.seq ?? `synth-${i}`} event={item} />
           ) : (
-            <ToolBlockRow key={item.id} block={item} />
+            // Tool-call ids come from the model and repeat across followup
+            // runs (e.g. a mock replaying `call_slow`), so disambiguate.
+            <ToolBlockRow key={`${item.id}-${i}`} block={item} />
           ),
         )}
         {timeline.length === 0 && (
           <p className="muted list-empty">Waiting for events…</p>
         )}
       </div>
+
+      <Composer
+        running={running}
+        busy={sending || cancelling}
+        onStop={() => void stop()}
+        onSubmit={send}
+      />
     </div>
   )
 }

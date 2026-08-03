@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { Session } from './api'
 import { listSessions } from './api'
-import NewSessionForm from './components/NewSessionForm'
+import DraftSession from './components/DraftSession'
 import SessionList from './components/SessionList'
 import SessionView from './components/SessionView'
 
 function App() {
   const [sessions, setSessions] = useState<Session[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [draftOpen, setDraftOpen] = useState(false)
+  const [lastWorkdir, setLastWorkdir] = useState('')
 
   const refresh = useCallback(async () => {
     try {
@@ -28,6 +30,22 @@ function App() {
     }
   }, [refresh])
 
+  const openDraft = () => {
+    setDraftOpen(true)
+    setSelectedId(null)
+  }
+
+  const selectSession = (id: string) => {
+    setDraftOpen(false)
+    setSelectedId(id)
+  }
+
+  const handleCreated = (s: Session) => {
+    setLastWorkdir(s.workdir)
+    selectSession(s.id)
+    void refresh()
+  }
+
   const selected = sessions.find((s) => s.id === selectedId) ?? null
 
   return (
@@ -38,20 +56,19 @@ function App() {
             mo <span className="subtitle">agent harness</span>
           </h1>
         </header>
-        <NewSessionForm
-          onCreated={(s) => {
-            setSelectedId(s.id)
-            void refresh()
-          }}
-        />
+        <button type="button" className="new-session-btn" onClick={openDraft}>
+          + New session
+        </button>
         <SessionList
           sessions={sessions}
           selectedId={selectedId}
-          onSelect={setSelectedId}
+          onSelect={selectSession}
         />
       </aside>
       <main className="main">
-        {selected ? (
+        {draftOpen ? (
+          <DraftSession defaultWorkdir={lastWorkdir} onCreated={handleCreated} />
+        ) : selected ? (
           <SessionView
             key={selected.id}
             session={selected}
@@ -59,7 +76,7 @@ function App() {
           />
         ) : (
           <div className="empty muted">
-            Select a session on the left, or start a new one.
+            Start a new session, or pick one from the list.
           </div>
         )}
       </main>

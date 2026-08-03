@@ -61,8 +61,10 @@ cd frontend && npm install && npm run dev
 ```
 
 Point the UI at a workdir (an absolute path containing the files the agent
-may touch — it is sandboxed there), type a prompt, and watch the session
-stream live. Cancel stops the worker and its process group.
+may touch — it is sandboxed there), type a message, and watch the session
+stream live. **Stop** kills the worker and its process group. When a run
+finishes or is stopped, the composer unlocks: follow-up messages resume the
+same session, and the worker rebuilds its context from the journal history.
 
 ### No API key? Use the mock
 
@@ -125,7 +127,8 @@ $HOME/.agents/
 | `GET /api/sessions/:id` | detail; liveness check flips dead workers to `failed` |
 | `GET /api/sessions/:id/history?after_seq=N` | journal events after `N` |
 | `GET /api/sessions/:id/events` | SSE tail: new events + synthesized status changes |
-| `POST /api/sessions/:id/cancel` | SIGTERM → SIGKILL the worker process group |
+| `POST /api/sessions/:id/messages` `{content}` | continue a terminal session: journal the user message, reset to `pending`, respawn the worker |
+| `POST /api/sessions/:id/cancel` | mark cancelled, then SIGTERM → SIGKILL the worker process group |
 
 Session status: `pending | running | completed | failed | cancelled`.
 Journal events: `message`, `tool_call_start`, `tool_result`, `status_change`

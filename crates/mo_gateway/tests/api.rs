@@ -188,6 +188,8 @@ async fn history_returns_events_and_respects_after_seq() {
         .unwrap();
     drop(journal);
 
+    // The gateway journals the initial user message at creation (seq 0),
+    // then the test appends two more events.
     let (status, events) = request(
         &app,
         Method::GET,
@@ -196,18 +198,19 @@ async fn history_returns_events_and_respects_after_seq() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(events.as_array().unwrap().len(), 2);
+    assert_eq!(events.as_array().unwrap().len(), 3);
+    assert_eq!(events[0]["kind"]["kind"], "message");
 
     let (status, after) = request(
         &app,
         Method::GET,
-        &format!("/api/sessions/{id}/history?after_seq=0"),
+        &format!("/api/sessions/{id}/history?after_seq=1"),
         None,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(after.as_array().unwrap().len(), 1);
-    assert_eq!(after[0]["seq"], 1);
+    assert_eq!(after[0]["seq"], 2);
     assert_eq!(after[0]["kind"]["kind"], "status_change");
 }
 
@@ -295,14 +298,15 @@ async fn sse_streams_journal_events_and_closes_on_terminal() {
     assert!(text.contains("\"role\":\"assistant\""), "got: {text}");
     assert!(text.contains("\"status\":\"completed\""), "got: {text}");
 
-    // Connecting with a cursor past everything must NOT re-synthesize the
-    // journaled terminal status (the first poll seeds journal_status from
-    // the whole journal).
+    // Connecting with a cursor past every journaled event must NOT
+    // re-synthesize the terminal status (the first poll seeds journal_status
+    // from the whole journal). The journal now has 3 events: the initial
+    // user message (seq 0, gateway), assistant (seq 1), status change (seq 2).
     let response = app
         .clone()
         .oneshot(
             Request::builder()
-                .uri(format!("/api/sessions/{id}/events?after_seq=1"))
+                .uri(format!("/api/sessions/{id}/events?after_seq=2"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -316,6 +320,82 @@ async fn sse_streams_journal_events_and_closes_on_terminal() {
         !text.contains("status_change"),
         "terminal status should not be re-synthesized, got: {text}"
     );
+}
+
+#[tokio::test]
+async fn followup_message_respawns_worker_and_journals() {
+    let (_dir, app) = setup(true);
+    let workdir = _dir.path().join("work");
+
+    let (_, session) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({ "workdir": workdir.display().to_string(), "prompt": "first message" })),
+    )
+    .await;
+    let id = session["id"].as_str().unwrap().to_string();
+    let journal_path = session["journal_path"].as_str().unwrap().to_string();
+
+    // Reject a message while the session is still queued/running.
+    let (status, _) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{id}/messages"),
+        Some(json!({ "content": "too soon" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Stop it, then send a followup: the worker respawns and the session is
+    // queued as pending again.
+    let (_, stopped) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{id}/cancel"),
+        None,
+    )
+    .await;
+    assert_eq!(stopped["status"], "cancelled");
+
+    let (status, resumed) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{id}/messages"),
+        Some(json!({ "content": "follow up" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(resumed["status"], "pending");
+    let pid = resumed["pid"].as_u64().unwrap() as u32;
+    assert!(process_is_alive(pid), "followup worker should be running");
+
+    // The journal holds the initial prompt plus the followup message.
+    let events = mo_core::read_events(Path::new(&journal_path)).unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(
+        matches!(&events[1].kind, JournalEventKind::Message(m) if m.role == "user" && m.content == "follow up")
+    );
+
+    // Blank content is rejected.
+    let (status, _) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{id}/messages"),
+        Some(json!({ "content": "   " })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Unknown session is 404.
+    let (status, _) = request(
+        &app,
+        Method::POST,
+        "/api/sessions/nope/messages",
+        Some(json!({ "content": "x" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 fn process_is_alive(pid: u32) -> bool {

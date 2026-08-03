@@ -82,6 +82,16 @@ export function createSession(workdir: string, prompt: string): Promise<Session>
   })
 }
 
+/** Send a followup message to a terminal session; the worker respawns and
+ *  continues the conversation from the journal history. */
+export function postMessage(id: string, content: string): Promise<Session> {
+  return http(`/api/sessions/${id}/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content }),
+  })
+}
+
 export function getHistory(id: string, afterSeq?: number): Promise<JournalEvent[]> {
   const q = afterSeq !== undefined ? `?after_seq=${afterSeq}` : ''
   return http(`/api/sessions/${id}/history${q}`)
