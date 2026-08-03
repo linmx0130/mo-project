@@ -10,6 +10,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() {
+    // Load MO_* config from a `.env` file in the project folder (secrets
+    // stay out of the shell); spawned workers inherit this process env.
+    let _ = dotenvy::dotenv();
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()

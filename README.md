@@ -79,6 +79,11 @@ The mock responds based on the prompt: prompts containing `subagent` exercise
 
 ## Env vars
 
+All `MO_*` vars may be set in the shell **or in a `.env` file in the project
+folder** (loaded at startup; `.env` is gitignored). The gateway passes its
+environment — including anything loaded from `.env` — to every spawned
+worker.
+
 | Var | Used by | Default |
 | --- | --- | --- |
 | `MO_DATA_DIR` | gateway + worker | `./data` |

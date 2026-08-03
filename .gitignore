@@ -4,6 +4,9 @@
 # Runtime data (SQLite DB + session journals)
 /data
 
+# Local secrets / model config
+.env
+
 # Node / frontend
 node_modules
 dist

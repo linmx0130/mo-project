@@ -50,6 +50,29 @@ pub fn is_pid_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// "worker died" error enriched with the tail of the worker's log so the
+/// UI surfaces the real cause (e.g. a missing env var or a startup error).
+pub fn worker_died_error(data_dir: &std::path::Path, id: &str) -> String {
+    let log_path = data_dir.join("sessions").join(id).join("worker.log");
+    let tail = std::fs::read_to_string(&log_path)
+        .ok()
+        .map(|content| {
+            content
+                .lines()
+                .rev()
+                .take(8)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|tail| !tail.trim().is_empty())
+        .map(|tail| format!(": {tail}"))
+        .unwrap_or_default();
+    format!("worker died{tail}")
+}
+
 /// SIGTERM the process group, give it a grace period, then SIGKILL the
 /// group and the pid. The worker runs in its own process group (pgid ==
 /// pid), so subagents spawned by it are covered too.

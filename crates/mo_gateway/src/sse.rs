@@ -113,7 +113,7 @@ pub async fn events(
                     &conn,
                     &id,
                     SessionStatus::Failed,
-                    Some("worker died".to_string()),
+                    Some(process::worker_died_error(&db_state.data_dir, &id)),
                 );
             }
             let should_synthesize = match journal_status {

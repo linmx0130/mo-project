@@ -139,14 +139,10 @@ async fn get_session(
     if (session.status == SessionStatus::Running || session.status == SessionStatus::Pending)
         && session.pid.is_some_and(|pid| !process::is_pid_alive(pid))
     {
-        let _ = db::update_status(
-            &conn,
-            &id,
-            SessionStatus::Failed,
-            Some("worker died".to_string()),
-        );
+        let error = process::worker_died_error(&state.data_dir, &id);
+        let _ = db::update_status(&conn, &id, SessionStatus::Failed, Some(error.clone()));
         session.status = SessionStatus::Failed;
-        session.error = Some("worker died".to_string());
+        session.error = Some(error);
     }
     Ok(Json(session))
 }

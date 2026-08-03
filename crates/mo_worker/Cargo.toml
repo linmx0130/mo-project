@@ -6,6 +6,7 @@ version.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono = "0.4.45"
+dotenvy = "0.15.7"
 futures-util.workspace = true
 mo_core = { version = "0.1.0", path = "../mo_core" }
 nah_chat = { version = "0.7.0", path = "../../../nah/nah_chat" }
