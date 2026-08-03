@@ -28,6 +28,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/api/meta", get(meta))
+        .route("/api/models", get(list_models))
         .route("/api/sessions", post(create_session).get(list_sessions))
         .route("/api/sessions/{id}", get(get_session))
         .route("/api/sessions/{id}/history", get(history))
@@ -57,10 +58,45 @@ async fn meta(State(state): State<Arc<AppState>>) -> Json<MetaResponse> {
     })
 }
 
+/// A model the user can pick when creating a session. `nickname` is the
+/// optional human-readable label from the config; `default` marks the first
+/// model in the config, which is what a session uses when none is chosen.
+#[derive(Serialize)]
+struct ModelInfo {
+    nickname: Option<String>,
+    name: String,
+    base_url: String,
+    default: bool,
+}
+
+/// GET /api/models — the configured models, first one default.
+async fn list_models(State(state): State<Arc<AppState>>) -> Json<Vec<ModelInfo>> {
+    let mut default = true;
+    Json(
+        state
+            .models
+            .iter()
+            .map(|model| {
+                let is_default = default;
+                default = false;
+                ModelInfo {
+                    nickname: model.nickname.clone(),
+                    name: model.name.clone(),
+                    base_url: model.base_url.clone(),
+                    default: is_default,
+                }
+            })
+            .collect(),
+    )
+}
+
 #[derive(Deserialize)]
 struct CreateSessionRequest {
     workdir: String,
     prompt: String,
+    /// Model name from `GET /api/models`; empty/absent picks the default
+    /// (first) model.
+    model: Option<String>,
 }
 
 /// POST /api/sessions — validate workdir, insert the session row, spawn the
@@ -90,7 +126,17 @@ async fn create_session(
         .join("sessions")
         .join(&id)
         .join("journal.jsonl");
-    let model = std::env::var("MO_MODEL_NAME").unwrap_or_default();
+    // Resolve the model: the client picks one by name from /api/models;
+    // absent/empty means the default (first) model from the config. The
+    // resolved model's env vars are passed to the worker at spawn.
+    let model = match &payload.model {
+        Some(name) if !name.trim().is_empty() => state
+            .find_model(name)
+            .ok_or_else(|| ApiError::bad_request(format!("unknown model: {name}")))?,
+        _ => state
+            .default_model()
+            .ok_or_else(|| ApiError::internal("no models configured"))?,
+    };
     // The `prompt` column doubles as the session title (sidebar + header
     // render it). A new session gets a timestamped placeholder right away;
     // a separate gateway-side LLM call replaces it with a generated title
@@ -103,7 +149,7 @@ async fn create_session(
         parent_id: None,
         workdir: workdir.display().to_string(),
         prompt: crate::title::placeholder_title(),
-        model,
+        model: model.name.clone(),
         status: SessionStatus::Pending,
         pid: None,
         journal_path: journal_path.display().to_string(),

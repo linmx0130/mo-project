@@ -34,12 +34,20 @@ pub fn placeholder_title() -> String {
 
 /// Kick off title generation for a freshly created session on a background
 /// thread and write the result back to the DB when it lands. Failures are
-/// logged and leave the placeholder title in place.
+/// logged and leave the placeholder title in place. The default (first)
+/// model from the config file is used.
 ///
 /// A dedicated OS thread with its own current-thread runtime is used because
 /// nah_chat's stream future is `!Send` and cannot be driven by a
 /// `tokio::spawn` task on the shared gateway runtime.
 pub fn spawn_title_generation(state: Arc<AppState>, session_id: String, first_message: String) {
+    let Some(model) = state.default_model().cloned() else {
+        tracing::debug!(
+            session = %session_id,
+            "no model configured; keeping placeholder title"
+        );
+        return;
+    };
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -51,16 +59,11 @@ pub fn spawn_title_generation(state: Arc<AppState>, session_id: String, first_me
                 return;
             }
         };
-        let base_url = std::env::var("MO_MODEL_BASE_URL").unwrap_or_default();
-        let model = std::env::var("MO_MODEL_NAME").unwrap_or_default();
-        let auth_token = std::env::var("MO_AUTH_TOKEN")
-            .ok()
-            .filter(|v| !v.is_empty());
         match rt.block_on(generate_title(
             &first_message,
-            &base_url,
-            &model,
-            auth_token,
+            &model.base_url,
+            &model.name,
+            model.token.clone(),
         )) {
             Ok(Some(generated)) => {
                 let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
@@ -106,8 +109,8 @@ async fn generate_title(
     auth_token: Option<String>,
 ) -> Result<Option<String>> {
     if base_url.is_empty() || model.is_empty() {
-        // Same env vars the workers need; without them there is nothing to
-        // call and the placeholder is the intended title.
+        // No usable model configuration; the placeholder is the intended
+        // title.
         return Ok(None);
     }
     let client = ChatClient::init(base_url.to_string(), auth_token);

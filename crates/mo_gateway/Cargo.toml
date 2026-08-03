@@ -8,7 +8,6 @@ anyhow.workspace = true
 async-stream = "0.3.6"
 axum = "0.8.9"
 chrono = "0.4.45"
-dotenvy = "0.15.7"
 futures-util.workspace = true
 libc = "0.2.189"
 mo_core = { version = "0.1.0", path = "../mo_core" }

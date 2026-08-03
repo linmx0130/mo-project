@@ -29,6 +29,17 @@ export interface Meta {
   cwd: string
 }
 
+/** A configured model (GET /api/models). The first one is the default. */
+export interface ModelInfo {
+  /** Optional human-readable label from mo.toml. */
+  nickname: string | null
+  /** Model name; sent as `model` when creating a session. */
+  name: string
+  base_url: string
+  /** True for the first (default) model in the config. */
+  default: boolean
+}
+
 export interface ToolCallInfo {
   id: string
   name: string
@@ -86,15 +97,24 @@ export function getMeta(): Promise<Meta> {
   return http('/api/meta')
 }
 
+/** The configured models (from mo.toml); the first one is the default. */
+export function getModels(): Promise<ModelInfo[]> {
+  return http('/api/models')
+}
+
 export function getSession(id: string): Promise<Session> {
   return http(`/api/sessions/${id}`)
 }
 
-export function createSession(workdir: string, prompt: string): Promise<Session> {
+export function createSession(
+  workdir: string,
+  prompt: string,
+  model?: string,
+): Promise<Session> {
   return http('/api/sessions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ workdir, prompt }),
+    body: JSON.stringify(model ? { workdir, prompt, model } : { workdir, prompt }),
   })
 }
 

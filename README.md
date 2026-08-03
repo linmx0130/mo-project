@@ -21,10 +21,10 @@ Frontend  <->  Gateway Service  <->  Agent worker(s)
 
 | Piece | Role |
 | --- | --- |
-| `mo_core` | Shared types, JSONL journal I/O, SQLite metadata DB (WAL) |
-| `mo_gateway` | axum HTTP service: sessions CRUD, history, SSE live updates, worker spawn/kill (port 3000) |
+| `mo_core` | Shared types, JSONL journal I/O, SQLite metadata DB (WAL), TOML config |
+| `mo_gateway` | axum HTTP service: sessions CRUD, history, SSE live updates, worker spawn/kill (port 3031) |
 | `mo_worker` | One process per session: runs the LLM agent loop (via `nah_chat`) with tools `read_file`, `edit_file`, `bash`, `spawn_subagent` |
-| `frontend` | React 19 + Vite + TS UI (Vite dev proxy `/api → :3000`) |
+| `frontend` | React 19 + Vite + TS UI (Vite dev server on 3030, proxy `/api → :3031`) |
 
 Workers append chat/tool events to a per-session `journal.jsonl` and update
 their own row in the shared SQLite DB; the gateway only reads files + DB and
@@ -35,47 +35,89 @@ SSE (`GET /api/sessions/:id/events`).
 
 ```
 Cargo.toml                 # workspace, resolver 3, edition 2024
+mo.toml.example            # example config file (copy to mo.toml)
 crates/
-  mo_core/                 # shared lib: types, journal, db
-  mo_gateway/              # axum binary (port 3000)
+  mo_core/                 # shared lib: types, journal, config, db
+  mo_gateway/              # axum binary (port 3031)
   mo_worker/               # agent worker binary
 frontend/                  # React 19 + Vite + TS
 scripts/mock_llm.py        # OpenAI-compatible mock LLM for smoke tests
 data/                      # runtime data dir (gitignored): mo.db + sessions/<id>/
 ```
 
+## Configuration (`mo.toml`)
+
+All configuration lives in a TOML file — models, ports, data dir, agents
+dir, subagent depth. The gateway resolves it in this order:
+
+1. `--config <file>` passed to `mo_gateway`
+2. `$PWD/mo.toml`
+3. `$HOME/.config/mo-agents/mo.toml`
+
+With no config file anywhere, the gateway falls back to the legacy `MO_*`
+env vars (`MO_MODEL_BASE_URL`, `MO_MODEL_NAME`, `MO_AUTH_TOKEN`,
+`MO_DATA_DIR`, `MO_PORT`, ...). See `mo.toml.example` for a fully commented
+template; the essentials:
+
+```toml
+port = 3031                    # gateway HTTP port (default 3031)
+# data_dir = "./data"          # runtime data (default ./data)
+# agents_dir = "~/.agents"     # global agents dir (default $HOME/.agents)
+# subagent_depth = 0           # worker subagent depth (default 0, cap 3)
+
+# At least one model is required. The first one is the default model used
+# to launch jobs and generate session titles; it is pre-selected in the
+# "New session" UI.
+[[models]]
+base_url = "https://api.deepseek.com"
+name = "deepseek-v4-flash"
+token = "sk-..."               # optional: omit for endpoints without auth
+nickname = "deepseek"          # optional label shown in the UI
+
+[[models]]
+base_url = "http://127.0.0.1:9001"
+name = "smoke-model"
+```
+
+Workers are spawned with the chosen session's model (base URL, name, token)
+plus the data dir / agents dir / subagent depth in their environment, so a
+config file replaces the old env-var setup entirely. The worker also falls
+back to the same config file when run standalone.
+
 ## Run it
 
 Prereqs: Rust 1.85+ (edition 2024), Node 20+.
 
 ```sh
+# 0. Configure: copy the example and fill in your models
+cp mo.toml.example mo.toml
+$EDITOR mo.toml
+
 # 1. Build
 cargo build --workspace
 
-# 2. Gateway (workers are spawned from target/debug/mo_worker by default;
-#    the model env vars are inherited by every spawned worker)
-MO_MODEL_BASE_URL=https://api.deepseek.com \
-MO_MODEL_NAME=deepseek-v4-flash \
-MO_AUTH_TOKEN=sk-... \
-cargo run -p mo_gateway
+# 2. Gateway (port 3031 by default; --config to point at a config file)
+cargo run -p mo_gateway            # or: target/debug/mo_gateway --config /path/to/mo.toml
 
-# 3. Frontend (dev server with /api proxy to :3000)
+# 3. Frontend (dev server on http://localhost:3030, /api proxied to :3031)
 cd frontend && npm install && npm run dev
-# -> http://localhost:5173
 ```
 
 Point the UI at a workdir (an absolute path containing the files the agent
-may touch — it is sandboxed there), type a message, and watch the session
-stream live. **Stop** kills the worker and its process group. When a run
-finishes or is stopped, the composer unlocks: follow-up messages resume the
-same session, and the worker rebuilds its context from the journal history.
+may touch — it is sandboxed there), pick a model (the first configured one
+is pre-selected), type a message, and watch the session stream live.
+**Stop** kills the worker and its process group. When a run finishes or is
+stopped, the composer unlocks: follow-up messages resume the same session,
+and the worker rebuilds its context from the journal history.
 
 ### No API key? Use the mock
 
 ```sh
 python3 scripts/mock_llm.py 9001 &      # replays canned SSE responses
-MO_MODEL_BASE_URL=http://127.0.0.1:9001 \
-MO_MODEL_NAME=smoke-model \
+# configure the mock as the default model in mo.toml:
+#   [[models]]
+#   base_url = "http://127.0.0.1:9001"
+#   name = "smoke-model"
 cargo run -p mo_gateway
 ```
 
@@ -100,12 +142,11 @@ preview for the canonical, complete text. Delta events are skipped when the
 worker rebuilds chat history from the journal, so the model context stays
 clean.
 
-## Env vars
+## Legacy env vars
 
-All `MO_*` vars may be set in the shell **or in a `.env` file in the project
-folder** (loaded at startup; `.env` is gitignored). The gateway passes its
-environment — including anything loaded from `.env` — to every spawned
-worker.
+Configuration lives in `mo.toml` (see above). When no config file is found,
+the gateway (and a standalone worker) falls back to these `MO_*` env vars —
+kept for existing setups; new deployments should use the config file:
 
 | Var | Used by | Default |
 | --- | --- | --- |
@@ -116,7 +157,7 @@ worker.
 | `MO_AUTH_TOKEN` | worker | unset |
 | `MO_SUBAGENT_DEPTH` | worker | `0` (hard cap `3`) |
 | `MO_WORKER_BIN` | gateway | sibling of `mo_gateway` exe named `mo_worker` |
-| `MO_PORT` | gateway | `3000` |
+| `MO_PORT` | gateway | `3031` |
 
 ## Global agent data (`$HOME/.agents`)
 
@@ -144,7 +185,8 @@ $HOME/.agents/
 | Endpoint | Description |
 | --- | --- |
 | `GET /api/meta` | static gateway metadata: `{cwd}` (gateway startup dir, used as the default session workdir) |
-| `POST /api/sessions` `{workdir, prompt}` | create session + spawn worker |
+| `GET /api/models` | configured models from `mo.toml` (`[{nickname, name, base_url, default}]`; first one is `default`) |
+| `POST /api/sessions` `{workdir, prompt, model?}` | create session + spawn worker (`model` = model name from `/api/models`; default when absent) |
 | `GET /api/sessions` | list (newest first) |
 | `GET /api/sessions/:id` | detail; liveness check flips dead workers to `failed` |
 | `GET /api/sessions/:id/history?after_seq=N` | journal events after `N` |
@@ -161,10 +203,11 @@ and reasoning) and `tool_output_delta` (live bash output) — JSONL, `seq` +
 ### Session titles
 
 A new session is titled `New session - <time>` the moment the message is
-sent. The gateway then makes a short, separate LLM call (same model env
-vars as the worker) to generate a simple title from the first user message
-and updates the DB — and with it the sidebar/header — when it lands. If no
-model is configured or the call fails, the timestamped placeholder stays.
+sent. The gateway then makes a short, separate LLM call — using the default
+(first) model from `mo.toml` — to generate a simple title from the first
+user message and updates the DB — and with it the sidebar/header — when it
+lands. If no model is configured or the call fails, the timestamped
+placeholder stays.
 
 ## Development
 

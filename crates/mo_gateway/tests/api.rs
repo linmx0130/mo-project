@@ -8,12 +8,29 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use mo_core::{JournalEventKind, JournalWriter, SessionStatus, db, open_db};
+use mo_core::{JournalEventKind, JournalWriter, ModelConfig, SessionStatus, db, open_db};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use mo_gateway::routes::create_router;
 use mo_gateway::state::AppState;
+
+fn test_models() -> Vec<ModelConfig> {
+    vec![
+        ModelConfig {
+            base_url: "http://127.0.0.1:9001".into(),
+            name: "default-model".into(),
+            token: Some("tok-1".into()),
+            nickname: Some("alpha".into()),
+        },
+        ModelConfig {
+            base_url: "http://127.0.0.1:9002".into(),
+            name: "second-model".into(),
+            token: None,
+            nickname: None,
+        },
+    ]
+}
 
 fn write_stub_worker(dir: &Path, body: &str) -> std::path::PathBuf {
     let path = dir.join("stub_worker.sh");
@@ -41,6 +58,9 @@ fn setup(sleep: bool) -> (tempfile::TempDir, Router) {
         db: Mutex::new(conn),
         worker_bin,
         cwd: std::env::current_dir().unwrap(),
+        agents_dir: dir.path().join("agents"),
+        subagent_depth: 0,
+        models: test_models(),
     });
     (dir, create_router(state))
 }
@@ -464,6 +484,67 @@ async fn followup_message_respawns_worker_and_journals() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn models_endpoint_lists_models_first_is_default() {
+    let (_dir, app) = setup(false);
+    let (status, models) = request(&app, Method::GET, "/api/models", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let models = models.as_array().unwrap();
+    assert_eq!(models.len(), 2);
+    assert_eq!(models[0]["name"], "default-model");
+    assert_eq!(models[0]["default"], true);
+    assert_eq!(models[0]["nickname"], "alpha");
+    assert_eq!(models[1]["name"], "second-model");
+    assert_eq!(models[1]["default"], false);
+    assert!(models[1]["nickname"].is_null());
+}
+
+#[tokio::test]
+async fn create_session_uses_default_model_and_accepts_model_choice() {
+    let (_dir, app) = setup(false);
+    let workdir = _dir.path().join("work");
+
+    // No model -> the default (first) model is stored on the session.
+    let (status, session) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({ "workdir": workdir.display().to_string(), "prompt": "hi" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(session["model"], "default-model");
+
+    // Explicit model name -> stored on the session.
+    let (status, session) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({
+            "workdir": workdir.display().to_string(),
+            "prompt": "hi again",
+            "model": "second-model",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(session["model"], "second-model");
+
+    // Unknown model name -> 400.
+    let (status, _) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({
+            "workdir": workdir.display().to_string(),
+            "prompt": "hi",
+            "model": "nope-model",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 fn process_is_alive(pid: u32) -> bool {

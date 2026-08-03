@@ -442,6 +442,27 @@ p {
   border-color: var(--accent);
 }
 
+.field select {
+  width: 100%;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-h);
+  font: inherit;
+  padding: 8px 10px;
+  cursor: pointer;
+}
+
+.field select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.field select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 /* ---------- timeline ---------- */
 
 .timeline {

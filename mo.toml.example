@@ -1,0 +1,43 @@
+# mo.toml — mo agent harness configuration
+#
+# Copy this file to `mo.toml` in the project folder (the gateway's working
+# directory), or to `$HOME/.config/mo-agents/mo.toml`, and fill in your
+# models. The gateway looks in `$PWD/mo.toml` first, then
+# `$HOME/.config/mo-agents/mo.toml`; an explicit path can be given with
+# `mo_gateway --config <file>`.
+#
+# With no config file at all, the gateway falls back to the legacy `MO_*`
+# env vars (MO_MODEL_BASE_URL / MO_MODEL_NAME / MO_AUTH_TOKEN / ...).
+
+# Runtime data dir (default ./data): mo.db + sessions/<id>/ journals.
+# data_dir = "./data"
+
+# Global agents dir (default $HOME/.agents): global AGENTS.md + skills.
+# agents_dir = "~/.agents"
+
+# Gateway HTTP port (default 3031).
+# port = 3031
+
+# Subagent nesting depth granted to root sessions (default 0, hard cap 3).
+# subagent_depth = 0
+
+# Worker binary (default: sibling of the mo_gateway executable named
+# mo_worker).
+# worker_bin = "./target/debug/mo_worker"
+
+# Models — at least one is required. The first model defined here is the
+# default: it is used to launch jobs and generate session titles, and it is
+# pre-selected in the "New session" UI. Every model needs a base_url and a
+# name; token is optional (omit it for endpoints without auth) and nickname
+# is an optional label shown in the UI.
+[[models]]
+base_url = "https://api.deepseek.com"
+name = "deepseek-v4-flash"
+token = "sk-..."
+# nickname = "deepseek"
+
+# A second model, e.g. a local mock for smoke tests:
+[[models]]
+base_url = "http://127.0.0.1:9001"
+name = "smoke-model"
+nickname = "mock"

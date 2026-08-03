@@ -12,6 +12,10 @@ use crate::state::AppState;
 /// `data/sessions/<id>/worker.log`. The worker gets its own process group
 /// so cancel can signal the whole tree (including subagents). Returns the
 /// child pid. A background task reaps the child so no zombies accumulate.
+///
+/// The worker's configuration travels through the environment: the session's
+/// model (resolved from the config file by name; the default model is the
+/// fallback), plus the data dir, global agents dir and subagent depth.
 pub fn spawn_worker(state: &AppState, session: &Session) -> std::io::Result<u32> {
     let session_dir = state.data_dir.join("sessions").join(&session.id);
     std::fs::create_dir_all(&session_dir)?;
@@ -22,10 +26,23 @@ pub fn spawn_worker(state: &AppState, session: &Session) -> std::io::Result<u32>
     cmd.arg("--session-id")
         .arg(&session.id)
         .env("MO_DATA_DIR", &state.data_dir)
+        .env("MO_AGENTS_DIR", &state.agents_dir)
+        .env("MO_SUBAGENT_DEPTH", state.subagent_depth.to_string())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_err))
         .process_group(0)
         .kill_on_drop(true);
+
+    if let Some(model) = state
+        .find_model(&session.model)
+        .or_else(|| state.default_model())
+    {
+        cmd.env("MO_MODEL_BASE_URL", &model.base_url)
+            .env("MO_MODEL_NAME", &model.name);
+        if let Some(token) = &model.token {
+            cmd.env("MO_AUTH_TOKEN", token);
+        }
+    }
 
     let mut child = cmd.spawn()?;
     let pid = child

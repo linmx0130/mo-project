@@ -17,10 +17,6 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() {
-    // Load MO_* config from a `.env` file when running standalone (the
-    // gateway normally passes everything down via inherited env).
-    let _ = dotenvy::dotenv();
-
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()

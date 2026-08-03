@@ -1,7 +1,10 @@
 //! Worker CLI/env configuration.
 //!
 //! The worker is spawned by the gateway with `--session-id <id>` and reads
-//! the rest of its configuration from the environment:
+//! the rest of its configuration from the environment (the gateway passes
+//! down the values resolved from `mo.toml`). For standalone runs it falls
+//! back to the shared config file (`mo.toml`, see `mo_core::config`) for
+//! anything the environment does not provide:
 //!
 //! * `MO_DATA_DIR` — runtime data dir (default `./data`); holds `mo.db` and `sessions/`.
 //! * `MO_MODEL_BASE_URL` — OpenAI-compatible endpoint base URL (no trailing `/`).
@@ -16,15 +19,6 @@ use std::env;
 use std::path::PathBuf;
 
 pub const MAX_SUBAGENT_DEPTH: u32 = 3;
-
-/// Default global agents dir when `MO_AGENTS_DIR` is unset: `$HOME/.agents`.
-/// Falls back to `./.agents` when `$HOME` is not set either.
-pub fn default_agents_dir() -> PathBuf {
-    match env::var("HOME") {
-        Ok(home) if !home.is_empty() => PathBuf::from(home).join(".agents"),
-        _ => PathBuf::from(".agents"),
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -43,9 +37,9 @@ pub enum ConfigError {
     MissingSessionId,
     #[error("invalid MO_SUBAGENT_DEPTH: {0}")]
     BadDepth(String),
-    #[error("missing required env var MO_MODEL_BASE_URL")]
+    #[error("missing model base URL: set MO_MODEL_BASE_URL or configure [[models]] in mo.toml")]
     MissingBaseUrl,
-    #[error("missing required env var MO_MODEL_NAME")]
+    #[error("missing model name: set MO_MODEL_NAME or configure [[models]] in mo.toml")]
     MissingModelName,
 }
 
@@ -59,19 +53,45 @@ pub fn parse_config() -> Result<WorkerConfig, ConfigError> {
     }
     let session_id = session_id.ok_or(ConfigError::MissingSessionId)?;
 
+    // The shared config file is a fallback for standalone runs; the gateway
+    // normally passes everything down via env, which always wins.
+    let file_cfg = mo_core::MoConfig::load(None).ok();
+
     let data_dir = env::var("MO_DATA_DIR")
         .map(PathBuf::from)
+        .or_else(|_| file_cfg.as_ref().map(|c| c.data_dir.clone()).ok_or(()))
         .unwrap_or_else(|_| PathBuf::from("./data"));
     let agents_dir = env::var("MO_AGENTS_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| default_agents_dir());
-    let model_base_url = env::var("MO_MODEL_BASE_URL").map_err(|_| ConfigError::MissingBaseUrl)?;
-    let model_name = env::var("MO_MODEL_NAME").map_err(|_| ConfigError::MissingModelName)?;
-    let auth_token = env::var("MO_AUTH_TOKEN").ok().filter(|v| !v.is_empty());
+        .or_else(|_| file_cfg.as_ref().map(|c| c.agents_dir.clone()).ok_or(()))
+        .unwrap_or_else(|_| mo_core::config::default_agents_dir());
     let subagent_depth = match env::var("MO_SUBAGENT_DEPTH") {
         Ok(v) => v.parse::<u32>().map_err(|_| ConfigError::BadDepth(v))?,
-        Err(_) => 0,
+        Err(_) => file_cfg.as_ref().map(|c| c.subagent_depth).unwrap_or(0),
     };
+    // Model: env first (the gateway passes the per-session model), then the
+    // default model from the config file.
+    let (model_base_url, model_name, auth_token) =
+        match (env::var("MO_MODEL_BASE_URL"), env::var("MO_MODEL_NAME")) {
+            (Ok(base_url), Ok(model_name)) => (
+                base_url,
+                model_name,
+                env::var("MO_AUTH_TOKEN").ok().filter(|v| !v.is_empty()),
+            ),
+            _ => match file_cfg.as_ref().and_then(|c| c.models.first()) {
+                Some(model) => (
+                    model.base_url.clone(),
+                    model.name.clone(),
+                    model.token.clone(),
+                ),
+                None => {
+                    if env::var("MO_MODEL_BASE_URL").is_err() {
+                        return Err(ConfigError::MissingBaseUrl);
+                    }
+                    return Err(ConfigError::MissingModelName);
+                }
+            },
+        };
 
     Ok(WorkerConfig {
         session_id,
