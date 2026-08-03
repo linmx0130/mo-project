@@ -36,10 +36,10 @@ type TimelineItem =
 /** Fold the journal event stream into renderable items.
  *
  * - `message_delta` events append to the assistant message currently being
- *   assembled (token-by-token preview); the following `message` event
- *   replaces its content with the canonical assembled text — which also
- *   repairs the transient state when a retried LLM call left partial deltas
- *   behind.
+ *   assembled (token-by-token preview of both the visible text and the
+ *   reasoning content); the following `message` event replaces its content
+ *   with the canonical assembled text — which also repairs the transient
+ *   state when a retried LLM call left partial deltas behind.
  * - `tool_output_delta` events append to the open tool block with the same
  *   id (bash output streaming); the following `tool_result` event replaces
  *   the preview with the complete, capped output.
@@ -54,12 +54,18 @@ function buildTimeline(events: JournalEvent[]): TimelineItem[] {
     const kind = ev.kind
     switch (kind.kind) {
       case 'message_delta': {
+        const reasoning = kind.reasoning_content ?? ''
         if (openMessage) {
-          openMessage.content += kind.content
+          if (kind.content) openMessage.content += kind.content
+          if (reasoning) {
+            openMessage.reasoning_content =
+              (openMessage.reasoning_content ?? '') + reasoning
+          }
         } else {
           const block: MessageBlock = {
             role: 'assistant',
             content: kind.content,
+            reasoning_content: reasoning || null,
             streaming: true,
           }
           openMessage = block
@@ -344,7 +350,10 @@ function MessageRow({ message }: { message: MessageBlock }) {
     <div className="msg msg-assistant">
       <div className="msg-label">assistant</div>
       {message.reasoning_content && (
-        <details className="reasoning">
+        // While reasoning is streaming, force the block open so the tokens
+        // are visible as they arrive; once the run settles the `open` prop
+        // is removed and the details stay in whatever state the user left.
+        <details className="reasoning" open={message.streaming || undefined}>
           <summary>reasoning</summary>
           <pre>{message.reasoning_content}</pre>
         </details>

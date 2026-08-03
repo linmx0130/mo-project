@@ -41,6 +41,20 @@ def stream_text(text, words_per_chunk=3):
     return [{"content": c + (" " if i < len(chunks) - 1 else "")} for i, c in enumerate(chunks)]
 
 
+def stream_reasoning(text, words_per_chunk=4):
+    """Split a reasoning trace into several `reasoning_content` deltas so
+    the worker journals reasoning token-by-token, like a reasoning model."""
+    words = text.split(" ")
+    chunks = [
+        " ".join(words[i : i + words_per_chunk])
+        for i in range(0, len(words), words_per_chunk)
+    ]
+    return [
+        {"reasoning_content": c + (" " if i < len(chunks) - 1 else "")}
+        for i, c in enumerate(chunks)
+    ]
+
+
 def sse(deltas):
     payload = "".join(
         f"data: {json.dumps({'choices': [{'delta': d}]})}\n\n" for d in deltas
@@ -109,8 +123,15 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 ]
             else:
-                deltas = [{"role": "assistant"}] + stream_text(
-                    "The subagent reported its result. Everything works."
+                deltas = (
+                    [{"role": "assistant"}]
+                    + stream_reasoning(
+                        "The subagent should have counted the words; "
+                        "I will report its result."
+                    )
+                    + stream_text(
+                        "The subagent reported its result. Everything works."
+                    )
                 )
         elif n == 0:
             deltas = [
@@ -147,10 +168,18 @@ class Handler(BaseHTTPRequestHandler):
                 },
             ]
         else:
-            # Final answer: streamed token-by-token (message_delta events).
-            deltas = [{"role": "assistant"}] + stream_text(
-                "Smoke test complete: read the greeting and counted "
-                "its words. All tools worked."
+            # Final answer: streamed token-by-token, reasoning first then
+            # content (message_delta events for both fields).
+            deltas = (
+                [{"role": "assistant"}]
+                + stream_reasoning(
+                    "I read the greeting and ran wc; "
+                    "I will summarize the result."
+                )
+                + stream_text(
+                    "Smoke test complete: read the greeting and counted "
+                    "its words. All tools worked."
+                )
             )
 
         payload = sse(deltas)

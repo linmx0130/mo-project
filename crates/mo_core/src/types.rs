@@ -128,7 +128,9 @@ pub enum JournalEventKind {
     /// A streamed chunk of an assistant message (token-by-token preview).
     ///
     /// The worker journals these as the LLM stream arrives, *before* the
-    /// final `Message` event with the assembled text. Readers (the
+    /// final `Message` event with the assembled text. A chunk may carry
+    /// either the visible `content`, `reasoning_content` (reasoning models
+    /// stream their thinking first, then the answer), or both. Readers (the
     /// frontend) append them to the in-flight assistant message and let the
     /// final `Message` event replace the assembled content — which also
     /// repairs the transient state when a retried LLM call leaves partial
@@ -136,6 +138,8 @@ pub enum JournalEventKind {
     /// history, so they never reach the model context.
     MessageDelta {
         content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<String>,
     },
     /// A streamed chunk of a running tool's output (bash stdout/stderr).
     ///

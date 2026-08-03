@@ -89,10 +89,12 @@ streaming path is exercised in smoke tests too.
 
 The UI renders responses token-by-token. While the worker consumes the LLM
 completion stream it journals each content chunk as a `message_delta` event
-(plus a `tool_output_delta` event per stdout/stderr chunk while `bash` is
-running); the gateway SSE tail forwards them as they land, and the frontend
-appends them to the in-flight message / tool block with a blinking caret and
-a `running` badge. When the turn completes, the worker journals the final
+— including `reasoning_content` for reasoning models, which streams its
+thinking first and then the visible answer — (plus a `tool_output_delta`
+event per stdout/stderr chunk while `bash` is running); the gateway SSE
+tail forwards them as they land, and the frontend appends them to the
+in-flight message / tool block with a blinking caret and a `running` badge.
+When the turn completes, the worker journals the final
 `message`/`tool_result` events, and the frontend swaps the delta-built
 preview for the canonical, complete text. Delta events are skipped when the
 worker rebuilds chat history from the journal, so the model context stays
@@ -152,8 +154,9 @@ $HOME/.agents/
 
 Session status: `pending | running | completed | failed | cancelled`.
 Journal events: `message`, `tool_call_start`, `tool_result`, `status_change`,
-plus the streaming previews `message_delta` (token-by-token assistant text)
-and `tool_output_delta` (live bash output) — JSONL, `seq` + `ts` per line.
+plus the streaming previews `message_delta` (token-by-token assistant text
+and reasoning) and `tool_output_delta` (live bash output) — JSONL, `seq` +
+`ts` per line.
 
 ### Session titles
 

@@ -48,9 +48,9 @@ export type JournalEventKind =
   | { kind: 'tool_call_start'; id: string; name: string; arguments: string }
   | { kind: 'tool_result'; id: string; name: string; ok: boolean; output: string }
   | { kind: 'status_change'; status: SessionStatus; error?: string | null }
-  /** Streamed assistant text chunk; the following `message` event carries
-   *  the assembled content and replaces the delta-built preview. */
-  | { kind: 'message_delta'; content: string }
+  /** Streamed assistant text/reasoning chunk; the following `message` event
+   *  carries the assembled content and replaces the delta-built preview. */
+  | { kind: 'message_delta'; content: string; reasoning_content?: string | null }
   /** Streamed output of a running tool (bash); the following `tool_result`
    *  event carries the complete, capped output and replaces the preview. */
   | { kind: 'tool_output_delta'; id: string; name: string; output: string }

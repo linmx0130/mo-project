@@ -305,11 +305,13 @@ async fn sse_streams_journal_events_and_closes_on_terminal() {
     journal
         .append(JournalEventKind::MessageDelta {
             content: "streamed ".into(),
+            reasoning_content: None,
         })
         .unwrap();
     journal
         .append(JournalEventKind::MessageDelta {
             content: "tokens".into(),
+            reasoning_content: Some("think first ".into()),
         })
         .unwrap();
     journal

@@ -237,11 +237,19 @@ mod tests {
         writer
             .append(JournalEventKind::MessageDelta {
                 content: "Hello ".to_string(),
+                reasoning_content: None,
+            })
+            .unwrap();
+        writer
+            .append(JournalEventKind::MessageDelta {
+                content: String::new(),
+                reasoning_content: Some("Let me think: ".to_string()),
             })
             .unwrap();
         writer
             .append(JournalEventKind::MessageDelta {
                 content: "world".to_string(),
+                reasoning_content: None,
             })
             .unwrap();
         writer
@@ -259,20 +267,30 @@ mod tests {
             })
             .unwrap();
         let events = read_events(&path).unwrap();
+        assert_eq!(events.len(), 5);
         assert_eq!(
             events[0].kind,
             JournalEventKind::MessageDelta {
-                content: "Hello ".to_string()
+                content: "Hello ".to_string(),
+                reasoning_content: None
             }
         );
         assert_eq!(
             events[1].kind,
             JournalEventKind::MessageDelta {
-                content: "world".to_string()
+                content: String::new(),
+                reasoning_content: Some("Let me think: ".to_string())
             }
         );
         assert_eq!(
             events[2].kind,
+            JournalEventKind::MessageDelta {
+                content: "world".to_string(),
+                reasoning_content: None
+            }
+        );
+        assert_eq!(
+            events[3].kind,
             JournalEventKind::ToolOutputDelta {
                 id: "call_1".to_string(),
                 name: "bash".to_string(),
@@ -280,7 +298,7 @@ mod tests {
             }
         );
         assert_eq!(
-            events[3].kind,
+            events[4].kind,
             JournalEventKind::ToolOutputDelta {
                 id: "call_1".to_string(),
                 name: "bash".to_string(),

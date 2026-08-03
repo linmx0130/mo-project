@@ -169,11 +169,13 @@ fn history_from_journal(journal_path: &Path) -> Result<Vec<ChatMessage>> {
 
 /// One LLM call with retry/backoff (3 tries, 5s/15s/30s).
 ///
-/// Content chunks are journaled as `MessageDelta` events while the stream
-/// runs, so the journal (and with it the gateway SSE) carries tokens live.
-/// A failed attempt may leave a few orphan deltas behind; the final
-/// `Message` event that follows a successful attempt replaces them on the
-/// reader side, so history stays correct.
+/// Content and reasoning chunks are journaled as `MessageDelta` events
+/// while the stream runs — reasoning models emit `reasoning_content`
+/// before the visible answer, and both stream token-by-token — so the
+/// journal (and with it the gateway SSE) carries tokens live. A failed
+/// attempt may leave a few orphan deltas behind; the final `Message` event
+/// that follows a successful attempt replaces them on the reader side, so
+/// history stays correct.
 async fn generate(
     chat_client: &ChatClient,
     model: &str,
@@ -218,11 +220,15 @@ async fn generate_once(
     let mut message = ChatMessage::new();
     while let Some(delta) = stream.next().await {
         let delta = delta.map_err(|e| anyhow::anyhow!("error in stream delta: {e}"))?;
-        if let Some(content) = delta.content.as_deref()
-            && !content.is_empty()
-        {
+        // Journal every chunk that carries visible text or reasoning, so
+        // both stream token-by-token (reasoning models emit
+        // `reasoning_content` deltas first, then `content` deltas).
+        let content = delta.content.clone().unwrap_or_default();
+        let reasoning_content = delta.reasoning_content.clone().filter(|s| !s.is_empty());
+        if !content.is_empty() || reasoning_content.is_some() {
             journal.append(JournalEventKind::MessageDelta {
-                content: content.to_string(),
+                content,
+                reasoning_content,
             })?;
         }
         message.apply_model_response_chunk(delta);
@@ -273,6 +279,10 @@ mod tests {
 
     fn delta_content(content: &str) -> Value {
         json!({ "content": content })
+    }
+
+    fn delta_reasoning(content: &str) -> Value {
+        json!({ "reasoning_content": content })
     }
 
     fn delta_tool_call(index: usize, id: &str, name: &str, arguments: &str) -> Value {
@@ -378,10 +388,13 @@ mod tests {
                                 ),
                             ])
                         } else {
-                            // The final answer streams in several content
-                            // chunks, exercising token-by-token journaling.
+                            // The final answer streams reasoning first, then
+                            // several content chunks, exercising
+                            // token-by-token journaling of both fields.
                             sse_payload(&[
                                 delta_role("assistant"),
+                                delta_reasoning("Let me recall: "),
+                                delta_reasoning("notes say hello."),
                                 delta_content("The file says: "),
                                 delta_content("hello world "),
                                 delta_content("from notes.\n"),
@@ -426,10 +439,10 @@ mod tests {
         run_agent(agent_cfg, &mut journal).await.unwrap();
 
         // Journal sequence: user message, assistant(tool call), tool_call_start,
-        // tool_result, then the final answer streamed as three message_delta
-        // events followed by the assembled assistant message.
+        // tool_result, then the final answer streamed as reasoning deltas
+        // followed by content deltas, then the assembled assistant message.
         let events = mo_core::read_events(std::path::Path::new(&session.journal_path)).unwrap();
-        assert_eq!(events.len(), 8, "events: {events:#?}");
+        assert_eq!(events.len(), 10, "events: {events:#?}");
         let kinds: Vec<&JournalEventKind> = events.iter().map(|e| &e.kind).collect();
         assert!(
             matches!(kinds[0], JournalEventKind::Message(m) if m.role == "user" && m.content.contains("Read notes.txt"))
@@ -443,27 +456,45 @@ mod tests {
         assert!(
             matches!(kinds[3], JournalEventKind::ToolResult { ok: true, output, .. } if output.contains("hello world from notes"))
         );
-        // Token-by-token preview: three deltas assembling the final answer.
+        // Token-by-token preview: reasoning deltas first (empty content),
+        // then the content deltas assembling the final answer.
         assert_eq!(
             kinds[4],
             &JournalEventKind::MessageDelta {
-                content: "The file says: ".to_string()
+                content: String::new(),
+                reasoning_content: Some("Let me recall: ".to_string()),
             }
         );
         assert_eq!(
             kinds[5],
             &JournalEventKind::MessageDelta {
-                content: "hello world ".to_string()
+                content: String::new(),
+                reasoning_content: Some("notes say hello.".to_string()),
             }
         );
         assert_eq!(
             kinds[6],
             &JournalEventKind::MessageDelta {
-                content: "from notes.\n".to_string()
+                content: "The file says: ".to_string(),
+                reasoning_content: None,
+            }
+        );
+        assert_eq!(
+            kinds[7],
+            &JournalEventKind::MessageDelta {
+                content: "hello world ".to_string(),
+                reasoning_content: None,
+            }
+        );
+        assert_eq!(
+            kinds[8],
+            &JournalEventKind::MessageDelta {
+                content: "from notes.\n".to_string(),
+                reasoning_content: None,
             }
         );
         assert!(
-            matches!(kinds[7], JournalEventKind::Message(m) if m.role == "assistant" && m.content.contains("hello world from notes"))
+            matches!(kinds[9], JournalEventKind::Message(m) if m.role == "assistant" && m.content.contains("hello world from notes") && m.reasoning_content.as_deref() == Some("Let me recall: notes say hello."))
         );
     }
 }
