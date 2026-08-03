@@ -2,7 +2,7 @@
 //! instructions + skills from the global agents dir (`MO_AGENTS_DIR`,
 //! default `$HOME/.agents`), and the contents of `<workdir>/AGENTS.md`.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub fn build_system_prompt(workdir: &Path, agents_dir: &Path, subagent_depth: u32) -> String {
     let mut prompt = String::new();
@@ -12,7 +12,8 @@ pub fn build_system_prompt(workdir: &Path, agents_dir: &Path, subagent_depth: u3
     );
     prompt.push_str(&format!("Working directory: {}\n", workdir.display()));
     prompt.push_str(
-        "You may read and write files only inside the working directory. \
+        "You may read and write files only inside the working directory, except that \
+         read_file may also read global skill folders (see \"Global skills\" below). \
          Never attempt to access files or run commands that escape it.\n\n",
     );
     prompt.push_str(
@@ -51,11 +52,11 @@ pub fn build_system_prompt(workdir: &Path, agents_dir: &Path, subagent_depth: u3
     }
 
     // Global skills: `<agents_dir>/<skill>/SKILL.md` and
-    // `<agents_dir>/skills/<skill>/SKILL.md`. Skills carry YAML frontmatter
-    // (name, description); the full body is included because the harness has
-    // no on-demand skill loader and the tools are sandboxed to the workdir,
-    // so the model cannot read the skill files itself.
-    let skills = discover_skills(agents_dir);
+    // `<agents_dir>/skills/<skill>/SKILL.md`. Only the frontmatter name +
+    // description go into the system prompt; the model pulls the full
+    // instructions on demand via the `load_skill` tool, which also returns
+    // the skill folder path so `read_file` can reach bundled resources.
+    let skills = crate::skills::discover_skills(agents_dir);
     if !skills.is_empty() {
         prompt.push_str(&format!(
             "Global skills available from {}:\n",
@@ -71,9 +72,13 @@ pub fn build_system_prompt(workdir: &Path, agents_dir: &Path, subagent_depth: u3
                     &skill.description
                 }
             ));
-            prompt.push_str(&skill.body);
-            prompt.push_str("\n\n");
         }
+        prompt.push_str(
+            "\nLoad a skill on demand by calling the load_skill tool with the \
+             skill name: it returns the full SKILL.md instructions and the \
+             absolute path of the skill's folder. read_file may read reference \
+             files, scripts, and other resources inside skill folders.\n\n",
+        );
     }
 
     let agents_md = workdir.join("AGENTS.md");
@@ -87,100 +92,6 @@ pub fn build_system_prompt(workdir: &Path, agents_dir: &Path, subagent_depth: u3
         ));
     }
     prompt
-}
-
-/// A discovered global skill: its frontmatter metadata plus the full body.
-struct Skill {
-    name: String,
-    description: String,
-    body: String,
-}
-
-/// Find every global skill under `agents_dir`. Both layouts are supported:
-/// `agents_dir/<skill>/SKILL.md` and `agents_dir/skills/<skill>/SKILL.md`
-/// (deduplicated by skill name, `skills/` layout scanned first). Results are
-/// sorted by name for a deterministic prompt.
-fn discover_skills(agents_dir: &Path) -> Vec<Skill> {
-    let mut skills: Vec<Skill> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for base in [agents_dir.join("skills"), agents_dir.to_path_buf()] {
-        let Ok(entries) = std::fs::read_dir(&base) else {
-            continue;
-        };
-        let mut dirs: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect();
-        dirs.sort();
-        for dir in dirs {
-            let dir_name = dir
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let Ok(content) = std::fs::read_to_string(dir.join("SKILL.md")) else {
-                continue;
-            };
-            if content.trim().is_empty() {
-                continue;
-            }
-            let (name, description, body) = parse_skill_md(&dir_name, &content);
-            if !seen.insert(name.clone()) {
-                continue;
-            }
-            skills.push(Skill {
-                name,
-                description,
-                body,
-            });
-        }
-    }
-    skills.sort_by(|a, b| a.name.cmp(&b.name));
-    skills
-}
-
-/// Parse a SKILL.md: optional YAML frontmatter delimited by `---` lines
-/// (flat `key: value` fields; `name` and `description` are used, everything
-/// else is ignored) followed by the markdown body. Falls back to the
-/// directory name when `name:` is absent.
-fn parse_skill_md(dir_name: &str, content: &str) -> (String, String, String) {
-    let mut name = dir_name.to_string();
-    let mut description = String::new();
-    let trimmed = content.trim_start();
-    if let Some(after_open) = trimmed.strip_prefix("---") {
-        let mut lines = after_open.lines();
-        let mut fm_lines: Vec<&str> = Vec::new();
-        let mut body_start: Option<usize> = None;
-        for (i, line) in lines.by_ref().enumerate() {
-            if line.trim() == "---" || line.trim() == "..." {
-                body_start = Some(i + 1);
-                break;
-            }
-            fm_lines.push(line);
-        }
-        if let Some(start) = body_start {
-            for line in fm_lines {
-                let Some((key, value)) = line.split_once(':') else {
-                    continue;
-                };
-                let value = value.trim().trim_matches(['"', '\'']);
-                match key.trim() {
-                    "name" => name = value.to_string(),
-                    "description" => description = value.to_string(),
-                    _ => {}
-                }
-            }
-            let body = after_open
-                .lines()
-                .skip(start)
-                .collect::<Vec<_>>()
-                .join("\n")
-                .trim()
-                .to_string();
-            return (name, description, body);
-        }
-    }
-    (name, description, trimmed.trim().to_string())
 }
 
 #[cfg(test)]
@@ -247,10 +158,14 @@ mod tests {
         assert!(prompt.contains("Global skills available from"));
         assert!(prompt.contains("### top-skill"));
         assert!(prompt.contains("Description: A top-level skill."));
-        assert!(prompt.contains("# Top skill body"));
         assert!(prompt.contains("### nested-skill"));
         assert!(prompt.contains("Description: A nested skill."));
-        assert!(prompt.contains("# Nested skill body"));
+        // The full bodies stay out of the prompt; they are fetched on demand
+        // via the load_skill tool, and read_file may read skill folders.
+        assert!(!prompt.contains("# Top skill body"));
+        assert!(!prompt.contains("# Nested skill body"));
+        assert!(prompt.contains("load_skill"));
+        assert!(prompt.contains("read_file may read reference"));
     }
 
     #[test]
@@ -263,27 +178,7 @@ mod tests {
         let prompt = build_system_prompt(dir.path(), agents.path(), 0);
         assert!(prompt.contains("### plain-skill"));
         assert!(prompt.contains("Description: (no description)"));
-        assert!(prompt.contains("# Just instructions"));
-    }
-
-    #[test]
-    fn parse_skill_md_extracts_frontmatter() {
-        let (name, desc, body) = parse_skill_md(
-            "fallback",
-            "---\nname: real-name\ndescription: Does things.\nlicense: MIT\n---\n\nBody here.\n",
-        );
-        assert_eq!(name, "real-name");
-        assert_eq!(desc, "Does things.");
-        assert_eq!(body, "Body here.");
-
-        // Missing frontmatter: dir name fallback, whole content is the body.
-        let (name, desc, body) = parse_skill_md("fallback", "# Just markdown\n");
-        assert_eq!(name, "fallback");
-        assert_eq!(desc, "");
-        assert_eq!(body, "# Just markdown");
-
-        // Quoted values are unquoted.
-        let (_, desc, _) = parse_skill_md("x", "---\ndescription: 'quoted value'\n---\nbody");
-        assert_eq!(desc, "quoted value");
+        // The body is not inlined into the system prompt.
+        assert!(!prompt.contains("# Just instructions"));
     }
 }

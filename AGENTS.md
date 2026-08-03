@@ -38,7 +38,9 @@ npm run dev                   # dev server on :3030, /api proxied to :3031
 - Configuration lives in `mo.toml` (models, port, data dir, agents dir,
   subagent depth); the gateway passes the resolved values to spawned workers
   via env. `MO_*` env vars are only a fallback when no config file exists.
-- Tool outputs are capped at ~1 MB; paths are sandboxed to the session workdir.
+- Tool outputs are capped at ~1 MB; paths are sandboxed to the session workdir
+  (`read_file` may also read global skill folders; skill bodies are fetched
+  via the `load_skill` tool).
 - Frontend: no router lib, hand-rolled view switch; types hand-duplicated in
   `src/api.ts`; SSE `after_seq` cursor + `seq: null` synthetic status events.
 

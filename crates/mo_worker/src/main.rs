@@ -7,6 +7,7 @@
 mod agent;
 mod config;
 mod prompt;
+mod skills;
 mod tools;
 
 use std::path::{Path, PathBuf};

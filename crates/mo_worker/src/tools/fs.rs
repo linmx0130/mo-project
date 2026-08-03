@@ -50,20 +50,62 @@ pub fn resolve_path(workdir: &Path, raw: &str) -> Result<PathBuf, String> {
 /// Like `resolve_path` but also requires the file itself to exist and, once
 /// canonicalized, to stay inside the workdir (catches symlink escapes).
 pub fn resolve_existing(workdir: &Path, raw: &str) -> Result<PathBuf, String> {
-    let resolved = resolve_path(workdir, raw)?;
+    resolve_readable(workdir, raw, &[])
+}
+
+/// Resolve `raw` for reading: the file must exist and, once canonicalized,
+/// must be inside `workdir` or inside one of `extra_roots` (used to allow
+/// `read_file` to reach global skill folders). Relative paths are resolved
+/// against the workdir; absolute paths are taken as-is.
+pub fn resolve_readable(
+    workdir: &Path,
+    raw: &str,
+    extra_roots: &[PathBuf],
+) -> Result<PathBuf, String> {
+    let workdir_canon = workdir.canonicalize().map_err(|e| {
+        format!(
+            "working directory does not exist: {} ({e})",
+            workdir.display()
+        )
+    })?;
+    if raw.trim().is_empty() {
+        return Err("path must not be empty".to_string());
+    }
+    let raw_path = Path::new(raw);
+    let candidate = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        workdir_canon.join(raw_path)
+    };
+    let parent = candidate
+        .parent()
+        .ok_or_else(|| format!("path has no parent: {raw}"))?;
+    let parent_canon = parent.canonicalize().map_err(|e| {
+        format!(
+            "parent directory does not exist: {} ({e})",
+            parent.display()
+        )
+    })?;
+    let file_name = candidate
+        .file_name()
+        .ok_or_else(|| format!("path has no file name: {raw}"))?;
+    let resolved = parent_canon.join(file_name);
     let canonical = resolved
         .canonicalize()
         .map_err(|e| format!("file does not exist: {raw} ({e})"))?;
-    let workdir_canon = workdir.canonicalize().map_err(|e| e.to_string())?;
-    if !canonical.starts_with(&workdir_canon) {
+    let in_workdir = canonical.starts_with(&workdir_canon);
+    let in_extra = extra_roots.iter().any(|root| canonical.starts_with(root));
+    if !in_workdir && !in_extra {
         return Err(format!("path escapes the working directory: {raw}"));
     }
     Ok(canonical)
 }
 
 /// Read a UTF-8 file (capped at ~1 MB with an explicit truncation note).
-pub fn read_file(workdir: &Path, raw: &str) -> Result<String, String> {
-    let full = resolve_existing(workdir, raw)?;
+/// The file must be inside the workdir or inside one of `extra_roots`
+/// (global skill folders).
+pub fn read_file(workdir: &Path, raw: &str, extra_roots: &[PathBuf]) -> Result<String, String> {
+    let full = resolve_readable(workdir, raw, extra_roots)?;
     let content = fs::read_to_string(&full).map_err(|e| format!("failed to read {raw}: {e}"))?;
     Ok(cap_output(&content))
 }
@@ -158,12 +200,57 @@ mod tests {
     fn read_relative_and_absolute() {
         let (_dir, workdir) = setup();
         assert_eq!(
-            read_file(&workdir, "notes.txt").unwrap(),
+            read_file(&workdir, "notes.txt", &[]).unwrap(),
             "line one\nline two\n"
         );
         assert_eq!(
-            read_file(&workdir, &workdir.join("notes.txt").display().to_string()).unwrap(),
+            read_file(
+                &workdir,
+                &workdir.join("notes.txt").display().to_string(),
+                &[]
+            )
+            .unwrap(),
             "line one\nline two\n"
+        );
+    }
+
+    #[test]
+    fn read_allows_extra_roots() {
+        let (dir, workdir) = setup();
+        let skill = dir.path().join("skill-a");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("script.sh"), "#!/bin/sh\necho hi\n").unwrap();
+        let root = skill.canonicalize().unwrap();
+        let abs = skill.join("script.sh").display().to_string();
+        // Inside the extra root: readable (via its absolute path).
+        assert_eq!(
+            read_file(&workdir, &abs, std::slice::from_ref(&root)).unwrap(),
+            "#!/bin/sh\necho hi\n"
+        );
+        // Without the extra root the same file is rejected.
+        assert!(read_file(&workdir, &abs, &[]).is_err());
+        // Files outside the root (e.g. a sibling dir) are still rejected.
+        let other = dir.path().join("other").join("x.txt");
+        fs::create_dir_all(dir.path().join("other")).unwrap();
+        fs::write(&other, "x").unwrap();
+        assert!(
+            read_file(
+                &workdir,
+                &other.display().to_string(),
+                std::slice::from_ref(&root)
+            )
+            .is_err()
+        );
+        // A symlink inside the root pointing outside is rejected.
+        fs::write(dir.path().join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("secret.txt"), skill.join("leak.txt")).unwrap();
+        assert!(
+            read_file(
+                &workdir,
+                &skill.join("leak.txt").display().to_string(),
+                std::slice::from_ref(&root)
+            )
+            .is_err()
         );
     }
 
@@ -172,13 +259,13 @@ mod tests {
         let (dir, workdir) = setup();
         fs::write(dir.path().join("secret.txt"), "secret").unwrap();
         // Traversal outside the workdir.
-        assert!(read_file(&workdir, "../secret.txt").is_err());
-        assert!(read_file(&workdir, "sub/../../secret.txt").is_err());
+        assert!(read_file(&workdir, "../secret.txt", &[]).is_err());
+        assert!(read_file(&workdir, "sub/../../secret.txt", &[]).is_err());
         // Absolute path outside.
         let outside = dir.path().join("secret.txt").display().to_string();
-        assert!(read_file(&workdir, &outside).is_err());
+        assert!(read_file(&workdir, &outside, &[]).is_err());
         // Nonexistent parent.
-        assert!(read_file(&workdir, "no/such/dir/file.txt").is_err());
+        assert!(read_file(&workdir, "no/such/dir/file.txt", &[]).is_err());
     }
 
     #[test]
@@ -187,7 +274,7 @@ mod tests {
         fs::write(dir.path().join("secret.txt"), "secret").unwrap();
         std::os::unix::fs::symlink(dir.path().join("secret.txt"), workdir.join("link.txt"))
             .unwrap();
-        assert!(read_file(&workdir, "link.txt").is_err());
+        assert!(read_file(&workdir, "link.txt", &[]).is_err());
     }
 
     #[test]
@@ -195,7 +282,10 @@ mod tests {
         let (_dir, workdir) = setup();
         let new_content = edit_file(&workdir, "notes.txt", "line one", "ONE", false).unwrap();
         assert_eq!(new_content, "ONE\nline two\n");
-        assert_eq!(read_file(&workdir, "notes.txt").unwrap(), "ONE\nline two\n");
+        assert_eq!(
+            read_file(&workdir, "notes.txt", &[]).unwrap(),
+            "ONE\nline two\n"
+        );
     }
 
     #[test]
@@ -221,7 +311,10 @@ mod tests {
         let (_dir, workdir) = setup();
         let written = create_file(&workdir, "new.txt", "hello\nworld\n").unwrap();
         assert_eq!(written, "hello\nworld\n");
-        assert_eq!(read_file(&workdir, "new.txt").unwrap(), "hello\nworld\n");
+        assert_eq!(
+            read_file(&workdir, "new.txt", &[]).unwrap(),
+            "hello\nworld\n"
+        );
         // Refuses to overwrite an existing file.
         let err = create_file(&workdir, "new.txt", "again").unwrap_err();
         assert!(err.contains("already exists"), "got: {err}");

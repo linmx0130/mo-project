@@ -3,6 +3,7 @@
 
 pub mod bash;
 pub mod fs;
+pub mod skill;
 pub mod subagent;
 
 use std::path::PathBuf;
@@ -17,6 +18,7 @@ pub const TOOL_CREATE_FILE: &str = "create_file";
 pub const TOOL_REMOVE_FILE: &str = "remove_file";
 pub const TOOL_BASH: &str = "bash";
 pub const TOOL_SPAWN_SUBAGENT: &str = "spawn_subagent";
+pub const TOOL_LOAD_SKILL: &str = "load_skill";
 
 /// Everything a tool needs to run: the sandboxed workdir, the shared data
 /// dir (for subagent sessions), the global agents dir (passed down so
@@ -41,7 +43,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": TOOL_READ_FILE,
-                "description": "Read a UTF-8 text file inside the working directory. Output is capped at ~1 MB.",
+                "description": "Read a UTF-8 text file inside the working directory or inside a global skill folder (the load_skill tool returns skill folder paths). Output is capped at ~1 MB.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -131,6 +133,21 @@ pub fn tool_definitions() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": TOOL_LOAD_SKILL,
+                "description": "Load a global skill's full instructions on demand. Skills are listed in the system prompt with only their name and description; pass the skill name to get its SKILL.md content and the absolute path of its folder, from which reference files, scripts, and other resources can be read with read_file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Name of the skill to load." }
+                    },
+                    "required": ["name"],
+                    "additionalProperties": false
+                }
+            }
+        }),
     ]
 }
 
@@ -169,6 +186,11 @@ struct SpawnSubagentArgs {
     prompt: String,
 }
 
+#[derive(Deserialize)]
+struct LoadSkillArgs {
+    name: String,
+}
+
 /// Execute one tool call. Returns the tool output (Ok) or a tool error
 /// (Err) — both are surfaced to the model; only a failed dispatch returns
 /// Err and both are journaled as ToolResult events.
@@ -187,7 +209,13 @@ pub async fn execute_tool(
         TOOL_READ_FILE => {
             let args: ReadFileArgs = serde_json::from_str(arguments)
                 .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
-            fs::read_file(&ctx.workdir, &args.path)
+            // `read_file` may also read global skill folders, so pass the
+            // discovered skill folder paths as extra allowed roots.
+            let skill_roots: Vec<PathBuf> = crate::skills::discover_skills(&ctx.agents_dir)
+                .into_iter()
+                .map(|s| s.path)
+                .collect();
+            fs::read_file(&ctx.workdir, &args.path, &skill_roots)
         }
         TOOL_EDIT_FILE => {
             let args: EditFileArgs = serde_json::from_str(arguments)
@@ -227,6 +255,11 @@ pub async fn execute_tool(
                 .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
             subagent::spawn_subagent(ctx, &args.prompt).await
         }
+        TOOL_LOAD_SKILL => {
+            let args: LoadSkillArgs = serde_json::from_str(arguments)
+                .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
+            skill::load_skill(&ctx.agents_dir, &args.name)
+        }
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -235,28 +268,11 @@ pub async fn execute_tool(
 mod tests {
     use super::*;
 
-    #[test]
-    fn definitions_cover_all_tools() {
-        let defs = tool_definitions();
-        assert_eq!(defs.len(), 6);
-        let names: Vec<&str> = defs
-            .iter()
-            .map(|d| d["function"]["name"].as_str().unwrap())
-            .collect();
-        assert!(names.contains(&TOOL_READ_FILE));
-        assert!(names.contains(&TOOL_EDIT_FILE));
-        assert!(names.contains(&TOOL_CREATE_FILE));
-        assert!(names.contains(&TOOL_REMOVE_FILE));
-        assert!(names.contains(&TOOL_BASH));
-        assert!(names.contains(&TOOL_SPAWN_SUBAGENT));
-    }
-
-    #[tokio::test]
-    async fn unknown_tool_errors() {
-        let ctx = ToolContext {
+    fn test_ctx(agents_dir: PathBuf) -> ToolContext {
+        ToolContext {
             workdir: PathBuf::from("/tmp"),
             data_dir: PathBuf::from("/tmp/data"),
-            agents_dir: PathBuf::from("/tmp/agents"),
+            agents_dir,
             session: Session {
                 id: "s".into(),
                 parent_id: None,
@@ -275,11 +291,73 @@ mod tests {
             model_base_url: "http://localhost:1".into(),
             model_name: "m".into(),
             auth_token: None,
-        };
+        }
+    }
+
+    #[test]
+    fn definitions_cover_all_tools() {
+        let defs = tool_definitions();
+        assert_eq!(defs.len(), 7);
+        let names: Vec<&str> = defs
+            .iter()
+            .map(|d| d["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&TOOL_READ_FILE));
+        assert!(names.contains(&TOOL_EDIT_FILE));
+        assert!(names.contains(&TOOL_CREATE_FILE));
+        assert!(names.contains(&TOOL_REMOVE_FILE));
+        assert!(names.contains(&TOOL_BASH));
+        assert!(names.contains(&TOOL_SPAWN_SUBAGENT));
+        assert!(names.contains(&TOOL_LOAD_SKILL));
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_errors() {
+        let ctx = test_ctx(PathBuf::from("/tmp/agents"));
         let mut no_delta = |_: JournalEventKind| {};
         let err = execute_tool(&ctx, "nope", "{}", "call_x", &mut no_delta)
             .await
             .unwrap_err();
         assert!(err.contains("unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn load_skill_returns_path_and_skill_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join("agents");
+        let skill_dir = agents.join("greeter");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: greeter\ndescription: Greets people.\n---\n# Greeter\nSay hello.\n",
+        )
+        .unwrap();
+        let ctx = test_ctx(agents);
+        let mut no_delta = |_: JournalEventKind| {};
+        let out = execute_tool(
+            &ctx,
+            TOOL_LOAD_SKILL,
+            r#"{"name":"greeter"}"#,
+            "call_s",
+            &mut no_delta,
+        )
+        .await
+        .unwrap();
+        let path_line = format!("Path: {}", skill_dir.canonicalize().unwrap().display());
+        assert!(out.starts_with(&path_line), "got: {out}");
+        assert!(out.contains("# Greeter"));
+        assert!(out.contains("Say hello."));
+
+        // Unknown skill name errors.
+        let err = execute_tool(
+            &ctx,
+            TOOL_LOAD_SKILL,
+            r#"{"name":"nope"}"#,
+            "call_s",
+            &mut no_delta,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("skill not found"), "got: {err}");
     }
 }

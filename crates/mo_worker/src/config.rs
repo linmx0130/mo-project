@@ -13,7 +13,8 @@
 //! * `MO_SUBAGENT_DEPTH` — subagent nesting depth (default 0, hard cap 3).
 //! * `MO_AGENTS_DIR` — global agents dir (default `$HOME/.agents`); holds the
 //!   global `AGENTS.md` and global skills (`<dir>/<skill>/SKILL.md` or
-//!   `<dir>/skills/<skill>/SKILL.md`), injected into the system prompt.
+//!   `<dir>/skills/<skill>/SKILL.md`). Skill name + description are injected
+//!   into the system prompt; the body is loaded on demand via `load_skill`.
 
 use std::env;
 use std::path::PathBuf;
