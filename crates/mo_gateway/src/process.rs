@@ -66,6 +66,12 @@ pub fn spawn_worker(state: &AppState, session: &Session) -> std::io::Result<u32>
         if let Some(token) = &model.token {
             cmd.env("MO_AUTH_TOKEN", token);
         }
+        // The context window travels as env so the worker can embed it in
+        // `context_usage` journal events (the status bar renders the context
+        // length against it); unset = unlimited.
+        if let Some(window) = model.context_window {
+            cmd.env("MO_CONTEXT_WINDOW", window.to_string());
+        }
     }
 
     let mut child = cmd.spawn()?;

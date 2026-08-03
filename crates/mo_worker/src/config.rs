@@ -10,6 +10,8 @@
 //! * `MO_MODEL_BASE_URL` — OpenAI-compatible endpoint base URL (no trailing `/`).
 //! * `MO_MODEL_NAME` — model name to request.
 //! * `MO_AUTH_TOKEN` — optional Bearer token / API key.
+//! * `MO_CONTEXT_WINDOW` — optional model context window in tokens (unset =
+//!   unlimited); embedded in `context_usage` journal events for the status bar.
 //! * `MO_SUBAGENT_DEPTH` — subagent nesting depth (default 0, hard cap 3).
 //! * `MO_AGENTS_DIR` — global agents dir (default `$HOME/.agents`); holds the
 //!   global `AGENTS.md` and global skills (`<dir>/<skill>/SKILL.md` or
@@ -29,6 +31,7 @@ pub struct WorkerConfig {
     pub model_base_url: String,
     pub model_name: String,
     pub auth_token: Option<String>,
+    pub context_window: Option<u64>,
     pub subagent_depth: u32,
 }
 
@@ -70,6 +73,15 @@ pub fn parse_config() -> Result<WorkerConfig, ConfigError> {
         Ok(v) => v.parse::<u32>().map_err(|_| ConfigError::BadDepth(v))?,
         Err(_) => file_cfg.as_ref().map(|c| c.subagent_depth).unwrap_or(0),
     };
+    // Context window: env first (the gateway passes the per-session model's
+    // window), then the default model from the config file. Unset = unlimited.
+    let context_window = match env::var("MO_CONTEXT_WINDOW") {
+        Ok(v) if !v.is_empty() => v.parse::<u64>().ok(),
+        _ => file_cfg
+            .as_ref()
+            .and_then(|c| c.default_model())
+            .and_then(|m| m.context_window),
+    };
     // Model: env first (the gateway passes the per-session model), then the
     // default model from the config file.
     let (model_base_url, model_name, auth_token) =
@@ -101,6 +113,7 @@ pub fn parse_config() -> Result<WorkerConfig, ConfigError> {
         model_base_url,
         model_name,
         auth_token,
+        context_window,
         subagent_depth,
     })
 }

@@ -129,6 +129,7 @@ async fn main() {
         model_base_url: cfg.model_base_url,
         model_name: cfg.model_name,
         auth_token: cfg.auth_token,
+        context_window: cfg.context_window,
         subagent_depth: cfg.subagent_depth,
     };
 

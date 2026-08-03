@@ -9,8 +9,8 @@ use anyhow::{Context, Result, bail};
 use futures_util::{StreamExt, pin_mut};
 use mo_core::{JournalEventKind, JournalMessage, JournalWriter, Session, ToolCallInfo};
 use nah_chat::{
-    ChatClient, ChatCompletionParamsBuilder, ChatMessage, ChatMessageContentValue,
-    FunctionCallRequest, ToolCallRequest,
+    ChatClient, ChatCompletionParamsBuilder, ChatCompletionStreamEvent, ChatMessage,
+    ChatMessageContentValue, FunctionCallRequest, ToolCallRequest,
 };
 use serde_json::{Value, json};
 
@@ -28,6 +28,9 @@ pub struct AgentConfig {
     pub model_base_url: String,
     pub model_name: String,
     pub auth_token: Option<String>,
+    /// The model's context window in tokens (from `mo.toml`), embedded in
+    /// each `ContextUsage` journal event; `None` = unlimited.
+    pub context_window: Option<u64>,
     pub subagent_depth: u32,
 }
 
@@ -69,9 +72,20 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
         // event per content chunk as it arrives; the final `Message` event
         // (full assembled text) is journaled right after, so readers see
         // tokens arrive live and then settle on the canonical message.
-        let assistant = generate(&chat_client, &config.model_name, &messages, &tools, journal)
-            .await
-            .context("LLM generation failed after retries")?;
+        let (assistant, prompt_tokens) =
+            generate(&chat_client, &config.model_name, &messages, &tools, journal)
+                .await
+                .context("LLM generation failed after retries")?;
+        // The API reported the tokens this call consumed (system prompt +
+        // history + tool outputs). Journal them as the session's current
+        // context length; the status bar shows the latest value. Skipped
+        // when the provider did not report usage (ignored `include_usage`).
+        if let Some(tokens) = prompt_tokens {
+            journal.append(JournalEventKind::ContextUsage {
+                tokens,
+                context_window: config.context_window,
+            })?;
+        }
         journal.append(JournalEventKind::Message(journal_message_from(&assistant)))?;
 
         let Some(tool_calls) = assistant.tool_calls.clone() else {
@@ -225,17 +239,21 @@ fn tool_calls_answered(messages: &[ChatMessage], idx: usize) -> bool {
 /// attempt may leave a few orphan deltas behind; the final `Message` event
 /// that follows a successful attempt replaces them on the reader side, so
 /// history stays correct.
+///
+/// Returns the assembled assistant message plus the prompt-token count the
+/// API reported for the call (`None` when the provider did not report
+/// usage, e.g. it ignored `stream_options.include_usage`).
 async fn generate(
     chat_client: &ChatClient,
     model: &str,
     messages: &[ChatMessage],
     tools: &[Value],
     journal: &mut JournalWriter,
-) -> Result<ChatMessage> {
+) -> Result<(ChatMessage, Option<u64>)> {
     let mut last_error: Option<anyhow::Error> = None;
     for (attempt, delay) in RETRY_DELAYS_SECS.iter().enumerate() {
         match generate_once(chat_client, model, messages, tools, journal).await {
-            Ok(msg) => return Ok(msg),
+            Ok(result) => return Ok(result),
             Err(e) => {
                 tracing::warn!("LLM call failed (attempt {}): {e:#}", attempt + 1);
                 last_error = Some(e);
@@ -254,33 +272,46 @@ async fn generate_once(
     messages: &[ChatMessage],
     tools: &[Value],
     journal: &mut JournalWriter,
-) -> Result<ChatMessage> {
+) -> Result<(ChatMessage, Option<u64>)> {
     let mut params = ChatCompletionParamsBuilder::new();
     // No hard `max_tokens` cap: reasoning models may spend arbitrary tokens
     // on `reasoning_content` before the actual answer, and a cap truncates
     // the stream before any content arrives. Let the model run until it
     // finishes on its own.
     params.temperature(0.7).insert("tools", json!(tools));
+    // Ask the server to report the call's token usage in the final stream
+    // chunk (`ChatCompletionStreamEvent::Usage` right before `[DONE]`); the
+    // prompt tokens become the session's context length in the status bar.
+    params.include_usage();
     let stream = chat_client
         .chat_completion_stream(model, messages, &params)
         .await
         .map_err(|e| anyhow::anyhow!("failed to start chat completion stream: {e}"))?;
     pin_mut!(stream);
     let mut message = ChatMessage::new();
-    while let Some(delta) = stream.next().await {
-        let delta = delta.map_err(|e| anyhow::anyhow!("error in stream delta: {e}"))?;
-        // Journal every chunk that carries visible text or reasoning, so
-        // both stream token-by-token (reasoning models emit
-        // `reasoning_content` deltas first, then `content` deltas).
-        let content = delta.content.clone().unwrap_or_default();
-        let reasoning_content = delta.reasoning_content.clone().filter(|s| !s.is_empty());
-        if !content.is_empty() || reasoning_content.is_some() {
-            journal.append(JournalEventKind::MessageDelta {
-                content,
-                reasoning_content,
-            })?;
+    let mut prompt_tokens: Option<u64> = None;
+    while let Some(event) = stream.next().await {
+        match event.map_err(|e| anyhow::anyhow!("error in stream delta: {e}"))? {
+            ChatCompletionStreamEvent::Delta(delta) => {
+                // Journal every chunk that carries visible text or reasoning,
+                // so both stream token-by-token (reasoning models emit
+                // `reasoning_content` deltas first, then `content` deltas).
+                let content = delta.content.clone().unwrap_or_default();
+                let reasoning_content = delta.reasoning_content.clone().filter(|s| !s.is_empty());
+                if !content.is_empty() || reasoning_content.is_some() {
+                    journal.append(JournalEventKind::MessageDelta {
+                        content,
+                        reasoning_content,
+                    })?;
+                }
+                message.apply_model_response_chunk(delta);
+            }
+            ChatCompletionStreamEvent::Usage(usage) => {
+                // The final chunk reports the whole call's usage; keep the
+                // last one seen (some proxies send it earlier).
+                prompt_tokens = usage.prompt_tokens;
+            }
         }
-        message.apply_model_response_chunk(delta);
     }
     let empty = message.role.is_empty()
         && message.content.to_string().is_empty()
@@ -288,7 +319,7 @@ async fn generate_once(
     if empty {
         bail!("model returned an empty response");
     }
-    Ok(message)
+    Ok((message, prompt_tokens))
 }
 
 fn journal_message_from(msg: &ChatMessage) -> JournalMessage {
@@ -345,8 +376,14 @@ mod tests {
         })
     }
 
-    /// Build a full SSE payload from a list of delta chunks.
-    fn sse_payload(deltas: &[Value]) -> String {
+    /// Build an SSE payload ending with a usage chunk (empty `choices` +
+    /// top-level `usage`) before `[DONE]`, as OpenAI-compatible servers send
+    /// when the request sets `stream_options.include_usage`.
+    fn sse_payload_with_usage(
+        deltas: &[Value],
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    ) -> String {
         let mut out = String::new();
         for delta in deltas {
             out.push_str(&format!(
@@ -354,6 +391,17 @@ mod tests {
                 json!({ "choices": [{ "delta": delta }] })
             ));
         }
+        out.push_str(&format!(
+            "data: {}\n\n",
+            json!({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                }
+            })
+        ));
         out.push_str("data: [DONE]\n\n");
         out
     }
@@ -558,29 +606,41 @@ mod tests {
                             body.get("max_tokens").is_none(),
                             "worker request must not hard-cap output tokens: {body:?}"
                         );
+                        assert_eq!(
+                            body["stream_options"]["include_usage"], true,
+                            "worker request must ask for usage: {body:?}"
+                        );
                         let n = calls.fetch_add(1, Ordering::SeqCst);
                         let body = if n == 0 {
-                            sse_payload(&[
-                                delta_role("assistant"),
-                                delta_tool_call(
-                                    0,
-                                    "call_1",
-                                    "read_file",
-                                    r#"{"path":"notes.txt"}"#,
-                                ),
-                            ])
+                            sse_payload_with_usage(
+                                &[
+                                    delta_role("assistant"),
+                                    delta_tool_call(
+                                        0,
+                                        "call_1",
+                                        "read_file",
+                                        r#"{"path":"notes.txt"}"#,
+                                    ),
+                                ],
+                                30,
+                                5,
+                            )
                         } else {
                             // The final answer streams reasoning first, then
                             // several content chunks, exercising
                             // token-by-token journaling of both fields.
-                            sse_payload(&[
-                                delta_role("assistant"),
-                                delta_reasoning("Let me recall: "),
-                                delta_reasoning("notes say hello."),
-                                delta_content("The file says: "),
-                                delta_content("hello world "),
-                                delta_content("from notes.\n"),
-                            ])
+                            sse_payload_with_usage(
+                                &[
+                                    delta_role("assistant"),
+                                    delta_reasoning("Let me recall: "),
+                                    delta_reasoning("notes say hello."),
+                                    delta_content("The file says: "),
+                                    delta_content("hello world "),
+                                    delta_content("from notes.\n"),
+                                ],
+                                48,
+                                12,
+                            )
                         };
                         (
                             [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
@@ -604,6 +664,7 @@ mod tests {
             model_base_url: format!("http://{addr}"),
             model_name: "mock-model".to_string(),
             auth_token: None,
+            context_window: Some(4096),
             subagent_depth: 0,
         };
         let mut journal = JournalWriter::open(std::path::Path::new(&session.journal_path)).unwrap();
@@ -620,63 +681,81 @@ mod tests {
             .unwrap();
         run_agent(agent_cfg, &mut journal).await.unwrap();
 
-        // Journal sequence: user message, assistant(tool call), tool_call_start,
-        // tool_result, then the final answer streamed as reasoning deltas
-        // followed by content deltas, then the assembled assistant message.
+        // Journal sequence: user message, context_usage (request 1),
+        // assistant(tool call), tool_call_start, tool_result, then the final
+        // answer streamed as reasoning deltas followed by content deltas,
+        // context_usage (request 2), then the assembled assistant message.
         let events = mo_core::read_events(std::path::Path::new(&session.journal_path)).unwrap();
-        assert_eq!(events.len(), 10, "events: {events:#?}");
+        assert_eq!(events.len(), 12, "events: {events:#?}");
         let kinds: Vec<&JournalEventKind> = events.iter().map(|e| &e.kind).collect();
         assert!(
             matches!(kinds[0], JournalEventKind::Message(m) if m.role == "user" && m.content.contains("Read notes.txt"))
         );
-        assert!(
-            matches!(kinds[1], JournalEventKind::Message(m) if m.role == "assistant" && m.tool_calls.as_ref().is_some_and(|t| t.len() == 1))
+        // Each LLM call journals the API-reported context length against the
+        // configured window; the first call's count is smaller than the
+        // second's (the tool round-trip grew the context).
+        assert_eq!(
+            kinds[1],
+            &JournalEventKind::ContextUsage {
+                tokens: 30,
+                context_window: Some(4096),
+            }
         );
         assert!(
-            matches!(kinds[2], JournalEventKind::ToolCallStart { name, .. } if name == "read_file")
+            matches!(kinds[2], JournalEventKind::Message(m) if m.role == "assistant" && m.tool_calls.as_ref().is_some_and(|t| t.len() == 1))
         );
         assert!(
-            matches!(kinds[3], JournalEventKind::ToolResult { ok: true, output, .. } if output.contains("hello world from notes"))
+            matches!(kinds[3], JournalEventKind::ToolCallStart { name, .. } if name == "read_file")
+        );
+        assert!(
+            matches!(kinds[4], JournalEventKind::ToolResult { ok: true, output, .. } if output.contains("hello world from notes"))
         );
         // Token-by-token preview: reasoning deltas first (empty content),
         // then the content deltas assembling the final answer.
         assert_eq!(
-            kinds[4],
+            kinds[5],
             &JournalEventKind::MessageDelta {
                 content: String::new(),
                 reasoning_content: Some("Let me recall: ".to_string()),
             }
         );
         assert_eq!(
-            kinds[5],
+            kinds[6],
             &JournalEventKind::MessageDelta {
                 content: String::new(),
                 reasoning_content: Some("notes say hello.".to_string()),
             }
         );
         assert_eq!(
-            kinds[6],
+            kinds[7],
             &JournalEventKind::MessageDelta {
                 content: "The file says: ".to_string(),
                 reasoning_content: None,
             }
         );
         assert_eq!(
-            kinds[7],
+            kinds[8],
             &JournalEventKind::MessageDelta {
                 content: "hello world ".to_string(),
                 reasoning_content: None,
             }
         );
         assert_eq!(
-            kinds[8],
+            kinds[9],
             &JournalEventKind::MessageDelta {
                 content: "from notes.\n".to_string(),
                 reasoning_content: None,
             }
         );
+        assert_eq!(
+            kinds[10],
+            &JournalEventKind::ContextUsage {
+                tokens: 48,
+                context_window: Some(4096),
+            }
+        );
         assert!(
-            matches!(kinds[9], JournalEventKind::Message(m) if m.role == "assistant" && m.content.contains("hello world from notes") && m.reasoning_content.as_deref() == Some("Let me recall: notes say hello."))
+            matches!(kinds[11], JournalEventKind::Message(m) if m.role == "assistant" && m.content.contains("hello world from notes") && m.reasoning_content.as_deref() == Some("Let me recall: notes say hello."))
         );
     }
 }

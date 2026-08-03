@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import type { JournalEvent, JournalMessage, Session, SessionStatus } from '../api'
 import { cancelSession, getHistory, getSession, postMessage } from '../api'
 import Composer from './Composer'
 import CopyButton from './CopyButton'
+import StatusBar from './StatusBar'
 
 interface Props {
   session: Session
@@ -254,6 +255,18 @@ export default function SessionView({ session, onStatusChange }: Props) {
 
   const running = status === 'running' || status === 'pending'
   const timeline = buildTimeline(events)
+  // The status bar shows the latest context_usage event (the worker journals
+  // one per LLM call; the last one reflects the deepest context, tool
+  // outputs included). Null until the first call reports usage.
+  const contextUsage = useMemo(() => {
+    let latest: { tokens: number; context_window?: number | null } | null = null
+    for (const ev of events) {
+      if (ev.kind.kind === 'context_usage') {
+        latest = { tokens: ev.kind.tokens, context_window: ev.kind.context_window ?? null }
+      }
+    }
+    return latest
+  }, [events])
   // While any tool is still streaming, re-render once per second so the
   // elapsed badge ticks; stop when everything settles.
   const anyToolStreaming = timeline.some(
@@ -336,6 +349,12 @@ export default function SessionView({ session, onStatusChange }: Props) {
         busy={sending || cancelling}
         onStop={() => void stop()}
         onSubmit={send}
+      />
+
+      <StatusBar
+        status={status}
+        tokens={contextUsage?.tokens ?? null}
+        contextWindow={contextUsage?.context_window ?? null}
       />
     </div>
   )

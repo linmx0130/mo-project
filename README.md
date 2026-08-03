@@ -77,16 +77,19 @@ base_url = "https://api.deepseek.com"
 name = "deepseek-v4-flash"
 token = "sk-..."               # optional: omit for endpoints without auth
 nickname = "deepseek"          # optional label shown in the UI
+# context_window = 65536       # optional: model context window in tokens;
+                               # absent = unlimited. The session status bar
+                               # shows the current context length against it.
 
 [[models]]
 base_url = "http://127.0.0.1:9001"
 name = "smoke-model"
 ```
 
-Workers are spawned with the chosen session's model (base URL, name, token)
-plus the data dir / agents dir / subagent depth in their environment, so a
-config file replaces the old env-var setup entirely. The worker also falls
-back to the same config file when run standalone.
+Workers are spawned with the chosen session's model (base URL, name, token,
+context window) plus the data dir / agents dir / subagent depth in their
+environment, so a config file replaces the old env-var setup entirely. The
+worker also falls back to the same config file when run standalone.
 
 ## Run it
 
@@ -146,6 +149,19 @@ preview for the canonical, complete text. Delta events are skipped when the
 worker rebuilds chat history from the journal, so the model context stays
 clean.
 
+## Status bar
+
+The session view has a status bar pinned to the bottom showing the session
+status badge and the current context length in tokens. The length comes
+from the LLM API — the worker requests `stream_options.include_usage` and
+journals the reported `usage.prompt_tokens` after every LLM call as a
+`context_usage` event, so the bar live-updates as the conversation grows
+(tool outputs included) and survives reloads (rebuilt from history). When
+the model config sets a `context_window`, the bar renders `used / window`
+with a thin progress bar and a percentage, turning red at ≥ 90%; without
+one the window is treated as unlimited and only the current length is
+shown.
+
 ## Legacy env vars
 
 Configuration lives in `mo.toml` (see above). When no config file is found,
@@ -203,9 +219,10 @@ $HOME/.agents/
 
 Session status: `pending | running | completed | failed | cancelled`.
 Journal events: `message`, `tool_call_start`, `tool_result`, `status_change`,
-plus the streaming previews `message_delta` (token-by-token assistant text
-and reasoning) and `tool_output_delta` (live bash output) — JSONL, `seq` +
-`ts` per line.
+`context_usage` (context length in tokens after each LLM call, from the
+API's `usage.prompt_tokens`), plus the streaming previews `message_delta`
+(token-by-token assistant text and reasoning) and `tool_output_delta` (live
+bash output) — JSONL, `seq` + `ts` per line.
 
 ### Session titles
 

@@ -151,6 +151,21 @@ pub enum JournalEventKind {
         name: String,
         output: String,
     },
+    /// The session's context length after an LLM call, reported by the API
+    /// (`usage.prompt_tokens` — the tokens the model consumed for this call,
+    /// i.e. system prompt + history + tool outputs). The worker journals one
+    /// of these after every successful LLM call; readers show the latest as
+    /// the session's current context usage in the status bar.
+    ///
+    /// `context_window` is the model's configured window in tokens at
+    /// session time, or `None` for unlimited — embedded by the worker so the
+    /// frontend can render the length against the window without extra
+    /// lookups.
+    ContextUsage {
+        tokens: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context_window: Option<u64>,
+    },
 }
 
 /// One line of a session journal.

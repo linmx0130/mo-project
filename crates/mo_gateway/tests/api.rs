@@ -22,12 +22,14 @@ fn test_models() -> Vec<ModelConfig> {
             name: "default-model".into(),
             token: Some("tok-1".into()),
             nickname: Some("alpha".into()),
+            context_window: Some(32768),
         },
         ModelConfig {
             base_url: "http://127.0.0.1:9002".into(),
             name: "second-model".into(),
             token: None,
             nickname: None,
+            context_window: None,
         },
     ]
 }
@@ -749,6 +751,61 @@ async fn create_session_uses_default_model_and_accepts_model_choice() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn spawn_worker_passes_context_window_env() {
+    // A stub worker that dumps its MO_* env to a file; the default model in
+    // `test_models` has `context_window = 32768`, which must reach the
+    // worker so it can embed the window in `context_usage` events.
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path().join("work");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let data_dir = dir.path().join("data");
+    let env_file = dir.path().join("env.txt");
+    let worker_bin = write_stub_worker(
+        dir.path(),
+        &format!("#!/bin/sh\nenv | grep MO_ > {}\n", env_file.display()),
+    );
+    let conn = mo_core::open_db(&data_dir.join("mo.db")).unwrap();
+    let state = Arc::new(AppState {
+        data_dir,
+        db: Mutex::new(conn),
+        worker_bin,
+        cwd: std::env::current_dir().unwrap(),
+        agents_dir: dir.path().join("agents"),
+        subagent_depth: 0,
+        models: test_models(),
+    });
+    let app = create_router(state);
+
+    let (status, _) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({ "workdir": workdir.display().to_string(), "prompt": "env check" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let mut written = false;
+    for _ in 0..50 {
+        if env_file.exists() {
+            written = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(written, "stub worker never wrote its env");
+    let env = std::fs::read_to_string(&env_file).unwrap();
+    assert!(
+        env.contains("MO_CONTEXT_WINDOW=32768"),
+        "MO_CONTEXT_WINDOW missing from worker env: {env}"
+    );
+    assert!(
+        env.contains("MO_MODEL_NAME=default-model"),
+        "model env missing: {env}"
+    );
 }
 
 fn process_is_alive(pid: u32) -> bool {

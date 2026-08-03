@@ -12,7 +12,10 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use futures_util::{StreamExt, pin_mut};
 use mo_core::db;
-use nah_chat::{ChatClient, ChatCompletionParamsBuilder, ChatMessage, ChatMessageContentValue};
+use nah_chat::{
+    ChatClient, ChatCompletionParamsBuilder, ChatCompletionStreamEvent, ChatMessage,
+    ChatMessageContentValue,
+};
 
 use crate::state::AppState;
 
@@ -155,7 +158,8 @@ async fn generate_title(
 
 /// One streaming chat completion call (same request shape the worker uses,
 /// so the mock LLM keeps working). No retries: titles are cheap to
-/// regenerate and a failure just leaves the placeholder in place.
+/// regenerate and a failure just leaves the placeholder in place. `Usage`
+/// stream events are ignored — titles don't need token counts.
 async fn generate_once(
     chat_client: &ChatClient,
     model: &str,
@@ -169,9 +173,13 @@ async fn generate_once(
         .map_err(|e| anyhow::anyhow!("failed to start chat completion stream: {e}"))?;
     pin_mut!(stream);
     let mut message = ChatMessage::new();
-    while let Some(delta) = stream.next().await {
-        let delta = delta.map_err(|e| anyhow::anyhow!("error in stream delta: {e}"))?;
-        message.apply_model_response_chunk(delta);
+    while let Some(event) = stream.next().await {
+        match event.map_err(|e| anyhow::anyhow!("error in stream delta: {e}"))? {
+            ChatCompletionStreamEvent::Delta(delta) => {
+                message.apply_model_response_chunk(delta);
+            }
+            ChatCompletionStreamEvent::Usage(_) => {}
+        }
     }
     if message.role.is_empty()
         && message.content.to_string().is_empty()

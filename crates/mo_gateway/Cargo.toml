@@ -11,7 +11,7 @@ chrono = "0.4.45"
 futures-util.workspace = true
 libc = "0.2.189"
 mo_core = { version = "0.1.0", path = "../mo_core" }
-nah_chat = { version = "0.7.0", git = "https://github.com/linmx0130/nah" }
+nah_chat = { version = "0.8.0", git = "https://github.com/linmx0130/nah" }
 rusqlite = "0.40.1"
 serde.workspace = true
 serde_json.workspace = true

@@ -20,6 +20,10 @@
 //! name      = "deepseek-v4-flash"
 //! token     = "sk-..."                # optional
 //! nickname  = "deepseek"              # optional, shown in the UI
+//! context_window = 65536              # optional; the model's context window in
+//!                                     # tokens (unlimited when absent). The UI
+//!                                     # shows the session's context length
+//!                                     # against this window in the status bar.
 //! ```
 
 use std::env;
@@ -43,6 +47,11 @@ pub struct ModelConfig {
     /// Optional human-readable label shown in the "New session" UI.
     #[serde(default)]
     pub nickname: Option<String>,
+    /// Optional context window in tokens; `None` means unlimited. The
+    /// worker embeds it in each `context_usage` journal event, and the UI
+    /// renders the session's context length against it.
+    #[serde(default)]
+    pub context_window: Option<u64>,
 }
 
 /// Raw TOML file shape (all fields optional so a minimal file works).
@@ -115,6 +124,7 @@ impl MoConfig {
                     name,
                     token: env::var("MO_AUTH_TOKEN").ok().filter(|v| !v.is_empty()),
                     nickname: None,
+                    context_window: None,
                 }]
             }
             _ => Vec::new(),
@@ -274,6 +284,7 @@ mod tests {
                 name = "model-a"
                 token = "tok-a"
                 nickname = "alpha"
+                context_window = 65536
 
                 [[models]]
                 base_url = "https://b.example.com"
@@ -294,7 +305,10 @@ mod tests {
             config.default_model().unwrap().token.as_deref(),
             Some("tok-a")
         );
+        assert_eq!(config.default_model().unwrap().context_window, Some(65536));
         assert_eq!(config.find_model("model-b").unwrap().token, None);
+        // Unset context_window means unlimited.
+        assert_eq!(config.find_model("model-b").unwrap().context_window, None);
         assert!(config.find_model("nope").is_none());
         assert_eq!(config.source.as_deref(), Some(path.as_path()));
         // Unset keys fall back to defaults.

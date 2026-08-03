@@ -30,11 +30,18 @@
 # pre-selected in the "New session" UI. Every model needs a base_url and a
 # name; token is optional (omit it for endpoints without auth) and nickname
 # is an optional label shown in the UI.
+#
+# context_window is optional: the model's context window in tokens. When
+# set, the session status bar shows the current context length against it
+# (with a progress bar); when absent the window is treated as unlimited and
+# only the current length is shown. The context length itself comes from the
+# LLM API (`usage.prompt_tokens` of each chat completion).
 [[models]]
 base_url = "https://api.deepseek.com"
 name = "deepseek-v4-flash"
 token = "sk-..."
 # nickname = "deepseek"
+# context_window = 65536
 
 # A second model, e.g. a local mock for smoke tests:
 [[models]]

@@ -65,6 +65,10 @@ export type JournalEventKind =
   /** Streamed output of a running tool (bash); the following `tool_result`
    *  event carries the complete, capped output and replaces the preview. */
   | { kind: 'tool_output_delta'; id: string; name: string; output: string }
+  /** Context length (API-reported prompt tokens) after an LLM call; the
+   *  status bar shows the latest one. `context_window` is the model's
+   *  configured window at session time, or null for unlimited. */
+  | { kind: 'context_usage'; tokens: number; context_window?: number | null }
 
 export interface JournalEvent {
   /** null for synthesized SSE status events (not part of the journal) */
