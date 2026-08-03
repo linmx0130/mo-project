@@ -487,6 +487,100 @@ async fn followup_message_respawns_worker_and_journals() {
 }
 
 #[tokio::test]
+async fn delete_session_removes_row_and_disk_files() {
+    let (_dir, app) = setup(false);
+    let workdir = _dir.path().join("work");
+    let data_dir = _dir.path().join("data");
+
+    let (_, session) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({ "workdir": workdir.display().to_string(), "prompt": "to be deleted" })),
+    )
+    .await;
+    let id = session["id"].as_str().unwrap().to_string();
+
+    // The stub exits immediately; wait for the liveness check to mark the
+    // session failed so the delete path skips the worker kill.
+    let mut terminal = false;
+    for _ in 0..50 {
+        let (_, detail) = request(&app, Method::GET, &format!("/api/sessions/{id}"), None).await;
+        if detail["status"] == "failed" {
+            terminal = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(terminal, "session was never marked failed");
+
+    // The session directory (journal + worker log) exists on disk.
+    let session_dir = data_dir.join("sessions").join(&id);
+    assert!(session_dir.join("journal.jsonl").is_file());
+    assert!(session_dir.join("worker.log").exists());
+
+    // DELETE /api/sessions/:id
+    let (status, _) = request(&app, Method::DELETE, &format!("/api/sessions/{id}"), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // DB row is gone and the session directory is removed from disk.
+    let conn = open_db(&data_dir.join("mo.db")).unwrap();
+    assert!(db::get_session(&conn, &id).unwrap().is_none());
+    drop(conn);
+    assert!(!session_dir.exists(), "session dir should be removed");
+
+    // The session is gone from the list and the detail endpoint 404s.
+    let (status, sessions) = request(&app, Method::GET, "/api/sessions", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(sessions.as_array().unwrap().len(), 0);
+    let (status, _) = request(&app, Method::GET, &format!("/api/sessions/{id}"), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_running_session_kills_worker() {
+    let (_dir, app) = setup(true);
+    let workdir = _dir.path().join("work");
+    let data_dir = _dir.path().join("data");
+
+    let (_, session) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({ "workdir": workdir.display().to_string(), "prompt": "run & delete" })),
+    )
+    .await;
+    let id = session["id"].as_str().unwrap().to_string();
+    let pid = session["pid"].as_u64().unwrap() as u32;
+    assert!(process_is_alive(pid), "stub worker should be running");
+
+    let session_dir = data_dir.join("sessions").join(&id);
+    assert!(session_dir.is_dir());
+
+    let (status, _) = request(&app, Method::DELETE, &format!("/api/sessions/{id}"), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // The worker must be dead and the session gone from DB + disk.
+    for _ in 0..20 {
+        if !process_is_alive(pid) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(!process_is_alive(pid), "worker should have been killed");
+    assert!(!session_dir.exists(), "session dir should be removed");
+    let conn = open_db(&data_dir.join("mo.db")).unwrap();
+    assert!(db::get_session(&conn, &id).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn delete_unknown_session_returns_404() {
+    let (_dir, app) = setup(false);
+    let (status, _) = request(&app, Method::DELETE, "/api/sessions/nope", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn models_endpoint_lists_models_first_is_default() {
     let (_dir, app) = setup(false);
     let (status, models) = request(&app, Method::GET, "/api/models", None).await;

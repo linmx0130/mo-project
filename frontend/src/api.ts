@@ -86,6 +86,8 @@ async function http<T>(url: string, init?: RequestInit): Promise<T> {
     }
     throw new Error(message)
   }
+  // 204 No Content (e.g. session deletion) has no JSON body.
+  if (res.status === 204) return undefined as T
   return res.json() as Promise<T>
 }
 
@@ -135,4 +137,9 @@ export function getHistory(id: string, afterSeq?: number): Promise<JournalEvent[
 
 export function cancelSession(id: string): Promise<Session> {
   return http(`/api/sessions/${id}/cancel`, { method: 'POST' })
+}
+
+/** Permanently delete a session (worker killed, files + DB row removed). */
+export function deleteSession(id: string): Promise<void> {
+  return http(`/api/sessions/${id}`, { method: 'DELETE' })
 }

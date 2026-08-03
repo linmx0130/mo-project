@@ -30,7 +30,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/meta", get(meta))
         .route("/api/models", get(list_models))
         .route("/api/sessions", post(create_session).get(list_sessions))
-        .route("/api/sessions/{id}", get(get_session))
+        .route(
+            "/api/sessions/{id}",
+            get(get_session).delete(delete_session),
+        )
         .route("/api/sessions/{id}/history", get(history))
         .route("/api/sessions/{id}/events", get(sse::events))
         .route("/api/sessions/{id}/messages", post(send_message))
@@ -317,6 +320,39 @@ async fn get_session(
         session.error = Some(error);
     }
     Ok(Json(session))
+}
+
+/// DELETE /api/sessions/:id — permanently remove a session: stop a running
+/// worker (SIGTERM → SIGKILL its process group), delete the per-session
+/// directory from disk (journal, worker log, ...), then drop the DB row.
+/// Returns 204 No Content on success, 404 for an unknown session.
+async fn delete_session(
+    State(state): State<Arc<AppState>>,
+    PathParam(id): PathParam<String>,
+) -> ApiResult<StatusCode> {
+    let (pid, status) = {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        match db::get_session(&conn, &id).map_err(ApiError::internal)? {
+            Some(session) => (session.pid, session.status),
+            None => return Err(ApiError::not_found("session not found")),
+        }
+    };
+    // Stop a live worker before touching its files so nothing keeps writing
+    // to the journal while the directory is removed.
+    if (status == SessionStatus::Running || status == SessionStatus::Pending)
+        && let Some(pid) = pid
+    {
+        process::cancel_session_pid(pid).await;
+    }
+    // Remove the per-session directory first: a failure here leaves the
+    // session fully intact (row + files), so the client can retry.
+    process::remove_session_dir(&state.data_dir, &id)
+        .map_err(|e| ApiError::internal(format!("failed to remove session directory: {e}")))?;
+    {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::delete_session(&conn, &id).map_err(ApiError::internal)?;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]

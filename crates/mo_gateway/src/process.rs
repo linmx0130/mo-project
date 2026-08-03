@@ -104,3 +104,36 @@ pub async fn cancel_session_pid(pid: u32) {
         libc::kill(pid as i32, libc::SIGKILL);
     }
 }
+
+/// Permanently remove the per-session directory (`<data_dir>/sessions/<id>`:
+/// journal, worker log, anything else the worker wrote there).
+///
+/// The id arrives from a URL path, so it is validated to be a single plain
+/// path component and the resolved directory is re-checked to live under
+/// `<data_dir>/sessions` before anything is deleted. Removing an already
+/// missing directory is a no-op.
+pub fn remove_session_dir(data_dir: &std::path::Path, id: &str) -> std::io::Result<()> {
+    let is_plain_component =
+        !id.is_empty() && id != "." && id != ".." && !id.contains('/') && !id.contains('\\');
+    if !is_plain_component {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid session id: {id:?}"),
+        ));
+    }
+    let sessions_root = data_dir.join("sessions");
+    let dir = sessions_root.join(id);
+    // Defense in depth: the resolved path must be a child of the sessions
+    // root (never the root itself).
+    if dir == sessions_root || !dir.starts_with(&sessions_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to remove non-session path: {}", dir.display()),
+        ));
+    }
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}

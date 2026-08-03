@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { Session } from './api'
-import { getMeta, listSessions } from './api'
+import { deleteSession, getMeta, listSessions } from './api'
 import DraftSession from './components/DraftSession'
 import SessionList from './components/SessionList'
 import SessionView from './components/SessionView'
@@ -29,6 +29,11 @@ function App() {
   const [draftOpen, setDraftOpen] = useState(false)
   const [lastWorkdir, setLastWorkdir] = useState('')
   const [theme, setTheme] = useState<Theme>(initialTheme)
+  // Session currently being deleted (delete button shows a spinner and the
+  // button is disabled while the request is in flight).
+  const [deletingId, setDeletingId] = useState<string | null>(null)
+  // Sidebar-level error, e.g. a failed delete (surfaced above the list).
+  const [listError, setListError] = useState<string | null>(null)
 
   // Theme: applied to <html data-theme> so CSS vars switch; persisted so the
   // choice survives reloads.
@@ -90,6 +95,25 @@ function App() {
     void refresh()
   }
 
+  /** Permanently delete a session: clears the selection if the deleted one
+   *  was open, then refreshes the list. Failures are surfaced in the
+   *  sidebar (the row reappears on the next poll if the delete didn't go
+   *  through). */
+  const handleDelete = async (id: string) => {
+    if (deletingId) return
+    setDeletingId(id)
+    setListError(null)
+    try {
+      await deleteSession(id)
+      if (selectedId === id) setSelectedId(null)
+      await refresh()
+    } catch (err) {
+      setListError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setDeletingId(null)
+    }
+  }
+
   const selected = sessions.find((s) => s.id === selectedId) ?? null
 
   return (
@@ -104,10 +128,17 @@ function App() {
           + New session
         </button>
         <div className="sidebar-list">
+          {listError && (
+            <p className="form-error list-error" role="alert">
+              {listError}
+            </p>
+          )}
           <SessionList
             sessions={sessions}
             selectedId={selectedId}
+            deletingId={deletingId}
             onSelect={selectSession}
+            onDelete={(id) => void handleDelete(id)}
           />
         </div>
         <footer className="sidebar-footer">

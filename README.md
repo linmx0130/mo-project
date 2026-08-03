@@ -193,6 +193,7 @@ $HOME/.agents/
 | `GET /api/sessions/:id/events` | SSE tail: new events + synthesized status changes |
 | `POST /api/sessions/:id/messages` `{content}` | continue a terminal session: journal the user message, reset to `pending`, respawn the worker |
 | `POST /api/sessions/:id/cancel` | mark cancelled, then SIGTERM → SIGKILL the worker process group |
+| `DELETE /api/sessions/:id` | permanently delete a session: stop a running worker, remove the session dir (journal, worker log, ...) from disk, drop the DB row (`204` on success) |
 
 Session status: `pending | running | completed | failed | cancelled`.
 Journal events: `message`, `tool_call_start`, `tool_result`, `status_change`,

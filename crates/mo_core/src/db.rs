@@ -142,6 +142,13 @@ pub fn clear_pid(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Permanently remove a session row. Returns `true` if a row was deleted
+/// (i.e. the session existed), `false` for an unknown id.
+pub fn delete_session(conn: &Connection, id: &str) -> Result<bool> {
+    let deleted = conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+    Ok(deleted > 0)
+}
+
 /// Overwrite the session title (the `prompt` column). Used by the gateway
 /// when a generated title lands after session creation.
 pub fn set_prompt(conn: &Connection, id: &str, prompt: &str) -> Result<()> {
@@ -260,6 +267,22 @@ mod tests {
         // Unknown session is a no-op (no rows updated).
         set_prompt(&conn, "missing", "nope").unwrap();
         assert!(get_session(&conn, "missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_session_removes_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("mo.db")).unwrap();
+        create_session(&conn, &sample_session("s1")).unwrap();
+        create_session(&conn, &sample_session("s2")).unwrap();
+
+        assert!(delete_session(&conn, "s1").unwrap());
+        assert!(get_session(&conn, "s1").unwrap().is_none());
+        assert!(get_session(&conn, "s2").unwrap().is_some());
+
+        // Deleting again (or an unknown id) reports no row deleted.
+        assert!(!delete_session(&conn, "s1").unwrap());
+        assert!(!delete_session(&conn, "missing").unwrap());
     }
 
     #[test]
