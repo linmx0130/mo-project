@@ -125,6 +125,28 @@ pub enum JournalEventKind {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// A streamed chunk of an assistant message (token-by-token preview).
+    ///
+    /// The worker journals these as the LLM stream arrives, *before* the
+    /// final `Message` event with the assembled text. Readers (the
+    /// frontend) append them to the in-flight assistant message and let the
+    /// final `Message` event replace the assembled content — which also
+    /// repairs the transient state when a retried LLM call leaves partial
+    /// deltas behind. Delta events are skipped when rebuilding chat
+    /// history, so they never reach the model context.
+    MessageDelta {
+        content: String,
+    },
+    /// A streamed chunk of a running tool's output (bash stdout/stderr).
+    ///
+    /// `id` matches the tool call id of the preceding `ToolCallStart`
+    /// event; readers append the chunks to that tool block until the final
+    /// `ToolResult` event (with the complete, capped output) arrives.
+    ToolOutputDelta {
+        id: String,
+        name: String,
+        output: String,
+    },
 }
 
 /// One line of a session journal.

@@ -303,9 +303,26 @@ async fn sse_streams_journal_events_and_closes_on_terminal() {
     }
     let mut journal = JournalWriter::open(Path::new(&journal_path)).unwrap();
     journal
+        .append(JournalEventKind::MessageDelta {
+            content: "streamed ".into(),
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::MessageDelta {
+            content: "tokens".into(),
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::ToolOutputDelta {
+            id: "call_1".into(),
+            name: "bash".into(),
+            output: "build output\n".into(),
+        })
+        .unwrap();
+    journal
         .append(JournalEventKind::Message(mo_core::JournalMessage {
             role: "assistant".into(),
-            content: "done".into(),
+            content: "streamed tokens".into(),
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
@@ -337,16 +354,25 @@ async fn sse_streams_journal_events_and_closes_on_terminal() {
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains("\"role\":\"assistant\""), "got: {text}");
     assert!(text.contains("\"status\":\"completed\""), "got: {text}");
+    // Streaming events pass through the SSE tail verbatim.
+    assert!(text.contains("\"kind\":\"message_delta\""), "got: {text}");
+    assert!(text.contains("streamed tokens"), "got: {text}");
+    assert!(
+        text.contains("\"kind\":\"tool_output_delta\""),
+        "got: {text}"
+    );
+    assert!(text.contains("build output"), "got: {text}");
 
     // Connecting with a cursor past every journaled event must NOT
     // re-synthesize the terminal status (the first poll seeds journal_status
-    // from the whole journal). The journal now has 3 events: the initial
-    // user message (seq 0, gateway), assistant (seq 1), status change (seq 2).
+    // from the whole journal). The journal now has 6 events: the initial
+    // user message (seq 0, gateway), two message deltas (seq 1-2), a tool
+    // output delta (seq 3), assistant message (seq 4), status change (seq 5).
     let response = app
         .clone()
         .oneshot(
             Request::builder()
-                .uri(format!("/api/sessions/{id}/events?after_seq=2"))
+                .uri(format!("/api/sessions/{id}/events?after_seq=5"))
                 .body(Body::empty())
                 .unwrap(),
         )

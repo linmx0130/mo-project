@@ -228,4 +228,64 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn streaming_delta_events_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let mut writer = JournalWriter::open(&path).unwrap();
+        writer
+            .append(JournalEventKind::MessageDelta {
+                content: "Hello ".to_string(),
+            })
+            .unwrap();
+        writer
+            .append(JournalEventKind::MessageDelta {
+                content: "world".to_string(),
+            })
+            .unwrap();
+        writer
+            .append(JournalEventKind::ToolOutputDelta {
+                id: "call_1".to_string(),
+                name: "bash".to_string(),
+                output: "hello\n".to_string(),
+            })
+            .unwrap();
+        writer
+            .append(JournalEventKind::ToolOutputDelta {
+                id: "call_1".to_string(),
+                name: "bash".to_string(),
+                output: "world\n".to_string(),
+            })
+            .unwrap();
+        let events = read_events(&path).unwrap();
+        assert_eq!(
+            events[0].kind,
+            JournalEventKind::MessageDelta {
+                content: "Hello ".to_string()
+            }
+        );
+        assert_eq!(
+            events[1].kind,
+            JournalEventKind::MessageDelta {
+                content: "world".to_string()
+            }
+        );
+        assert_eq!(
+            events[2].kind,
+            JournalEventKind::ToolOutputDelta {
+                id: "call_1".to_string(),
+                name: "bash".to_string(),
+                output: "hello\n".to_string()
+            }
+        );
+        assert_eq!(
+            events[3].kind,
+            JournalEventKind::ToolOutputDelta {
+                id: "call_1".to_string(),
+                name: "bash".to_string(),
+                output: "world\n".to_string()
+            }
+        );
+    }
 }

@@ -7,7 +7,7 @@ pub mod subagent;
 
 use std::path::PathBuf;
 
-use mo_core::Session;
+use mo_core::{JournalEventKind, Session};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -128,10 +128,16 @@ struct SpawnSubagentArgs {
 /// Execute one tool call. Returns the tool output (Ok) or a tool error
 /// (Err) — both are surfaced to the model; only a failed dispatch returns
 /// Err and both are journaled as ToolResult events.
+///
+/// `tool_call_id` identifies the call (used for streamed output events) and
+/// `on_delta` receives `ToolOutputDelta` events while a streaming tool
+/// (bash) runs, so the frontend can render output as it is produced.
 pub async fn execute_tool(
     ctx: &ToolContext,
     name: &str,
     arguments: &str,
+    tool_call_id: &str,
+    on_delta: &mut (dyn FnMut(JournalEventKind) + Send),
 ) -> Result<String, String> {
     match name {
         TOOL_READ_FILE => {
@@ -153,7 +159,14 @@ pub async fn execute_tool(
         TOOL_BASH => {
             let args: BashArgs = serde_json::from_str(arguments)
                 .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
-            bash::bash(&ctx.workdir, &args.command, bash::DEFAULT_TIMEOUT).await
+            bash::bash(
+                &ctx.workdir,
+                &args.command,
+                bash::DEFAULT_TIMEOUT,
+                tool_call_id,
+                on_delta,
+            )
+            .await
         }
         TOOL_SPAWN_SUBAGENT => {
             let args: SpawnSubagentArgs = serde_json::from_str(arguments)
@@ -207,7 +220,10 @@ mod tests {
             model_name: "m".into(),
             auth_token: None,
         };
-        let err = execute_tool(&ctx, "nope", "{}").await.unwrap_err();
+        let mut no_delta = |_: JournalEventKind| {};
+        let err = execute_tool(&ctx, "nope", "{}", "call_x", &mut no_delta)
+            .await
+            .unwrap_err();
         assert!(err.contains("unknown tool"));
     }
 }

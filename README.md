@@ -81,7 +81,22 @@ cargo run -p mo_gateway
 
 The mock responds based on the prompt: prompts containing `subagent` exercise
 `spawn_subagent`, prompts containing `slow` start a long-running `bash sleep`
-(handy for testing cancel), anything else does `read_file` + `bash`.
+(handy for testing cancel), anything else does `read_file` + `bash`. Final
+answers are replayed as multiple content chunks, so the token-by-token
+streaming path is exercised in smoke tests too.
+
+## Streaming
+
+The UI renders responses token-by-token. While the worker consumes the LLM
+completion stream it journals each content chunk as a `message_delta` event
+(plus a `tool_output_delta` event per stdout/stderr chunk while `bash` is
+running); the gateway SSE tail forwards them as they land, and the frontend
+appends them to the in-flight message / tool block with a blinking caret and
+a `running` badge. When the turn completes, the worker journals the final
+`message`/`tool_result` events, and the frontend swaps the delta-built
+preview for the canonical, complete text. Delta events are skipped when the
+worker rebuilds chat history from the journal, so the model context stays
+clean.
 
 ## Env vars
 
@@ -136,8 +151,9 @@ $HOME/.agents/
 | `POST /api/sessions/:id/cancel` | mark cancelled, then SIGTERM → SIGKILL the worker process group |
 
 Session status: `pending | running | completed | failed | cancelled`.
-Journal events: `message`, `tool_call_start`, `tool_result`, `status_change`
-(JSONL, `seq` + `ts` per line).
+Journal events: `message`, `tool_call_start`, `tool_result`, `status_change`,
+plus the streaming previews `message_delta` (token-by-token assistant text)
+and `tool_output_delta` (live bash output) — JSONL, `seq` + `ts` per line.
 
 ### Session titles
 
@@ -158,8 +174,7 @@ cd frontend && npm run lint && npm run build
 
 ## Non-goals (MVP)
 
-No worker pool, no auth, no token-by-token streaming to the frontend, no
-message compaction beyond the 1 MB tool-output cap, no static-file serving
-from the gateway, no multi-user support. Extension points (more tools,
-compaction, on-demand skill loading, prompt templates) are future
-experiments.
+No worker pool, no auth, no message compaction beyond the 1 MB tool-output
+cap, no static-file serving from the gateway, no multi-user support.
+Extension points (more tools, compaction, on-demand skill loading, prompt
+templates) are future experiments.

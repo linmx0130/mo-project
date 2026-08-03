@@ -660,6 +660,11 @@ p {
   text-transform: uppercase;
 }
 
+.tool-status.running {
+  color: var(--accent);
+  animation: mo-pulse 1.2s ease-in-out infinite;
+}
+
 .tool-status.ok {
   color: var(--status-completed);
 }
@@ -689,4 +694,29 @@ p {
   align-items: center;
   gap: 10px;
   padding: 2px 0;
+}
+
+/* ---------- streaming ---------- */
+
+/* Blinking caret shown while an assistant message is still being assembled
+   from message_delta events (token-by-token preview). */
+.stream-cursor {
+  display: inline-block;
+  width: 8px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--accent);
+  border-radius: 1px;
+  animation: mo-pulse 1s ease-in-out infinite;
+}
+
+@keyframes mo-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.25;
+  }
 }

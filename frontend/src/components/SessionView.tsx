@@ -20,31 +20,106 @@ interface ToolBlock {
   arguments: string
   output?: string
   ok?: boolean
+  /** True while output deltas are still arriving (tool still running). */
+  streaming?: boolean
 }
 
-type TimelineItem = JournalEvent | ToolBlock
+/** An assistant message as rendered; `streaming` marks a message whose
+ *  content is still being assembled from `message_delta` events. */
+type MessageBlock = JournalMessage & { streaming?: boolean }
 
-/** Pair each tool_call_start with its tool_result into one block. */
+type TimelineItem =
+  | { type: 'message'; message: MessageBlock }
+  | { type: 'tool'; block: ToolBlock }
+  | { type: 'event'; event: JournalEvent }
+
+/** Fold the journal event stream into renderable items.
+ *
+ * - `message_delta` events append to the assistant message currently being
+ *   assembled (token-by-token preview); the following `message` event
+ *   replaces its content with the canonical assembled text — which also
+ *   repairs the transient state when a retried LLM call left partial deltas
+ *   behind.
+ * - `tool_output_delta` events append to the open tool block with the same
+ *   id (bash output streaming); the following `tool_result` event replaces
+ *   the preview with the complete, capped output.
+ * - `tool_call_start`/`tool_result` are paired into one block as before.
+ */
 function buildTimeline(events: JournalEvent[]): TimelineItem[] {
   const items: TimelineItem[] = []
   const pending = new Map<string, ToolBlock>()
+  let openMessage: MessageBlock | null = null
+
   for (const ev of events) {
     const kind = ev.kind
-    if (kind.kind === 'tool_call_start') {
-      const block: ToolBlock = {
-        id: kind.id,
-        name: kind.name,
-        arguments: kind.arguments,
+    switch (kind.kind) {
+      case 'message_delta': {
+        if (openMessage) {
+          openMessage.content += kind.content
+        } else {
+          const block: MessageBlock = {
+            role: 'assistant',
+            content: kind.content,
+            streaming: true,
+          }
+          openMessage = block
+          items.push({ type: 'message', message: block })
+        }
+        break
       }
-      pending.set(kind.id, block)
-      items.push(block)
-    } else if (kind.kind === 'tool_result' && pending.has(kind.id)) {
-      const block = pending.get(kind.id)!
-      block.output = kind.output
-      block.ok = kind.ok
-      pending.delete(kind.id)
-    } else {
-      items.push(ev)
+      case 'message': {
+        if (kind.role === 'assistant' && openMessage) {
+          // Finalize the delta-built preview with the canonical message.
+          openMessage.content = kind.content
+          openMessage.reasoning_content = kind.reasoning_content ?? null
+          openMessage.tool_call_id = kind.tool_call_id ?? null
+          openMessage.tool_calls = kind.tool_calls ?? null
+          openMessage.streaming = false
+          openMessage = null
+        } else {
+          items.push({
+            type: 'message',
+            message: {
+              role: kind.role,
+              content: kind.content,
+              reasoning_content: kind.reasoning_content ?? null,
+              tool_call_id: kind.tool_call_id ?? null,
+              tool_calls: kind.tool_calls ?? null,
+            },
+          })
+        }
+        break
+      }
+      case 'tool_call_start': {
+        const block: ToolBlock = {
+          id: kind.id,
+          name: kind.name,
+          arguments: kind.arguments,
+        }
+        pending.set(kind.id, block)
+        items.push({ type: 'tool', block })
+        break
+      }
+      case 'tool_output_delta': {
+        const block = pending.get(kind.id)
+        if (block) {
+          block.output = (block.output ?? '') + kind.output
+          block.streaming = true
+        }
+        break
+      }
+      case 'tool_result': {
+        const block = pending.get(kind.id)
+        if (block) {
+          block.output = kind.output
+          block.ok = kind.ok
+          block.streaming = false
+          pending.delete(kind.id)
+        }
+        break
+      }
+      default:
+        items.push({ type: 'event', event: ev })
     }
   }
   return items
@@ -157,6 +232,15 @@ export default function SessionView({ session, onStatusChange }: Props) {
 
   const running = status === 'running' || status === 'pending'
   const timeline = buildTimeline(events)
+  // Stick to the bottom while events stream in, unless the user scrolled up.
+  const timelineRef = useRef<HTMLDivElement | null>(null)
+  const stickToBottomRef = useRef(true)
+  useEffect(() => {
+    const el = timelineRef.current
+    if (el && stickToBottomRef.current) {
+      el.scrollTop = el.scrollHeight
+    }
+  }, [events])
 
   return (
     <div className="session-view">
@@ -177,16 +261,35 @@ export default function SessionView({ session, onStatusChange }: Props) {
 
       {error && <p className="form-error">{error}</p>}
 
-      <div className="timeline">
-        {timeline.map((item, i) =>
-          'kind' in item ? (
-            <EventRow key={item.seq ?? `synth-${i}`} event={item} />
-          ) : (
-            // Tool-call ids come from the model and repeat across followup
-            // runs (e.g. a mock replaying `call_slow`), so disambiguate.
-            <ToolBlockRow key={`${item.id}-${i}`} block={item} />
-          ),
-        )}
+      <div
+        className="timeline"
+        ref={timelineRef}
+        onScroll={() => {
+          const el = timelineRef.current
+          if (!el) return
+          stickToBottomRef.current =
+            el.scrollHeight - el.scrollTop - el.clientHeight < 80
+        }}
+      >
+        {timeline.map((item, i) => {
+          switch (item.type) {
+            case 'message':
+              return <MessageRow key={`msg-${i}`} message={item.message} />
+            case 'tool':
+              // Tool-call ids come from the model and repeat across followup
+              // runs (e.g. a mock replaying `call_slow`), so disambiguate.
+              return (
+                <ToolBlockRow key={`${item.block.id}-${i}`} block={item.block} />
+              )
+            case 'event':
+              return (
+                <EventRow
+                  key={item.event.seq ?? `synth-${i}`}
+                  event={item.event}
+                />
+              )
+          }
+        })}
         {timeline.length === 0 && (
           <p className="muted list-empty">Waiting for events…</p>
         )}
@@ -205,8 +308,6 @@ export default function SessionView({ session, onStatusChange }: Props) {
 function EventRow({ event }: { event: JournalEvent }) {
   const kind = event.kind
   switch (kind.kind) {
-    case 'message':
-      return <MessageRow message={kind} />
     case 'status_change':
       return (
         <div className="status-change">
@@ -215,11 +316,13 @@ function EventRow({ event }: { event: JournalEvent }) {
         </div>
       )
     default:
+      // message / tool events are folded into dedicated items by
+      // buildTimeline; anything else is not rendered.
       return null
   }
 }
 
-function MessageRow({ message }: { message: JournalMessage }) {
+function MessageRow({ message }: { message: MessageBlock }) {
   const role = message.role
   if (role === 'tool') {
     return (
@@ -253,16 +356,27 @@ function MessageRow({ message }: { message: JournalMessage }) {
           </ReactMarkdown>
         </div>
       )}
+      {message.streaming && (
+        <span className="stream-cursor" aria-hidden="true" />
+      )}
     </div>
   )
 }
 
 function ToolBlockRow({ block }: { block: ToolBlock }) {
+  // While output is streaming, force the block open so the user sees it
+  // fill in live; once the result lands the `open` prop is removed and the
+  // details become uncontrolled again, staying open until the user
+  // collapses it.
   return (
-    <details className={`tool-block ${block.ok === false ? 'tool-failed' : ''}`}>
+    <details
+      className={`tool-block ${block.ok === false ? 'tool-failed' : ''}`}
+      open={block.streaming || undefined}
+    >
       <summary>
         <span className="tool-name">{block.name}</span>
         <code className="tool-args">{block.arguments}</code>
+        {block.streaming && <span className="tool-status running">running</span>}
         {block.ok !== undefined && (
           <span className={`tool-status ${block.ok ? 'ok' : 'err'}`}>
             {block.ok ? 'ok' : 'error'}

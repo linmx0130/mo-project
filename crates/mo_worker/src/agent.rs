@@ -65,7 +65,11 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
     };
 
     loop {
-        let assistant = generate(&chat_client, &config.model_name, &messages, &tools)
+        // `generate` streams the completion and journals a `MessageDelta`
+        // event per content chunk as it arrives; the final `Message` event
+        // (full assembled text) is journaled right after, so readers see
+        // tokens arrive live and then settle on the canonical message.
+        let assistant = generate(&chat_client, &config.model_name, &messages, &tools, journal)
             .await
             .context("LLM generation failed after retries")?;
         journal.append(JournalEventKind::Message(journal_message_from(&assistant)))?;
@@ -82,8 +86,22 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
                 name: tc.function.name.clone(),
                 arguments: tc.function.arguments.clone(),
             })?;
-            let result =
-                tools::execute_tool(&tool_ctx, &tc.function.name, &tc.function.arguments).await;
+            // Streaming tools (bash) emit `ToolOutputDelta` events through
+            // this sink while they run, so the frontend can render output
+            // as it is produced rather than only when the tool finishes.
+            let result = {
+                let mut on_delta = |kind: JournalEventKind| {
+                    let _ = journal.append(kind);
+                };
+                tools::execute_tool(
+                    &tool_ctx,
+                    &tc.function.name,
+                    &tc.function.arguments,
+                    &tc.id,
+                    &mut on_delta,
+                )
+                .await
+            };
             let (ok, output) = match result {
                 Ok(output) => (true, output),
                 Err(err) => (false, err),
@@ -150,15 +168,22 @@ fn history_from_journal(journal_path: &Path) -> Result<Vec<ChatMessage>> {
 }
 
 /// One LLM call with retry/backoff (3 tries, 5s/15s/30s).
+///
+/// Content chunks are journaled as `MessageDelta` events while the stream
+/// runs, so the journal (and with it the gateway SSE) carries tokens live.
+/// A failed attempt may leave a few orphan deltas behind; the final
+/// `Message` event that follows a successful attempt replaces them on the
+/// reader side, so history stays correct.
 async fn generate(
     chat_client: &ChatClient,
     model: &str,
     messages: &[ChatMessage],
     tools: &[Value],
+    journal: &mut JournalWriter,
 ) -> Result<ChatMessage> {
     let mut last_error: Option<anyhow::Error> = None;
     for (attempt, delay) in RETRY_DELAYS_SECS.iter().enumerate() {
-        match generate_once(chat_client, model, messages, tools).await {
+        match generate_once(chat_client, model, messages, tools, journal).await {
             Ok(msg) => return Ok(msg),
             Err(e) => {
                 tracing::warn!("LLM call failed (attempt {}): {e:#}", attempt + 1);
@@ -177,6 +202,7 @@ async fn generate_once(
     model: &str,
     messages: &[ChatMessage],
     tools: &[Value],
+    journal: &mut JournalWriter,
 ) -> Result<ChatMessage> {
     let mut params = ChatCompletionParamsBuilder::new();
     params
@@ -191,6 +217,13 @@ async fn generate_once(
     let mut message = ChatMessage::new();
     while let Some(delta) = stream.next().await {
         let delta = delta.map_err(|e| anyhow::anyhow!("error in stream delta: {e}"))?;
+        if let Some(content) = delta.content.as_deref()
+            && !content.is_empty()
+        {
+            journal.append(JournalEventKind::MessageDelta {
+                content: content.to_string(),
+            })?;
+        }
         message.apply_model_response_chunk(delta);
     }
     let empty = message.role.is_empty()
@@ -340,9 +373,13 @@ mod tests {
                                 ),
                             ])
                         } else {
+                            // The final answer streams in several content
+                            // chunks, exercising token-by-token journaling.
                             sse_payload(&[
                                 delta_role("assistant"),
-                                delta_content("The file says: hello world from notes.\n"),
+                                delta_content("The file says: "),
+                                delta_content("hello world "),
+                                delta_content("from notes.\n"),
                             ])
                         };
                         (
@@ -384,9 +421,10 @@ mod tests {
         run_agent(agent_cfg, &mut journal).await.unwrap();
 
         // Journal sequence: user message, assistant(tool call), tool_call_start,
-        // tool_result, assistant(final).
+        // tool_result, then the final answer streamed as three message_delta
+        // events followed by the assembled assistant message.
         let events = mo_core::read_events(std::path::Path::new(&session.journal_path)).unwrap();
-        assert_eq!(events.len(), 5, "events: {events:#?}");
+        assert_eq!(events.len(), 8, "events: {events:#?}");
         let kinds: Vec<&JournalEventKind> = events.iter().map(|e| &e.kind).collect();
         assert!(
             matches!(kinds[0], JournalEventKind::Message(m) if m.role == "user" && m.content.contains("Read notes.txt"))
@@ -400,8 +438,27 @@ mod tests {
         assert!(
             matches!(kinds[3], JournalEventKind::ToolResult { ok: true, output, .. } if output.contains("hello world from notes"))
         );
+        // Token-by-token preview: three deltas assembling the final answer.
+        assert_eq!(
+            kinds[4],
+            &JournalEventKind::MessageDelta {
+                content: "The file says: ".to_string()
+            }
+        );
+        assert_eq!(
+            kinds[5],
+            &JournalEventKind::MessageDelta {
+                content: "hello world ".to_string()
+            }
+        );
+        assert_eq!(
+            kinds[6],
+            &JournalEventKind::MessageDelta {
+                content: "from notes.\n".to_string()
+            }
+        );
         assert!(
-            matches!(kinds[4], JournalEventKind::Message(m) if m.role == "assistant" && m.content.contains("hello world from notes"))
+            matches!(kinds[7], JournalEventKind::Message(m) if m.role == "assistant" && m.content.contains("hello world from notes"))
         );
     }
 }

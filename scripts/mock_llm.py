@@ -29,6 +29,18 @@ PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 9001
 state = threading.local()
 
 
+def stream_text(text, words_per_chunk=3):
+    """Split a text answer into several content deltas so the worker
+    journals token-by-token `message_delta` events (the smoke-test path for
+    streaming)."""
+    words = text.split(" ")
+    chunks = [
+        " ".join(words[i : i + words_per_chunk])
+        for i in range(0, len(words), words_per_chunk)
+    ]
+    return [{"content": c + (" " if i < len(chunks) - 1 else "")} for i, c in enumerate(chunks)]
+
+
 def sse(deltas):
     payload = "".join(
         f"data: {json.dumps({'choices': [{'delta': d}]})}\n\n" for d in deltas
@@ -97,10 +109,9 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 ]
             else:
-                deltas = [
-                    {"role": "assistant"},
-                    {"content": "The subagent reported its result. Everything works."},
-                ]
+                deltas = [{"role": "assistant"}] + stream_text(
+                    "The subagent reported its result. Everything works."
+                )
         elif n == 0:
             deltas = [
                 {"role": "assistant"},
@@ -136,15 +147,11 @@ class Handler(BaseHTTPRequestHandler):
                 },
             ]
         else:
-            deltas = [
-                {"role": "assistant"},
-                {
-                    "content": (
-                        "Smoke test complete: read the greeting and counted "
-                        "its words. All tools worked."
-                    )
-                },
-            ]
+            # Final answer: streamed token-by-token (message_delta events).
+            deltas = [{"role": "assistant"}] + stream_text(
+                "Smoke test complete: read the greeting and counted "
+                "its words. All tools worked."
+            )
 
         payload = sse(deltas)
         self.send_response(200)
