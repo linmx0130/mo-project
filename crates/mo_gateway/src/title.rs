@@ -21,6 +21,14 @@ use crate::state::AppState;
 const TITLE_SYSTEM_PROMPT: &str = "Generate a short title for this chat session. Given the user's first \
      message, reply with only the title: at most 6 words, no quotes, no period.";
 
+/// Token budget for the title call. Must leave headroom for reasoning
+/// models: they stream `reasoning_content` before `content`, and a budget
+/// that is too small (e.g. 64) is exhausted by reasoning alone, so the
+/// stream ends (`finish_reason: "length"`) with an empty `content` and the
+/// placeholder title never gets replaced. 512 is plenty for a few reasoning
+/// tokens plus a title of at most 6 words.
+const TITLE_MAX_TOKENS: usize = 512;
+
 /// The placeholder title used from the moment the message is sent until the
 /// generated title lands (or generation is unavailable).
 pub fn placeholder_title() -> String {
@@ -132,6 +140,21 @@ async fn generate_title(
     }
     let title = message.content.to_string().trim().to_string();
     if title.is_empty() {
+        // Empty content usually means the model spent its whole token
+        // budget on `reasoning_content` and the stream ended before any
+        // title text (`finish_reason: "length"`). Surface that so a too-
+        // small TITLE_MAX_TOKENS does not silently regress into placeholder
+        // titles everywhere.
+        if message
+            .reasoning_content
+            .as_deref()
+            .is_some_and(|r| !r.trim().is_empty())
+        {
+            tracing::warn!(
+                "title generation returned reasoning but no title content \
+                 (token budget may have been exhausted by reasoning)"
+            );
+        }
         return Ok(None);
     }
     Ok(Some(title))
@@ -146,7 +169,7 @@ async fn generate_once(
     messages: &[ChatMessage],
 ) -> Result<ChatMessage> {
     let mut params = ChatCompletionParamsBuilder::new();
-    params.max_tokens(64).temperature(0.0);
+    params.max_tokens(TITLE_MAX_TOKENS).temperature(0.0);
     let stream = chat_client
         .chat_completion_stream(model, messages, &params)
         .await
@@ -186,11 +209,15 @@ mod tests {
 
     /// A tiny mock LLM: responses are keyed on the first user message so
     /// parallel tests stay deterministic. Each request also asserts it
-    /// carried the title system prompt.
+    /// carried the title system prompt and a token budget that leaves room
+    /// for reasoning models to emit content after their `reasoning_content`
+    /// (a budget of 64 was exhausted by reasoning alone, which is the
+    /// regression this guards against).
     ///
-    /// * message contains "tool"  -> assistant tool call (unusable title)
-    /// * message contains "empty" -> empty assistant content
-    /// * otherwise                -> plain text title
+    /// * message contains "tool"      -> assistant tool call (unusable title)
+    /// * message contains "empty"     -> empty assistant content
+    /// * message contains "reasoning" -> reasoning_content, then content
+    /// * otherwise                    -> plain text title
     async fn mock_llm() -> String {
         let router = Router::new().route(
             "/chat/completions",
@@ -203,6 +230,11 @@ mod tests {
                 assert!(
                     system.contains("short title"),
                     "title request must carry the title system prompt: {system}"
+                );
+                let max_tokens = body["max_tokens"].as_u64().unwrap_or(0);
+                assert!(
+                    max_tokens >= 512,
+                    "title request needs a token budget that survives reasoning: {max_tokens}"
                 );
                 let user = body["messages"]
                     .as_array()
@@ -226,6 +258,15 @@ mod tests {
                     ])
                 } else if user.contains("empty") {
                     sse_payload(&[json!({ "role": "assistant" })])
+                } else if user.contains("reasoning") {
+                    // A reasoning model streams `reasoning_content` first;
+                    // the title only appears in `content` afterwards.
+                    sse_payload(&[
+                        json!({ "role": "assistant" }),
+                        json!({ "reasoning_content": "The user wants " }),
+                        json!({ "reasoning_content": "a title about notes." }),
+                        json!({ "content": "Summarize notes.txt" }),
+                    ])
                 } else {
                     sse_payload(&[
                         json!({ "role": "assistant" }),
@@ -271,6 +312,19 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(title.as_deref(), Some("Explore notes.txt"));
+    }
+
+    #[tokio::test]
+    async fn reasoning_model_title_comes_from_content_not_reasoning() {
+        let base_url = mock_llm().await;
+        // A reasoning model streams `reasoning_content` first; the title
+        // must be read from the `content` that follows, never from the
+        // reasoning text. With the old 64-token budget this stream would
+        // have ended (length) before any content arrived.
+        let title = generate_title("reasoning model please", &base_url, "mock-model", None)
+            .await
+            .unwrap();
+        assert_eq!(title.as_deref(), Some("Summarize notes.txt"));
     }
 
     #[tokio::test]
