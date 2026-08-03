@@ -215,6 +215,36 @@ async fn history_returns_events_and_respects_after_seq() {
 }
 
 #[tokio::test]
+async fn new_session_gets_placeholder_title_and_journals_first_message() {
+    let (_dir, app) = setup(false);
+    let workdir = _dir.path().join("work");
+    let (status, session) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(
+            json!({ "workdir": workdir.display().to_string(), "prompt": "original first message" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let prompt = session["prompt"].as_str().unwrap();
+    assert!(
+        prompt.starts_with("New session - "),
+        "session title should start with the placeholder, got: {prompt}"
+    );
+
+    // The journal still carries the real first message: the worker rebuilds
+    // its context from it, so titling must not touch the conversation.
+    let journal_path = session["journal_path"].as_str().unwrap().to_string();
+    let events = mo_core::read_events(Path::new(&journal_path)).unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(
+        matches!(&events[0].kind, JournalEventKind::Message(m) if m.role == "user" && m.content == "original first message")
+    );
+}
+
+#[tokio::test]
 async fn rejects_invalid_workdir_and_unknown_session() {
     let (_dir, app) = setup(false);
     let (status, _) = request(

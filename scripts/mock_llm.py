@@ -13,6 +13,10 @@ workers each get their own sequence):
   * otherwise                  -> read_file greeting.txt, then
                                  bash wc -w greeting.txt, then final answer
 
+Gateway session-title requests (a system prompt mentioning "short title")
+get a bare title derived from the first user message, so the auto-title
+flow works in smoke tests too.
+
 Usage: python3 scripts/mock_llm.py [port]
 """
 import json
@@ -46,7 +50,15 @@ class Handler(BaseHTTPRequestHandler):
         user_msgs = [m for m in body.get("messages", []) if m.get("role") == "user"]
         prompt = user_msgs[0].get("content", "") if user_msgs else ""
 
-        if "slow" in prompt:
+        system_msgs = [m for m in body.get("messages", []) if m.get("role") == "system"]
+        if any("short title" in m.get("content", "") for m in system_msgs):
+            # Gateway session-title generation: reply with a bare title
+            # derived from the first user message.
+            deltas = [
+                {"role": "assistant"},
+                {"content": (prompt[:40] if prompt else "Untitled session")},
+            ]
+        elif "slow" in prompt:
             deltas = [
                 {"role": "assistant"},
                 {

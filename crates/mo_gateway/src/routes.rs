@@ -76,11 +76,18 @@ async fn create_session(
         .join(&id)
         .join("journal.jsonl");
     let model = std::env::var("MO_MODEL_NAME").unwrap_or_default();
+    // The `prompt` column doubles as the session title (sidebar + header
+    // render it). A new session gets a timestamped placeholder right away;
+    // a separate gateway-side LLM call replaces it with a generated title
+    // shortly after (see `title::generate_title`), updating the DB in place.
+    // The first user message itself is journaled below, so it stays in the
+    // history either way.
+    let first_message = payload.prompt;
     let mut session = Session {
         id: id.clone(),
         parent_id: None,
         workdir: workdir.display().to_string(),
-        prompt: payload.prompt,
+        prompt: crate::title::placeholder_title(),
         model,
         status: SessionStatus::Pending,
         pid: None,
@@ -106,7 +113,7 @@ async fn create_session(
         journal
             .append(JournalEventKind::Message(JournalMessage {
                 role: "user".to_string(),
-                content: session.prompt.clone(),
+                content: first_message.clone(),
                 reasoning_content: None,
                 tool_call_id: None,
                 tool_calls: None,
@@ -115,6 +122,12 @@ async fn create_session(
     }
 
     spawn_and_patch(&state, &mut session);
+
+    // Fire-and-forget title generation: a short, separate LLM call so the
+    // session does not stay stuck with the placeholder when a model is
+    // configured. The DB (and with it the sidebar/header) updates when the
+    // title lands; failures keep the placeholder.
+    crate::title::spawn_title_generation(state.clone(), id.clone(), first_message);
 
     Ok((StatusCode::CREATED, Json(session)))
 }
@@ -194,11 +207,11 @@ async fn send_message(
 
     {
         let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
-        // The first message of a session becomes its title (the sidebar and
-        // header render `prompt`); followups keep the original title.
-        let _ = db::set_prompt_if_empty(&conn, &id, &payload.content);
         // Clear the stale pid of the dead worker so the liveness check does
         // not flip the freshly-queued session to `failed`, then queue it.
+        // The title is untouched: followups never rename a session (new
+        // sessions get their title from the gateway-side generator at
+        // creation).
         db::clear_pid(&conn, &id).map_err(ApiError::internal)?;
         db::update_status(&conn, &id, SessionStatus::Pending, None).map_err(ApiError::internal)?;
     }

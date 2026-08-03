@@ -5,3 +5,4 @@ pub mod process;
 pub mod routes;
 pub mod sse;
 pub mod state;
+pub mod title;

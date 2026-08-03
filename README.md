@@ -134,6 +134,14 @@ Session status: `pending | running | completed | failed | cancelled`.
 Journal events: `message`, `tool_call_start`, `tool_result`, `status_change`
 (JSONL, `seq` + `ts` per line).
 
+### Session titles
+
+A new session is titled `New session - <time>` the moment the message is
+sent. The gateway then makes a short, separate LLM call (same model env
+vars as the worker) to generate a simple title from the first user message
+and updates the DB — and with it the sidebar/header — when it lands. If no
+model is configured or the call fails, the timestamped placeholder stays.
+
 ## Development
 
 ```sh

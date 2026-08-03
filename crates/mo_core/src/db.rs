@@ -142,11 +142,11 @@ pub fn clear_pid(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Set `prompt` only when it is currently empty (a session's first message
-/// becomes its title; followups leave the title untouched).
-pub fn set_prompt_if_empty(conn: &Connection, id: &str, prompt: &str) -> Result<()> {
+/// Overwrite the session title (the `prompt` column). Used by the gateway
+/// when a generated title lands after session creation.
+pub fn set_prompt(conn: &Connection, id: &str, prompt: &str) -> Result<()> {
     conn.execute(
-        "UPDATE sessions SET prompt = ?1, updated_at = ?2 WHERE id = ?3 AND prompt = ''",
+        "UPDATE sessions SET prompt = ?1, updated_at = ?2 WHERE id = ?3",
         params![prompt, chrono::Utc::now().to_rfc3339(), id],
     )?;
     Ok(())
@@ -244,6 +244,22 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].id, "new");
         assert_eq!(sessions[1].id, "old");
+    }
+
+    #[test]
+    fn set_prompt_overwrites_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("mo.db")).unwrap();
+        create_session(&conn, &sample_session("s1")).unwrap();
+
+        set_prompt(&conn, "s1", "generated title").unwrap();
+        let fetched = get_session(&conn, "s1").unwrap().unwrap();
+        assert_eq!(fetched.prompt, "generated title");
+        assert!(fetched.updated_at >= fetched.created_at);
+
+        // Unknown session is a no-op (no rows updated).
+        set_prompt(&conn, "missing", "nope").unwrap();
+        assert!(get_session(&conn, "missing").unwrap().is_none());
     }
 
     #[test]
