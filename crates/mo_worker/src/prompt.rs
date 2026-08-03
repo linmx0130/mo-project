@@ -18,6 +18,9 @@ pub fn build_system_prompt(workdir: &Path, agents_dir: &Path, subagent_depth: u3
     prompt.push_str(
         "Tool usage rules:\n\
          - When you need information, read files first.\n\
+         - Create new files with create_file (the parent directory must already\n\
+           exist and the file must not exist); modify existing files with\n\
+           edit_file.\n\
          - Make precise edits: provide a unique old_string that appears exactly once\n\
            (use replace_all only when every occurrence should change).\n\
          - Use bash for anything outside the file tools: builds, tests, git, etc.\n\

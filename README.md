@@ -23,7 +23,7 @@ Frontend  <->  Gateway Service  <->  Agent worker(s)
 | --- | --- |
 | `mo_core` | Shared types, JSONL journal I/O, SQLite metadata DB (WAL), TOML config |
 | `mo_gateway` | axum HTTP service: sessions CRUD, history, SSE live updates, worker spawn/kill (port 3031) |
-| `mo_worker` | One process per session: runs the LLM agent loop (via `nah_chat`) with tools `read_file`, `edit_file`, `bash`, `spawn_subagent` |
+| `mo_worker` | One process per session: runs the LLM agent loop (via `nah_chat`) with tools `read_file`, `edit_file`, `create_file`, `remove_file`, `bash`, `spawn_subagent` |
 | `frontend` | React 19 + Vite + TS UI (Vite dev server on 3030, proxy `/api → :3031`) |
 
 Workers append chat/tool events to a per-session `journal.jsonl` and update

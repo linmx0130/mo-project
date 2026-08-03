@@ -13,6 +13,8 @@ use serde_json::{Value, json};
 
 pub const TOOL_READ_FILE: &str = "read_file";
 pub const TOOL_EDIT_FILE: &str = "edit_file";
+pub const TOOL_CREATE_FILE: &str = "create_file";
+pub const TOOL_REMOVE_FILE: &str = "remove_file";
 pub const TOOL_BASH: &str = "bash";
 pub const TOOL_SPAWN_SUBAGENT: &str = "spawn_subagent";
 
@@ -71,6 +73,37 @@ pub fn tool_definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": TOOL_CREATE_FILE,
+                "description": "Create a new file with the given content inside the working directory. The parent directory must already exist and the file must not exist (use edit_file to modify existing files). Returns the content written.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Path to the new file, relative to the working directory (or absolute)." },
+                        "content": { "type": "string", "description": "Full content to write to the file." }
+                    },
+                    "required": ["path", "content"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": TOOL_REMOVE_FILE,
+                "description": "Remove a regular file inside the working directory. Directories and symlinks are refused. Returns a confirmation.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Path to the file to remove, relative to the working directory (or absolute)." }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": TOOL_BASH,
                 "description": "Run a shell command via sh -c in the working directory. 120s timeout. Returns stdout, stderr and the exit code.",
                 "parameters": {
@@ -116,6 +149,17 @@ struct EditFileArgs {
 }
 
 #[derive(Deserialize)]
+struct CreateFileArgs {
+    path: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct RemoveFileArgs {
+    path: String,
+}
+
+#[derive(Deserialize)]
 struct BashArgs {
     command: String,
 }
@@ -156,6 +200,16 @@ pub async fn execute_tool(
                 args.replace_all,
             )
         }
+        TOOL_CREATE_FILE => {
+            let args: CreateFileArgs = serde_json::from_str(arguments)
+                .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
+            fs::create_file(&ctx.workdir, &args.path, &args.content)
+        }
+        TOOL_REMOVE_FILE => {
+            let args: RemoveFileArgs = serde_json::from_str(arguments)
+                .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
+            fs::remove_file(&ctx.workdir, &args.path)
+        }
         TOOL_BASH => {
             let args: BashArgs = serde_json::from_str(arguments)
                 .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
@@ -184,13 +238,15 @@ mod tests {
     #[test]
     fn definitions_cover_all_tools() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 4);
+        assert_eq!(defs.len(), 6);
         let names: Vec<&str> = defs
             .iter()
             .map(|d| d["function"]["name"].as_str().unwrap())
             .collect();
         assert!(names.contains(&TOOL_READ_FILE));
         assert!(names.contains(&TOOL_EDIT_FILE));
+        assert!(names.contains(&TOOL_CREATE_FILE));
+        assert!(names.contains(&TOOL_REMOVE_FILE));
         assert!(names.contains(&TOOL_BASH));
         assert!(names.contains(&TOOL_SPAWN_SUBAGENT));
     }

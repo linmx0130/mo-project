@@ -68,6 +68,34 @@ pub fn read_file(workdir: &Path, raw: &str) -> Result<String, String> {
     Ok(cap_output(&content))
 }
 
+/// Create a new file with `content`. The parent directory must already
+/// exist (and stay inside the workdir); the file itself must not exist.
+/// Returns the content written.
+pub fn create_file(workdir: &Path, raw: &str, content: &str) -> Result<String, String> {
+    let full = resolve_path(workdir, raw)?;
+    if full.exists() {
+        return Err(format!("file already exists: {raw}"));
+    }
+    fs::write(&full, content).map_err(|e| format!("failed to write {raw}: {e}"))?;
+    Ok(content.to_string())
+}
+
+/// Remove a regular file. Directories and symlinks are refused; the path
+/// must stay inside the workdir. Returns a confirmation.
+pub fn remove_file(workdir: &Path, raw: &str) -> Result<String, String> {
+    let full = resolve_path(workdir, raw)?;
+    let meta =
+        fs::symlink_metadata(&full).map_err(|e| format!("file does not exist: {raw} ({e})"))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("refusing to remove symlink: {raw}"));
+    }
+    if !meta.is_file() {
+        return Err(format!("not a regular file: {raw}"));
+    }
+    fs::remove_file(&full).map_err(|e| format!("failed to remove {raw}: {e}"))?;
+    Ok(format!("removed {raw}"))
+}
+
 /// Replace `old_string` with `new_string` in the file. Without `replace_all`
 /// the match must be unique. Returns the full new file content.
 pub fn edit_file(
@@ -186,5 +214,63 @@ mod tests {
         let (_dir, workdir) = setup();
         let err = edit_file(&workdir, "notes.txt", "nope", "x", false).unwrap_err();
         assert!(err.contains("found 0 matches"), "got: {err}");
+    }
+
+    #[test]
+    fn create_file_writes_content_and_refuses_existing() {
+        let (_dir, workdir) = setup();
+        let written = create_file(&workdir, "new.txt", "hello\nworld\n").unwrap();
+        assert_eq!(written, "hello\nworld\n");
+        assert_eq!(read_file(&workdir, "new.txt").unwrap(), "hello\nworld\n");
+        // Refuses to overwrite an existing file.
+        let err = create_file(&workdir, "new.txt", "again").unwrap_err();
+        assert!(err.contains("already exists"), "got: {err}");
+        let err = create_file(&workdir, "notes.txt", "again").unwrap_err();
+        assert!(err.contains("already exists"), "got: {err}");
+        // Parent directory must exist.
+        assert!(create_file(&workdir, "no/such/dir/f.txt", "x").is_err());
+    }
+
+    #[test]
+    fn create_file_rejects_escapes() {
+        let (dir, workdir) = setup();
+        fs::write(dir.path().join("secret.txt"), "secret").unwrap();
+        let outside = dir.path().join("secret.txt").display().to_string();
+        assert!(create_file(&workdir, &outside, "x").is_err());
+        assert!(create_file(&workdir, "../evil.txt", "x").is_err());
+        // A symlinked parent pointing outside is rejected by resolve_path.
+        std::os::unix::fs::symlink(dir.path(), workdir.join("outside")).unwrap();
+        assert!(create_file(&workdir, "outside/evil.txt", "x").is_err());
+    }
+
+    #[test]
+    fn remove_file_removes_and_refuses_dirs_and_symlinks() {
+        let (dir, workdir) = setup();
+        fs::write(workdir.join("tmp.txt"), "x").unwrap();
+        assert!(
+            remove_file(&workdir, "tmp.txt")
+                .unwrap()
+                .contains("removed")
+        );
+        assert!(!workdir.join("tmp.txt").exists());
+        assert!(remove_file(&workdir, "tmp.txt").is_err()); // already gone
+
+        // Refuses to remove a directory.
+        fs::create_dir_all(workdir.join("subdir")).unwrap();
+        let err = remove_file(&workdir, "subdir").unwrap_err();
+        assert!(err.contains("not a regular file"), "got: {err}");
+
+        // Refuses to remove a symlink (even one pointing inside the workdir).
+        fs::write(workdir.join("real.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(workdir.join("real.txt"), workdir.join("link.txt")).unwrap();
+        let err = remove_file(&workdir, "link.txt").unwrap_err();
+        assert!(err.contains("refusing to remove symlink"), "got: {err}");
+        assert!(workdir.join("real.txt").exists());
+
+        // Escapes are rejected.
+        fs::write(dir.path().join("secret.txt"), "secret").unwrap();
+        assert!(remove_file(&workdir, "../secret.txt").is_err());
+        let outside = dir.path().join("secret.txt").display().to_string();
+        assert!(remove_file(&workdir, &outside).is_err());
     }
 }
