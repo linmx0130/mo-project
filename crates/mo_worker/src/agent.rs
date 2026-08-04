@@ -319,6 +319,17 @@ async fn generate_once(
     if empty {
         bail!("model returned an empty response");
     }
+    if prompt_tokens.is_none() {
+        // `include_usage` was requested but the server never sent a `Usage`
+        // event — either the endpoint ignores `stream_options` or reports
+        // usage in a shape nah_chat cannot parse. The session keeps working;
+        // only the status bar's context length is missing. Surfaces in
+        // `data/sessions/<id>/worker.log`.
+        tracing::warn!(
+            model,
+            "LLM API did not report token usage in the stream (stream_options.include_usage was requested); context length will be unavailable"
+        );
+    }
     Ok((message, prompt_tokens))
 }
 
