@@ -840,7 +840,7 @@ dependencies = [
 [[package]]
 name = "nah_chat"
 version = "0.8.0"
-source = "git+https://github.com/linmx0130/nah#89d9ae1c60a75f31a363672f7972952a16ab34bf"
+source = "git+https://github.com/linmx0130/nah#8ab2735fe792aa39542ec9914bbded5e8f8d2a8b"
 dependencies = [
  "async-stream",
  "bytes",
