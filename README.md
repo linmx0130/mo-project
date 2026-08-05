@@ -27,7 +27,7 @@ Frontend  <->  Gateway Service  <->  Agent worker(s)
 | --- | --- |
 | `mo_core` | Shared types, JSONL journal I/O, SQLite metadata DB (WAL), TOML config, the session-mode registry (`build` / `plan` / `explore`) |
 | `mo_gateway` | axum HTTP service: sessions CRUD, history, SSE live updates, worker spawn/kill, mode switching (port 3031) |
-| `mo_worker` | One process per session: runs the LLM agent loop (via `nah_chat`) with tools `read_file`, `edit_file`, `create_file`, `remove_file`, `bash`, `spawn_subagent`, `load_skill`; journals the system prompt once and reuses it verbatim on every run |
+| `mo_worker` | One process per session: runs the LLM agent loop (via `nah_chat`) with tools `read_file`, `edit_file`, `create_file`, `remove_file`, `bash`, `spawn_subagent`, `load_skill`, `request_mode_change`; journals the system prompt once and reuses it verbatim on every run |
 | `frontend` | React 19 + Vite + TS UI (Vite dev server on 3030, proxy `/api → :3031`) |
 
 Workers append chat/tool events to a per-session `journal.jsonl` and update
@@ -184,6 +184,23 @@ conversation last ran under. At most one message is injected per followup:
 The worker passes the notice to the model as a user-role message, so the
 model sees the new mode's framing directly before the real user message.
 
+**Requesting a mode change.** When the model needs a mode it does not have
+(e.g. a plan/explore session and the user asks it to build), it calls the
+`request_mode_change` tool instead of working around the sandbox. The tool
+takes the requested `mode` and a short `message` for the user — written in
+the user's language — journals a `mode_change_request` event, and tells the
+model to stop and wait. The frontend shows an Agree / Reject banner and
+freezes the composer while the request is pending (resolved = a
+`mode_change` or `mode_change_request_declined` event after it). **Agree**
+(`POST /api/sessions/:id/mode/approve`) switches the session's mode to the
+requested one and continues the run with a single mode-change message (the
+`mode_change` notice plus an "approved — continue" sentence), so the model
+picks up where it left off with the new write sandbox. **Reject**
+(`POST /api/sessions/:id/mode/reject`) journals a
+`mode_change_request_declined` marker — no mode switch, nothing sent to the
+model — and the composer unfreezes. Subagents cannot use the tool (their
+journal has no UI); they must report the need to their parent agent.
+
 ## Streaming
 
 The UI renders responses token-by-token. While the worker consumes the LLM
@@ -268,6 +285,8 @@ $HOME/.agents/
 | `GET /api/sessions/:id/events` | SSE tail: new events + synthesized status changes |
 | `POST /api/sessions/:id/messages` `{content}` | continue a terminal session: journal the user message (preceded by a `mode_change` notice when the mode was switched since the last run), reset to `pending`, respawn the worker |
 | `POST /api/sessions/:id/mode` `{mode}` | switch a terminal session's mode (409 while running): changes only the write sandbox of subsequent runs — the journaled system prompt never changes; the switch surfaces as a `mode_change` notice before the next user message |
+| `POST /api/sessions/:id/mode/approve` | approve a pending `mode_change_request` (the agent called `request_mode_change`): switch the session's mode to the requested one and continue the run with a single `mode_change` notice (409 unless the journal's last mode marker is a pending request) |
+| `POST /api/sessions/:id/mode/reject` | reject a pending `mode_change_request`: journal a `mode_change_request_declined` marker, no mode switch, nothing sent to the model (409 unless a request is pending) |
 | `POST /api/sessions/:id/cancel` | mark cancelled, then SIGTERM → SIGKILL the worker process group |
 | `DELETE /api/sessions/:id` | permanently delete a session: stop a running worker, remove the session dir (journal, worker log, ...) from disk, drop the DB row (`204` on success) |
 
@@ -277,8 +296,12 @@ Journal events: `message`, `tool_call_start`, `tool_result`, `status_change`,
 reused verbatim on every later run, carrying the mode it was built for),
 `mode_change` (a mode-change notice injected by the gateway right before a
 followup user message when the session's mode differs from the mode of the
-last run), `context_usage` (context length in tokens after each LLM call,
-from the API's `usage.prompt_tokens`), plus the streaming previews
+last run — or by `POST .../mode/approve` to continue a run after a
+`mode_change_request`), `mode_change_request` (the agent's request, via the
+`request_mode_change` tool, to switch the session's mode, with the model's
+message for the user), `mode_change_request_declined` (the user rejected
+the request), `context_usage` (context length in tokens after each LLM
+call, from the API's `usage.prompt_tokens`), plus the streaming previews
 `message_delta` (token-by-token assistant text and reasoning) and
 `tool_output_delta` (live bash output) — JSONL, `seq` + `ts` per line.
 

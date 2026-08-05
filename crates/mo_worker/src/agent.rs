@@ -136,10 +136,10 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
                 arguments: tc.function.arguments.clone(),
             })?;
             // Streaming tools (bash) emit `ToolOutputDelta` events through
-            // this sink while they run, so the frontend can render output
-            // as it is produced rather than only when the tool finishes.
+            // this sink while they run, and `request_mode_change` emits its
+            // `ModeChangeRequest` event, so the frontend sees them live.
             let result = {
-                let mut on_delta = |kind: JournalEventKind| {
+                let mut on_event = |kind: JournalEventKind| {
                     let _ = journal.append(kind);
                 };
                 tools::execute_tool(
@@ -147,7 +147,7 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
                     &tc.function.name,
                     &tc.function.arguments,
                     &tc.id,
-                    &mut on_delta,
+                    &mut on_event,
                 )
                 .await
             };

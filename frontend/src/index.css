@@ -431,6 +431,71 @@ p {
   cursor: default;
 }
 
+/* Mode-change request banner: shown in place of the composer while a
+   `mode_change_request` is pending — the agent asked (via the
+   request_mode_change tool) to switch the session's mode, and the user has
+   not answered yet. The composer is frozen; Agree switches the mode and
+   continues the run, Reject resolves the request without switching. */
+.mode-request-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+  padding: 12px;
+}
+
+.mode-request-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.mode-request-title {
+  font-weight: 600;
+}
+
+.mode-request-message {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-h);
+}
+
+.mode-request-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.mode-request-actions .send,
+.mode-request-actions .stop {
+  border-radius: 6px;
+  padding: 6px 18px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.mode-request-actions .send {
+  background: var(--accent-bg);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+}
+
+.mode-request-actions .stop {
+  background: transparent;
+  border: 1px solid var(--status-failed);
+  color: var(--status-failed);
+}
+
+.mode-request-actions .send:disabled,
+.mode-request-actions .stop:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* ---------- status bar ---------- */
 
 .status-bar {

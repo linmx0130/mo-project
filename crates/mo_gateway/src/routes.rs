@@ -39,6 +39,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/events", get(sse::events))
         .route("/api/sessions/{id}/messages", post(send_message))
         .route("/api/sessions/{id}/mode", post(switch_mode))
+        .route("/api/sessions/{id}/mode/approve", post(approve_mode_change))
+        .route("/api/sessions/{id}/mode/reject", post(reject_mode_change))
         .route("/api/sessions/{id}/cancel", post(cancel))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -397,7 +399,138 @@ async fn switch_mode(
     Ok(Json(session))
 }
 
-/// GET /api/sessions — newest first.
+/// POST /api/sessions/:id/mode/approve — the user approved a pending
+/// `request_mode_change` request in the UI (the agent asked, via the
+/// `request_mode_change` tool, to switch the session's mode).
+///
+/// Switches the session's mode to the requested one, journals a single
+/// `ModeChange` notice (the "single mode change message" the model receives
+/// to continue the task in the new mode), and respawns the worker. The
+/// session must be terminal and the journal's last mode marker must be a
+/// pending request (a `ModeChangeRequest` with no `ModeChange` /
+/// `ModeChangeRequestDeclined` after it).
+async fn approve_mode_change(
+    State(state): State<Arc<AppState>>,
+    PathParam(id): PathParam<String>,
+) -> ApiResult<(StatusCode, Json<Session>)> {
+    let (status, pid, journal_path) = {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        match db::get_session(&conn, &id).map_err(ApiError::internal)? {
+            Some(session) => (session.status, session.pid, session.journal_path),
+            None => return Err(ApiError::not_found("session not found")),
+        }
+    };
+    if status == SessionStatus::Running || status == SessionStatus::Pending {
+        return Err(ApiError::conflict("session is already running"));
+    }
+    // A just-cancelled session's worker may still be dying; refuse to
+    // overlap it, exactly like `send_message` does.
+    if pid.is_some_and(process::is_pid_alive) {
+        return Err(ApiError::conflict("session worker is still shutting down"));
+    }
+    let events = mo_core::read_events(Path::new(&journal_path)).map_err(ApiError::internal)?;
+    let requested = match mo_core::last_mode_marker(&events) {
+        Some(mo_core::ModeMarker::RequestPending { mode }) => mode,
+        _ => {
+            return Err(ApiError::conflict(
+                "no pending mode change request to approve",
+            ));
+        }
+    };
+
+    // Switch the session's mode: the upcoming worker run's write sandbox
+    // follows the new mode. The journaled system prompt stays as journaled
+    // (never rebuilt), which is why the ModeChange notice below is needed.
+    {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::update_mode(&conn, &id, requested).map_err(ApiError::internal)?;
+    }
+    // The session scratch dir (`<data_dir>/sessions/<id>/tmp`, the same
+    // deterministic path the worker creates and canonicalizes on the first
+    // run) — embedded in the notice text so the model is told where it
+    // *may* write, exactly like the followup mode-change notice.
+    let scratch = state.data_dir.join("sessions").join(&id).join("tmp");
+    let scratch = scratch.canonicalize().unwrap_or(scratch);
+    {
+        let mut journal =
+            JournalWriter::open(Path::new(&journal_path)).map_err(ApiError::internal)?;
+        // The single mode-change message: the worker maps this event to a
+        // user-role message, so the model sees the new mode's framing and
+        // the approval directly before continuing the task.
+        journal
+            .append(JournalEventKind::ModeChange {
+                mode: requested,
+                content: mo_core::mode_change_approved_message(requested, &scratch),
+            })
+            .map_err(ApiError::internal)?;
+    }
+
+    {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::clear_pid(&conn, &id).map_err(ApiError::internal)?;
+        db::update_status(&conn, &id, SessionStatus::Pending, None).map_err(ApiError::internal)?;
+    }
+
+    let mut session = {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::get_session(&conn, &id)
+            .map_err(ApiError::internal)?
+            .expect("session row exists")
+    };
+    spawn_and_patch(&state, &mut session);
+
+    Ok((StatusCode::ACCEPTED, Json(session)))
+}
+
+/// POST /api/sessions/:id/mode/reject — the user rejected a pending
+/// `request_mode_change` request in the UI.
+///
+/// Journals a `ModeChangeRequestDeclined` marker that resolves the request
+/// (the session's mode is *not* switched and nothing is sent to the LLM —
+/// the request was UI-only), so the request stops being pending and the
+/// frontend unfreezes the composer. The session stays terminal in its
+/// current mode. 409 unless the journal's last mode marker is a pending
+/// request.
+async fn reject_mode_change(
+    State(state): State<Arc<AppState>>,
+    PathParam(id): PathParam<String>,
+) -> ApiResult<Json<Session>> {
+    let (status, pid, journal_path) = {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        match db::get_session(&conn, &id).map_err(ApiError::internal)? {
+            Some(session) => (session.status, session.pid, session.journal_path),
+            None => return Err(ApiError::not_found("session not found")),
+        }
+    };
+    if status == SessionStatus::Running || status == SessionStatus::Pending {
+        return Err(ApiError::conflict("session is already running"));
+    }
+    if pid.is_some_and(process::is_pid_alive) {
+        return Err(ApiError::conflict("session worker is still shutting down"));
+    }
+    let events = mo_core::read_events(Path::new(&journal_path)).map_err(ApiError::internal)?;
+    let requested = match mo_core::last_mode_marker(&events) {
+        Some(mo_core::ModeMarker::RequestPending { mode }) => mode,
+        _ => {
+            return Err(ApiError::conflict(
+                "no pending mode change request to reject",
+            ));
+        }
+    };
+    {
+        let mut journal =
+            JournalWriter::open(Path::new(&journal_path)).map_err(ApiError::internal)?;
+        journal
+            .append(JournalEventKind::ModeChangeRequestDeclined { mode: requested })
+            .map_err(ApiError::internal)?;
+    }
+    let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+    let session = db::get_session(&conn, &id)
+        .map_err(ApiError::internal)?
+        .expect("session row exists");
+    Ok(Json(session))
+}
+
 async fn list_sessions(State(state): State<Arc<AppState>>) -> ApiResult<Json<Vec<Session>>> {
     let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
     let sessions = db::list_sessions(&conn).map_err(ApiError::internal)?;
@@ -532,7 +665,6 @@ async fn cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use std::sync::Mutex;
 
     use axum::body::Body;
@@ -550,11 +682,20 @@ mod tests {
     fn test_app() -> TestApp {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("data");
+        // A real, executable no-op worker: `spawn_and_patch` spawns it and
+        // records its pid, so the session stays `pending` instead of being
+        // flipped to `failed` on a missing binary.
+        let worker_bin = dir.path().join("stub_worker.sh");
+        std::fs::write(&worker_bin, "#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&worker_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&worker_bin, perms).unwrap();
         let conn = mo_core::open_db(&data_dir.join("mo.db")).unwrap();
         let state = Arc::new(AppState {
             data_dir,
             db: Mutex::new(conn),
-            worker_bin: PathBuf::from("/bin/true"),
+            worker_bin,
             cwd: dir.path().to_path_buf(),
             agents_dir: dir.path().join("agents"),
             subagent_depth: 0,
@@ -883,5 +1024,196 @@ mod tests {
             other => panic!("expected the Explore notice, got: {other:?}"),
         }
         assert_eq!(kinds[kinds.len() - 1], user_msg("explore followup"));
+    }
+
+    fn mode_change_request(mode: Mode, message: &str) -> JournalEventKind {
+        JournalEventKind::ModeChangeRequest {
+            mode,
+            message: message.to_string(),
+        }
+    }
+
+    async fn post_empty_json(
+        app: &Arc<AppState>,
+        id: &str,
+        path: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let router = create_router(app.clone());
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/sessions/{id}{path}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, value)
+    }
+
+    /// The journal of a completed Plan-mode run where the agent requested a
+    /// switch to Build (via request_mode_change) and the user has not
+    /// answered yet.
+    fn pending_request_journal(session: &Session) {
+        append_kinds(
+            &session.journal_path,
+            &[
+                user_msg("plan the thing"),
+                system_prompt(Mode::Build),
+                assistant_msg("here is the plan"),
+                mode_change_request(Mode::Build, "may I switch to build mode?"),
+            ],
+        );
+    }
+
+    /// Approving a pending request switches the session's mode to the
+    /// requested one, journals exactly one ModeChange notice (the single
+    /// mode-change message the model receives to continue), and respawns
+    /// the worker (session back to pending).
+    #[tokio::test]
+    async fn approve_mode_change_switches_mode_and_journals_notice() {
+        let app = test_app();
+        let session = insert_session(&app.state, "s1", Mode::Plan);
+        pending_request_journal(&session);
+
+        let (status, body) = post_empty_json(&app.state, "s1", "/mode/approve").await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["mode"], "build", "body: {body}");
+        assert_eq!(body["status"], "pending", "body: {body}");
+
+        // The DB row carries the new mode.
+        let row = {
+            let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+            db::get_session(&conn, "s1").unwrap().unwrap()
+        };
+        assert_eq!(row.mode, Mode::Build);
+
+        let kinds = read_kinds(&app, "s1");
+        assert_eq!(kinds.len(), 5, "kinds: {kinds:#?}");
+        // Exactly one ModeChange appended after the request, with the
+        // approval text (bracket prefix + scratch dir + approval sentence).
+        match &kinds[4] {
+            JournalEventKind::ModeChange { mode, content } => {
+                assert_eq!(*mode, Mode::Build);
+                assert!(
+                    content.contains("[Session mode changed to build]"),
+                    "content: {content}"
+                );
+                assert!(
+                    content.contains("approved your request"),
+                    "content: {content}"
+                );
+                // Build mode has no scratch dir to write to — the notice
+                // must not send the model looking for one.
+                assert!(!content.contains("/sessions/s1/tmp"), "content: {content}");
+            }
+            other => panic!("expected mode_change at seq 4, got: {other:?}"),
+        }
+        // No user message follows the notice — the notice is the single
+        // message that continues the run.
+        assert_eq!(kinds.len(), 5);
+    }
+
+    /// Approving with no pending request (the journal has no mode marker or
+    /// the last one is a resolution) is a conflict.
+    #[tokio::test]
+    async fn approve_mode_change_without_pending_request_conflicts() {
+        let app = test_app();
+        let session = insert_session(&app.state, "s1", Mode::Plan);
+        // Completed run, no request ever made.
+        append_kinds(
+            &session.journal_path,
+            &[
+                user_msg("hi"),
+                system_prompt(Mode::Build),
+                assistant_msg("done"),
+            ],
+        );
+        let (status, _) = post_empty_json(&app.state, "s1", "/mode/approve").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(session.mode, Mode::Plan);
+
+        // A request that was already resolved (rejected) is not pending.
+        append_kinds(
+            &session.journal_path,
+            &[
+                mode_change_request(Mode::Build, "may I?"),
+                JournalEventKind::ModeChangeRequestDeclined { mode: Mode::Build },
+            ],
+        );
+        let (status, _) = post_empty_json(&app.state, "s1", "/mode/approve").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        // The mode was never switched.
+        let row = {
+            let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+            db::get_session(&conn, "s1").unwrap().unwrap()
+        };
+        assert_eq!(row.mode, Mode::Plan);
+    }
+
+    /// Approving while the session is running is refused.
+    #[tokio::test]
+    async fn approve_mode_change_while_running_conflicts() {
+        let app = test_app();
+        let session = insert_session(&app.state, "s1", Mode::Plan);
+        pending_request_journal(&session);
+        {
+            let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+            db::update_status(&conn, "s1", SessionStatus::Running, None).unwrap();
+        }
+        let (status, _) = post_empty_json(&app.state, "s1", "/mode/approve").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    /// Rejecting a pending request journals a ModeChangeRequestDeclined
+    /// marker and leaves the mode untouched — nothing is sent to the LLM.
+    #[tokio::test]
+    async fn reject_mode_change_journals_declined_and_keeps_mode() {
+        let app = test_app();
+        let session = insert_session(&app.state, "s1", Mode::Plan);
+        pending_request_journal(&session);
+
+        let (status, body) = post_empty_json(&app.state, "s1", "/mode/reject").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["mode"], "plan", "body: {body}");
+        assert_eq!(body["status"], "completed", "body: {body}");
+
+        let kinds = read_kinds(&app, "s1");
+        assert_eq!(kinds.len(), 5, "kinds: {kinds:#?}");
+        assert_eq!(
+            kinds[4],
+            JournalEventKind::ModeChangeRequestDeclined { mode: Mode::Build }
+        );
+        // No ModeChange, no user message: the request was UI-only.
+        assert!(
+            !kinds
+                .iter()
+                .any(|k| matches!(k, JournalEventKind::ModeChange { .. }))
+        );
+        // The DB mode is untouched.
+        let row = {
+            let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+            db::get_session(&conn, "s1").unwrap().unwrap()
+        };
+        assert_eq!(row.mode, Mode::Plan);
+    }
+
+    /// Rejecting with no pending request is a conflict.
+    #[tokio::test]
+    async fn reject_mode_change_without_pending_request_conflicts() {
+        let app = test_app();
+        let session = insert_session(&app.state, "s1", Mode::Plan);
+        append_kinds(
+            &session.journal_path,
+            &[
+                user_msg("hi"),
+                system_prompt(Mode::Build),
+                assistant_msg("done"),
+            ],
+        );
+        let (status, _) = post_empty_json(&app.state, "s1", "/mode/reject").await;
+        assert_eq!(status, StatusCode::CONFLICT);
     }
 }

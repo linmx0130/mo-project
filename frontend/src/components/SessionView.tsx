@@ -2,7 +2,15 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import type { JournalEvent, JournalMessage, Mode, Session, SessionStatus } from '../api'
-import { cancelSession, getHistory, getSession, postMessage, switchMode } from '../api'
+import {
+  approveModeChange,
+  cancelSession,
+  getHistory,
+  getSession,
+  postMessage,
+  rejectModeChange,
+  switchMode,
+} from '../api'
 import Composer from './Composer'
 import CopyButton from './CopyButton'
 import StatusBar from './StatusBar'
@@ -296,6 +304,34 @@ export default function SessionView({ session, onStatusChange }: Props) {
     }
     return latest
   }, [events])
+  // A pending mode-change request: the agent called `request_mode_change`
+  // (journaled as `mode_change_request`) and the user has not answered yet.
+  // Resolved by a `mode_change` (approved) or `mode_change_request_declined`
+  // (rejected) event after it. While pending, the composer is frozen and the
+  // Agree / Reject banner is shown instead.
+  const pendingRequest = useMemo(() => {
+    let lastRequest: { mode: Mode; message: string; seq: number } | null = null
+    let lastResolutionSeq: number | null = null
+    for (const ev of events) {
+      if (ev.kind.kind === 'mode_change_request') {
+        lastRequest = {
+          mode: ev.kind.mode,
+          message: ev.kind.message,
+          seq: ev.seq ?? -1,
+        }
+      } else if (
+        ev.kind.kind === 'mode_change' ||
+        ev.kind.kind === 'mode_change_request_declined'
+      ) {
+        lastResolutionSeq = ev.seq ?? -1
+      }
+    }
+    if (!lastRequest) return null
+    if (lastResolutionSeq !== null && lastResolutionSeq > lastRequest.seq) {
+      return null
+    }
+    return lastRequest
+  }, [events])
   // While any tool is still streaming, re-render once per second so the
   // elapsed badge ticks; stop when everything settles.
   const anyToolStreaming = timeline.some(
@@ -315,6 +351,44 @@ export default function SessionView({ session, onStatusChange }: Props) {
       el.scrollTop = el.scrollHeight
     }
   }, [events, now])
+
+  /** Approve the pending mode-change request: the backend switches the
+   *  session's mode to the requested one and continues the run with a
+   *  single mode-change message. */
+  const approveRequest = async () => {
+    setSending(true)
+    try {
+      const updated = await approveModeChange(session.id)
+      setStatus(updated.status)
+      // Re-arm the SSE stream (the run continues in the new mode); the
+      // effect also refetches the history, which now resolves the request.
+      setRunId((r) => r + 1)
+      onStatusChange()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSending(false)
+    }
+  }
+
+  /** Reject the pending mode-change request: the backend journals a
+   *  `mode_change_request_declined` marker (no mode switch, nothing sent to
+   *  the agent) and the composer unfreezes. */
+  const rejectRequest = async () => {
+    setSending(true)
+    try {
+      const updated = await rejectModeChange(session.id)
+      setStatus(updated.status)
+      // Re-arm the SSE stream / refetch history so the declined marker
+      // lands in the timeline and the request stops being pending.
+      setRunId((r) => r + 1)
+      onStatusChange()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSending(false)
+    }
+  }
 
   return (
     <div className="session-view">
@@ -373,12 +447,23 @@ export default function SessionView({ session, onStatusChange }: Props) {
         )}
       </div>
 
-      <Composer
-        running={running}
-        busy={sending || cancelling}
-        onStop={() => void stop()}
-        onSubmit={send}
-      />
+      {pendingRequest && !running ? (
+        // A mode-change request from the agent is awaiting the user's
+        // decision: freeze the input box and show Agree / Reject instead.
+        <ModeChangeRequestBanner
+          request={pendingRequest}
+          busy={sending}
+          onApprove={() => void approveRequest()}
+          onReject={() => void rejectRequest()}
+        />
+      ) : (
+        <Composer
+          running={running}
+          busy={sending || cancelling}
+          onStop={() => void stop()}
+          onSubmit={send}
+        />
+      )}
 
       <StatusBar
         status={status}
@@ -411,11 +496,71 @@ function EventRow({ event }: { event: JournalEvent }) {
           <span className="muted">{kind.content}</span>
         </div>
       )
+    case 'mode_change_request':
+      // The agent asked (via request_mode_change) to switch the session's
+      // mode; the passive timeline record of the request. The actionable
+      // Agree / Reject banner is rendered above the composer while the
+      // request is pending.
+      return (
+        <div className="mode-change">
+          <span className={`badge mode-${kind.mode}`}>
+            → mode: {kind.mode} requested
+          </span>
+          <span className="muted">{kind.message}</span>
+        </div>
+      )
+    case 'mode_change_request_declined':
+      // The user rejected the request; it is resolved (no mode switch).
+      return (
+        <div className="mode-change">
+          <span className={`badge mode-${kind.mode}`}>
+            → mode: {kind.mode} rejected
+          </span>
+          <span className="muted">The user rejected the mode change request.</span>
+        </div>
+      )
     default:
       // message / tool events are folded into dedicated items by
       // buildTimeline; anything else is not rendered.
       return null
   }
+}
+
+/** The frozen-composer banner shown while a `mode_change_request` is
+ *  pending: the agent's request message (in the user's language) plus the
+ *  Agree / Reject buttons. */
+function ModeChangeRequestBanner({
+  request,
+  busy,
+  onApprove,
+  onReject,
+}: {
+  request: { mode: Mode; message: string }
+  busy: boolean
+  onApprove: () => void
+  onReject: () => void
+}) {
+  return (
+    <div className="mode-request-banner">
+      <div className="mode-request-head">
+        <span className={`badge mode-${request.mode}`}>
+          → mode: {request.mode}
+        </span>
+        <span className="mode-request-title">
+          The agent requests to switch the session mode
+        </span>
+      </div>
+      <p className="mode-request-message">{request.message}</p>
+      <div className="mode-request-actions">
+        <button type="button" className="send" onClick={onApprove} disabled={busy}>
+          {busy ? 'Working…' : 'Agree'}
+        </button>
+        <button type="button" className="stop" onClick={onReject} disabled={busy}>
+          Reject
+        </button>
+      </div>
+    </div>
+  )
 }
 
 function MessageRow({ message }: { message: MessageBlock }) {

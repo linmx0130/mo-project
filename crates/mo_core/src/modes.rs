@@ -40,6 +40,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "bash",
     "spawn_subagent",
     "load_skill",
+    "request_mode_change",
 ];
 
 /// The built-in modes, in display order. `build` is the default for new
@@ -123,6 +124,64 @@ pub fn mode_change_message(mode: Mode, scratch: &Path) -> String {
     }
 }
 
+/// The content of the single `ModeChange` notice the gateway journals when
+/// the user approves a pending `mode_change_request`: the standard
+/// mode-change text plus an approval sentence, so the model knows the user
+/// approved its request and that it should continue the task in the new
+/// mode (this is the "single mode change message" sent to the LLM on
+/// approval — the worker maps it to a user-role message and the run
+/// continues).
+pub fn mode_change_approved_message(mode: Mode, scratch: &Path) -> String {
+    format!(
+        "{}\nThe user approved your request to switch modes. Continue with the task — pick \
+         up where you left off.\n",
+        mode_change_message(mode, scratch)
+    )
+}
+
+/// The journal's *mode marker* — the last event that pins down the session's
+/// mode-change state, as scanned by the worker's `request_mode_change` tool
+/// and the gateway's approve/reject endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeMarker {
+    /// A `mode_change_request` with no resolving marker after it: the
+    /// request is still pending (the user has not approved or rejected it).
+    RequestPending { mode: Mode },
+    /// A `ModeChange` notice: the pending request (if any) was approved and
+    /// the session switched to `mode`; no request is pending.
+    Approved { mode: Mode },
+    /// A `ModeChangeRequestDeclined` event: the pending request was rejected;
+    /// no request is pending and the mode did not change.
+    Declined { mode: Mode },
+}
+
+/// Scan journal events (oldest first) for the last mode marker, if any.
+///
+/// The marker set is exactly the three events above; anything else
+/// (`SystemPrompt`, messages, tool events, ...) does not resolve a request
+/// and is skipped. Used verbatim by:
+///
+/// - the worker's `request_mode_change` tool (refuse when a request is
+///   already pending),
+/// - the gateway's approve endpoint (409 unless the last marker is a pending
+///   request; the pending request's mode is what the session switches to),
+/// - the gateway's reject endpoint (journal `ModeChangeRequestDeclined`
+///   unless there is nothing to reject).
+pub fn last_mode_marker(events: &[crate::types::JournalEvent]) -> Option<ModeMarker> {
+    events.iter().rev().find_map(|e| match &e.kind {
+        crate::types::JournalEventKind::ModeChangeRequest { mode, .. } => {
+            Some(ModeMarker::RequestPending { mode: *mode })
+        }
+        crate::types::JournalEventKind::ModeChange { mode, .. } => {
+            Some(ModeMarker::Approved { mode: *mode })
+        }
+        crate::types::JournalEventKind::ModeChangeRequestDeclined { mode } => {
+            Some(ModeMarker::Declined { mode: *mode })
+        }
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +240,78 @@ mod tests {
         assert!(explore.contains("READ-ONLY"));
         assert!(explore.contains("Prefer read_file"));
         assert!(explore.contains(scratch.to_str().unwrap()));
+    }
+
+    #[test]
+    fn approved_message_adds_approval_sentence() {
+        let scratch = Path::new("/data/sessions/s1/tmp");
+        let approved = mode_change_approved_message(Mode::Build, scratch);
+        assert!(approved.starts_with("[Session mode changed to build]"));
+        assert!(approved.contains("You are now in Build mode"));
+        assert!(approved.contains("approved your request"));
+        assert!(approved.contains("Continue with the task"));
+    }
+
+    #[test]
+    fn tool_names_include_request_mode_change() {
+        assert!(TOOL_NAMES.contains(&"request_mode_change"));
+        for mode in [Mode::Build, Mode::Plan, Mode::Explore] {
+            assert!(mode.info().tools.contains(&"request_mode_change"));
+        }
+    }
+
+    #[test]
+    fn last_mode_marker_resolves_pending_requests() {
+        use crate::types::{JournalEvent, JournalEventKind, JournalMessage};
+        let mk = |kind: JournalEventKind| JournalEvent {
+            seq: 0,
+            ts: chrono::Utc::now(),
+            kind,
+        };
+        let user = || {
+            mk(JournalEventKind::Message(JournalMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+                reasoning_content: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }))
+        };
+        let request = || {
+            mk(JournalEventKind::ModeChangeRequest {
+                mode: Mode::Build,
+                message: "may I switch?".to_string(),
+            })
+        };
+        let approved = || {
+            mk(JournalEventKind::ModeChange {
+                mode: Mode::Build,
+                content: "[Session mode changed to build]".to_string(),
+            })
+        };
+        let declined = || mk(JournalEventKind::ModeChangeRequestDeclined { mode: Mode::Build });
+
+        // No markers at all.
+        assert_eq!(last_mode_marker(&[user()]), None);
+        // A lone request is pending.
+        assert_eq!(
+            last_mode_marker(&[user(), request()]),
+            Some(ModeMarker::RequestPending { mode: Mode::Build })
+        );
+        // A ModeChange after the request resolves it (approved).
+        assert_eq!(
+            last_mode_marker(&[user(), request(), approved()]),
+            Some(ModeMarker::Approved { mode: Mode::Build })
+        );
+        // A declined marker resolves it too.
+        assert_eq!(
+            last_mode_marker(&[user(), request(), declined()]),
+            Some(ModeMarker::Declined { mode: Mode::Build })
+        );
+        // An approved request followed by a *new* request is pending again.
+        assert_eq!(
+            last_mode_marker(&[user(), request(), approved(), request()]),
+            Some(ModeMarker::RequestPending { mode: Mode::Build })
+        );
     }
 }

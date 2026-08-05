@@ -12,7 +12,10 @@ pub use config::{
 };
 pub use db::{DbError, open as open_db};
 pub use journal::{JournalError, JournalWriter, read_events, read_events_after};
-pub use modes::{MODES, ModeInfo, TOOL_NAMES, mode_change_message};
+pub use modes::{
+    MODES, ModeInfo, ModeMarker, TOOL_NAMES, last_mode_marker, mode_change_approved_message,
+    mode_change_message,
+};
 pub use types::{
     JournalEvent, JournalEventKind, JournalMessage, Mode, Session, SessionStatus, ToolCallInfo,
 };

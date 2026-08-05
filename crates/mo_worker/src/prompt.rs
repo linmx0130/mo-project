@@ -116,6 +116,10 @@ fn mode_framing(mode: Mode, workdir: &Path, scratch: &Path) -> String {
              directory {} (use absolute paths).\n\
              bash is available but treat it as read-only (a soft restriction): use it to \
              gather facts (builds, tests, greps), not to change anything.\n\
+             If the user asks you to build the plan, call the `request_mode_change` tool \
+             with mode \"build\" to ask them to switch this session to build mode — the user \
+             approves or rejects in the UI, and on approval the session continues in build \
+             mode. Do not try to work around the sandbox: subagents inherit your mode.\n\
              Finish with the plan as your final answer.\n\n",
             workdir.display(),
             scratch.display()
@@ -127,6 +131,8 @@ fn mode_framing(mode: Mode, workdir: &Path, scratch: &Path) -> String {
              You may create, edit and remove temporary files under the session scratch \
              directory {} (use absolute paths).\n\
              Prefer read_file; run read-only bash commands when helpful.\n\
+             If the task turns into modifying the codebase, call the `request_mode_change` \
+             tool to ask the user to switch this session to build mode.\n\
              Report concise findings as your final answer.\n\n",
             workdir.display(),
             scratch.display()
@@ -290,6 +296,10 @@ mod tests {
         assert!(prompt.contains("absolute paths"));
         // The create/edit instructions are replaced by the scratch rule.
         assert!(!prompt.contains("modify existing files with edit_file"));
+        // Plan mode points the model at request_mode_change instead of
+        // working around the sandbox.
+        assert!(prompt.contains("request_mode_change"));
+        assert!(prompt.contains("subagents inherit your mode"));
     }
 
     #[test]
@@ -301,5 +311,7 @@ mod tests {
         assert!(prompt.contains("READ-ONLY"));
         assert!(prompt.contains("Prefer read_file"));
         assert!(prompt.contains(&scratch(&dir).display().to_string()));
+        // Explore mode also points at request_mode_change for build tasks.
+        assert!(prompt.contains("request_mode_change"));
     }
 }

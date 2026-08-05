@@ -54,14 +54,14 @@ impl Drop for BashPgidGuard {
 /// is killed and an error is returned.
 ///
 /// While the command runs, raw stdout/stderr chunks are forwarded to
-/// `on_delta` as `ToolOutputDelta { id: tool_call_id, name: "bash", .. }`
+/// `on_event` as `ToolOutputDelta { id: tool_call_id, name: "bash", .. }`
 /// events so readers can stream the output live.
 pub async fn bash(
     workdir: &Path,
     command: &str,
     timeout: Duration,
     tool_call_id: &str,
-    on_delta: &mut (dyn FnMut(JournalEventKind) + Send),
+    on_event: &mut (dyn FnMut(JournalEventKind) + Send),
 ) -> Result<String, String> {
     if command.trim().is_empty() {
         return Err("command must not be empty".to_string());
@@ -92,7 +92,7 @@ pub async fn bash(
         .ok_or_else(|| "failed to take stderr pipe".to_string())?;
 
     // Two reader tasks forward raw chunks over a channel; the single
-    // consumer below owns `on_delta` and also accumulates the full
+    // consumer below owns `on_event` and also accumulates the full
     // stdout/stderr buffers for the final result. Source tag: 0 = stdout,
     // 1 = stderr. Both pipes are drained concurrently, so a command that
     // floods one pipe can never deadlock the other.
@@ -128,7 +128,7 @@ pub async fn bash(
     });
     // The channel closes when both readers hit EOF (each holds one sender);
     // the JoinHandles are intentionally detached — the tasks only forward
-    // chunks and never touch `on_delta` or `child`.
+    // chunks and never touch `on_event` or `child`.
     drop((stdout_reader, stderr_reader));
 
     // Retained output buffers live OUTSIDE the timeout future so the
@@ -150,14 +150,14 @@ pub async fn bash(
             if streamed_bytes < DELTA_STREAM_CAP {
                 streamed_bytes += chunk.len();
                 let text = String::from_utf8_lossy(&chunk);
-                on_delta(JournalEventKind::ToolOutputDelta {
+                on_event(JournalEventKind::ToolOutputDelta {
                     id: tool_call_id.to_string(),
                     name: "bash".to_string(),
                     output: text.into_owned(),
                 });
             } else if !stream_capped {
                 stream_capped = true;
-                on_delta(JournalEventKind::ToolOutputDelta {
+                on_event(JournalEventKind::ToolOutputDelta {
                     id: tool_call_id.to_string(),
                     name: "bash".to_string(),
                     output: "\n[output capped at 10 MB — further output is suppressed]\n"

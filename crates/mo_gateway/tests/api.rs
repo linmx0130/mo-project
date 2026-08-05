@@ -821,11 +821,19 @@ async fn modes_endpoint_lists_the_three_modes() {
     assert_eq!(modes.len(), 3);
     let names: Vec<&str> = modes.iter().map(|m| m["name"].as_str().unwrap()).collect();
     assert_eq!(names, vec!["build", "plan", "explore"]);
-    // The UI picker shows a description and the tool set.
+    // The UI picker shows a description and the tool set (which now
+    // includes request_mode_change in every mode).
     for m in modes {
         assert!(!m["label"].as_str().unwrap().is_empty());
         assert!(!m["description"].as_str().unwrap().is_empty());
-        assert!(m["tools"].as_array().unwrap().len() == 7);
+        assert!(m["tools"].as_array().unwrap().len() == 8);
+        assert!(
+            m["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t == "request_mode_change")
+        );
     }
 }
 
@@ -939,6 +947,189 @@ async fn switch_mode_updates_terminal_session_and_rejects_running() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn approve_mode_change_switches_mode_and_continues() {
+    let (_dir, app) = setup(true);
+    let workdir = _dir.path().join("work");
+
+    // A terminal session whose journal records a completed Plan-mode run
+    // ending with a pending request to switch to Build.
+    let (_, session) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({
+            "workdir": workdir.display().to_string(),
+            "prompt": "plan it",
+            "mode": "plan",
+        })),
+    )
+    .await;
+    let id = session["id"].as_str().unwrap().to_string();
+    let journal_path = session["journal_path"].as_str().unwrap().to_string();
+
+    // Stop the stub worker, then shape the journal: a completed run + the
+    // worker's mode-change request (what the request_mode_change tool
+    // journals).
+    let (_, stopped) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{id}/cancel"),
+        None,
+    )
+    .await;
+    assert_eq!(stopped["status"], "cancelled");
+    {
+        let mut journal = JournalWriter::open(Path::new(&journal_path)).unwrap();
+        journal
+            .append(JournalEventKind::SystemPrompt {
+                content: "plan framing".to_string(),
+                mode: Mode::Plan,
+            })
+            .unwrap();
+        journal
+            .append(JournalEventKind::Message(mo_core::JournalMessage {
+                role: "assistant".to_string(),
+                content: "here is the plan".to_string(),
+                reasoning_content: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }))
+            .unwrap();
+        journal
+            .append(JournalEventKind::ModeChangeRequest {
+                mode: Mode::Build,
+                message: "may I switch to build mode to implement the plan?".to_string(),
+            })
+            .unwrap();
+    }
+
+    // Approving returns the session queued as pending in the new mode...
+    let (status, resumed) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{id}/mode/approve"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(resumed["mode"], "build");
+    assert_eq!(resumed["status"], "pending");
+
+    // ...journals exactly one ModeChange notice (the single mode-change
+    // message that continues the run)...
+    let events = mo_core::read_events(Path::new(&journal_path)).unwrap();
+    // seq 0: initial user message (gateway), 1: system prompt, 2: assistant
+    // message, 3: mode_change_request, 4: the mode_change notice.
+    assert_eq!(events.len(), 5, "events: {events:#?}");
+    match &events[4].kind {
+        JournalEventKind::ModeChange { mode, content } => {
+            assert_eq!(*mode, Mode::Build);
+            assert!(
+                content.contains("[Session mode changed to build]"),
+                "content: {content}"
+            );
+            assert!(
+                content.contains("approved your request"),
+                "content: {content}"
+            );
+        }
+        other => panic!("expected mode_change, got: {other:?}"),
+    }
+
+    // ...and the DB row carries the new mode.
+    let conn = open_db(&_dir.path().join("data").join("mo.db")).unwrap();
+    let row = db::get_session(&conn, &id).unwrap().unwrap();
+    assert_eq!(row.mode, Mode::Build);
+    drop(conn);
+
+    // A second approve (the request is no longer pending) is a conflict.
+    let (status, _) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{id}/mode/approve"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn reject_mode_change_keeps_mode_and_resolves_request() {
+    let (_dir, app) = setup(false);
+    let workdir = _dir.path().join("work");
+
+    let (_, session) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({
+            "workdir": workdir.display().to_string(),
+            "prompt": "plan it",
+            "mode": "plan",
+        })),
+    )
+    .await;
+    let id = session["id"].as_str().unwrap().to_string();
+    let journal_path = session["journal_path"].as_str().unwrap().to_string();
+    // The stub exits immediately; wait for liveness to flip it terminal.
+    let mut terminal = false;
+    for _ in 0..50 {
+        let (_, detail) = request(&app, Method::GET, &format!("/api/sessions/{id}"), None).await;
+        if detail["status"] != "pending" && detail["status"] != "running" {
+            terminal = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(terminal, "session never became terminal");
+    {
+        let mut journal = JournalWriter::open(Path::new(&journal_path)).unwrap();
+        journal
+            .append(JournalEventKind::ModeChangeRequest {
+                mode: Mode::Build,
+                message: "may I switch?".to_string(),
+            })
+            .unwrap();
+    }
+
+    let (status, rejected) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{id}/mode/reject"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rejected["mode"], "plan");
+    // The request is resolved by a declined marker; the mode did not change.
+    let events = mo_core::read_events(Path::new(&journal_path)).unwrap();
+    // seq 0: initial user message (gateway), 1: mode_change_request,
+    // 2: mode_change_request_declined.
+    assert_eq!(events.len(), 3, "events: {events:#?}");
+    assert!(
+        matches!(
+            &events[2].kind,
+            JournalEventKind::ModeChangeRequestDeclined { mode: Mode::Build }
+        ),
+        "events: {events:#?}"
+    );
+    let conn = open_db(&_dir.path().join("data").join("mo.db")).unwrap();
+    let row = db::get_session(&conn, &id).unwrap().unwrap();
+    assert_eq!(row.mode, Mode::Plan);
+    drop(conn);
+
+    // Rejecting again (nothing pending) is a conflict.
+    let (status, _) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{id}/mode/reject"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
 }
 
 fn process_is_alive(pid: u32) -> bool {

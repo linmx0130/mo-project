@@ -89,8 +89,20 @@ export type JournalEventKind =
    *  by the gateway right before a followup user message when the mode
    *  differs from the mode of the last run (at most one per followup).
    *  `mode` is the new mode; `content` is the full notice text. Rendered
-   *  as a subtle notice row, not a chat bubble. */
+   *  as a subtle notice row, not a chat bubble. Also journaled by
+   *  `POST /:id/mode/approve` — approving a `mode_change_request` switches
+   *  the mode and injects this single notice to continue the run. */
   | { kind: 'mode_change'; mode: Mode; content: string }
+  /** The agent's request, via the `request_mode_change` tool, to switch the
+   *  session's mode. `message` is the model's request text in the user's
+   *  language. While the latest such request is pending (no `mode_change` /
+   *  `mode_change_request_declined` after it), the frontend freezes the
+   *  composer and offers Agree / Reject. */
+  | { kind: 'mode_change_request'; mode: Mode; message: string }
+  /** The user rejected a pending `mode_change_request` (POST /:id/mode/
+   *  reject); it resolves the request — no mode switch happens. Rendered
+   *  as a passive notice row. */
+  | { kind: 'mode_change_request_declined'; mode: Mode }
   /** Streamed assistant text/reasoning chunk; the following `message` event
    *  carries the assembled content and replaces the delta-built preview. */
   | { kind: 'message_delta'; content: string; reasoning_content?: string | null }
@@ -173,6 +185,20 @@ export function switchMode(id: string, mode: Mode): Promise<Session> {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ mode }),
   })
+}
+
+/** Approve a pending `mode_change_request` (the agent asked, via the
+ *  request_mode_change tool, to switch the session's mode): switches the
+ *  session's mode to the requested one and continues the run with a single
+ *  mode-change message. */
+export function approveModeChange(id: string): Promise<Session> {
+  return http(`/api/sessions/${id}/mode/approve`, { method: 'POST' })
+}
+
+/** Reject a pending `mode_change_request`: resolves the request without
+ *  switching the mode (nothing is sent to the agent). */
+export function rejectModeChange(id: string): Promise<Session> {
+  return http(`/api/sessions/${id}/mode/reject`, { method: 'POST' })
 }
 
 /** Send a followup message to a terminal session; the worker respawns and

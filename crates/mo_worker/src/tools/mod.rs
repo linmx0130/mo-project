@@ -3,6 +3,7 @@
 
 pub mod bash;
 pub mod fs;
+pub mod request_mode_change;
 pub mod skill;
 pub mod subagent;
 
@@ -19,6 +20,7 @@ pub const TOOL_REMOVE_FILE: &str = "remove_file";
 pub const TOOL_BASH: &str = "bash";
 pub const TOOL_SPAWN_SUBAGENT: &str = "spawn_subagent";
 pub const TOOL_LOAD_SKILL: &str = "load_skill";
+pub const TOOL_REQUEST_MODE_CHANGE: &str = "request_mode_change";
 
 /// Everything a tool needs to run: the sandboxed workdir, the shared data
 /// dir (for subagent sessions), the global agents dir (passed down so
@@ -151,6 +153,22 @@ pub fn tool_definitions() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": TOOL_REQUEST_MODE_CHANGE,
+                "description": "Request the user (in the UI) to switch this session's mode. Use this when the task needs a mode you do not have — e.g. you are in plan/explore mode and need to modify the codebase, or you are in build mode and only need to plan/explore. The user approves or rejects the request in the UI; on approval the session switches mode and continues the run, so you can then do the work. Root sessions only: subagents must ask their parent agent instead. Write `message` in the user's language (the language the user writes in).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "mode": { "type": "string", "enum": ["build", "plan", "explore"], "description": "The mode to switch to." },
+                        "message": { "type": "string", "description": "A short message for the user, in the user's language, explaining why the mode switch is needed and what you will do once approved." }
+                    },
+                    "required": ["mode", "message"],
+                    "additionalProperties": false
+                }
+            }
+        }),
     ]
 }
 
@@ -220,14 +238,16 @@ fn write_root_for(ctx: &ToolContext, raw: &str) -> Result<PathBuf, String> {
 /// Err and both are journaled as ToolResult events.
 ///
 /// `tool_call_id` identifies the call (used for streamed output events) and
-/// `on_delta` receives `ToolOutputDelta` events while a streaming tool
-/// (bash) runs, so the frontend can render output as it is produced.
+/// `on_event` receives non-result journal events while a tool runs: the
+/// `ToolOutputDelta` chunks of a streaming tool (bash), or the
+/// `ModeChangeRequest` a `request_mode_change` call emits — the caller
+/// appends them to the journal so the frontend sees them live.
 pub async fn execute_tool(
     ctx: &ToolContext,
     name: &str,
     arguments: &str,
     tool_call_id: &str,
-    on_delta: &mut (dyn FnMut(JournalEventKind) + Send),
+    on_event: &mut (dyn FnMut(JournalEventKind) + Send),
 ) -> Result<String, String> {
     match name {
         TOOL_READ_FILE => {
@@ -274,7 +294,7 @@ pub async fn execute_tool(
                 &args.command,
                 bash::DEFAULT_TIMEOUT,
                 tool_call_id,
-                on_delta,
+                on_event,
             )
             .await
         }
@@ -293,6 +313,11 @@ pub async fn execute_tool(
             let args: LoadSkillArgs = serde_json::from_str(arguments)
                 .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
             skill::load_skill(&ctx.agents_dir, &args.name)
+        }
+        TOOL_REQUEST_MODE_CHANGE => {
+            let args: request_mode_change::RequestModeChangeArgs = serde_json::from_str(arguments)
+                .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
+            request_mode_change::request_mode_change(ctx, &args, on_event)
         }
         other => Err(format!("unknown tool: {other}")),
     }
@@ -336,7 +361,7 @@ mod tests {
     #[test]
     fn definitions_cover_all_tools() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 7);
+        assert_eq!(defs.len(), 8);
         let names: Vec<&str> = defs
             .iter()
             .map(|d| d["function"]["name"].as_str().unwrap())
@@ -348,13 +373,37 @@ mod tests {
         assert!(names.contains(&TOOL_BASH));
         assert!(names.contains(&TOOL_SPAWN_SUBAGENT));
         assert!(names.contains(&TOOL_LOAD_SKILL));
+        assert!(names.contains(&TOOL_REQUEST_MODE_CHANGE));
+        // The request_mode_change definition carries the mode enum and the
+        // user-language guidance.
+        let def = defs
+            .iter()
+            .find(|d| d["function"]["name"] == TOOL_REQUEST_MODE_CHANGE)
+            .unwrap();
+        assert_eq!(
+            def["function"]["parameters"]["properties"]["mode"]["enum"],
+            json!(["build", "plan", "explore"])
+        );
+        assert!(
+            def["function"]["parameters"]["required"]
+                .as_array()
+                .unwrap()
+                .len()
+                == 2
+        );
+        assert!(
+            def["function"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("user's language")
+        );
     }
 
     #[tokio::test]
     async fn unknown_tool_errors() {
         let ctx = test_ctx(PathBuf::from("/tmp/agents"));
-        let mut no_delta = |_: JournalEventKind| {};
-        let err = execute_tool(&ctx, "nope", "{}", "call_x", &mut no_delta)
+        let mut no_event = |_: JournalEventKind| {};
+        let err = execute_tool(&ctx, "nope", "{}", "call_x", &mut no_event)
             .await
             .unwrap_err();
         assert!(err.contains("unknown tool"));
@@ -372,13 +421,13 @@ mod tests {
         )
         .unwrap();
         let ctx = test_ctx(agents);
-        let mut no_delta = |_: JournalEventKind| {};
+        let mut no_event = |_: JournalEventKind| {};
         let out = execute_tool(
             &ctx,
             TOOL_LOAD_SKILL,
             r#"{"name":"greeter"}"#,
             "call_s",
-            &mut no_delta,
+            &mut no_event,
         )
         .await
         .unwrap();
@@ -393,7 +442,7 @@ mod tests {
             TOOL_LOAD_SKILL,
             r#"{"name":"nope"}"#,
             "call_s",
-            &mut no_delta,
+            &mut no_event,
         )
         .await
         .unwrap_err();
@@ -443,7 +492,7 @@ mod tests {
         for mode in [Mode::Plan, Mode::Explore] {
             let dir = tempfile::tempdir().unwrap();
             let ctx = plan_ctx(&dir, mode);
-            let mut no_delta = |_: JournalEventKind| {};
+            let mut no_event = |_: JournalEventKind| {};
 
             // Writing into the codebase (relative or absolute) is denied
             // with a mode-aware message.
@@ -454,7 +503,7 @@ mod tests {
                     ctx.workdir.join("new.txt").display()
                 ),
             ] {
-                let err = execute_tool(&ctx, TOOL_CREATE_FILE, &args, "c1", &mut no_delta)
+                let err = execute_tool(&ctx, TOOL_CREATE_FILE, &args, "c1", &mut no_event)
                     .await
                     .unwrap_err();
                 assert!(err.contains("read-only"), "got: {err}");
@@ -469,7 +518,7 @@ mod tests {
                 TOOL_EDIT_FILE,
                 r#"{"path":"notes.txt","old_string":"codebase","new_string":"hacked"}"#,
                 "c2",
-                &mut no_delta,
+                &mut no_event,
             )
             .await
             .unwrap_err();
@@ -480,7 +529,7 @@ mod tests {
                 TOOL_REMOVE_FILE,
                 r#"{"path":"notes.txt"}"#,
                 "c3",
-                &mut no_delta,
+                &mut no_event,
             )
             .await
             .unwrap_err();
@@ -493,11 +542,11 @@ mod tests {
                 r#"{{"path":"{}","content":"draft"}}"#,
                 scratch_file.display()
             );
-            execute_tool(&ctx, TOOL_CREATE_FILE, &create_args, "c4", &mut no_delta)
+            execute_tool(&ctx, TOOL_CREATE_FILE, &create_args, "c4", &mut no_event)
                 .await
                 .unwrap();
             let read_args = format!(r#"{{"path":"{}"}}"#, scratch_file.display());
-            let out = execute_tool(&ctx, TOOL_READ_FILE, &read_args, "c5", &mut no_delta)
+            let out = execute_tool(&ctx, TOOL_READ_FILE, &read_args, "c5", &mut no_event)
                 .await
                 .unwrap();
             assert!(out.contains("draft"), "got: {out}");
@@ -505,11 +554,11 @@ mod tests {
                 r#"{{"path":"{}","old_string":"draft","new_string":"plan"}}"#,
                 scratch_file.display()
             );
-            execute_tool(&ctx, TOOL_EDIT_FILE, &edit_args, "c6", &mut no_delta)
+            execute_tool(&ctx, TOOL_EDIT_FILE, &edit_args, "c6", &mut no_event)
                 .await
                 .unwrap();
             let remove_args = format!(r#"{{"path":"{}"}}"#, scratch_file.display());
-            execute_tool(&ctx, TOOL_REMOVE_FILE, &remove_args, "c7", &mut no_delta)
+            execute_tool(&ctx, TOOL_REMOVE_FILE, &remove_args, "c7", &mut no_event)
                 .await
                 .unwrap();
             assert!(!scratch_file.exists());
@@ -526,13 +575,13 @@ mod tests {
     async fn build_mode_writes_to_workdir() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = plan_ctx(&dir, Mode::Build);
-        let mut no_delta = |_: JournalEventKind| {};
+        let mut no_event = |_: JournalEventKind| {};
         execute_tool(
             &ctx,
             TOOL_CREATE_FILE,
             r#"{"path":"new.txt","content":"built"}"#,
             "c1",
-            &mut no_delta,
+            &mut no_event,
         )
         .await
         .unwrap();
@@ -547,16 +596,196 @@ mod tests {
     async fn spawn_subagent_rejects_unknown_mode() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = plan_ctx(&dir, Mode::Build);
-        let mut no_delta = |_: JournalEventKind| {};
+        let mut no_event = |_: JournalEventKind| {};
         let err = execute_tool(
             &ctx,
             TOOL_SPAWN_SUBAGENT,
             r#"{"prompt":"do it","mode":"nope"}"#,
             "c1",
-            &mut no_delta,
+            &mut no_event,
         )
         .await
         .unwrap_err();
         assert!(err.contains("invalid arguments"), "got: {err}");
+    }
+
+    /// A non-Build-mode ctx with a real journal file, for the
+    /// `request_mode_change` tests (the tool reads the journal to decide
+    /// whether a request is already pending).
+    fn request_ctx(dir: &tempfile::TempDir, mode: Mode, parent_id: Option<String>) -> ToolContext {
+        let mut ctx = plan_ctx(dir, mode);
+        ctx.session.parent_id = parent_id;
+        let journal = dir.path().join("data/sessions/s/journal.jsonl");
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        ctx.session.journal_path = journal.display().to_string();
+        ctx
+    }
+
+    /// A plan-mode agent requests build: the tool journals a
+    /// `ModeChangeRequest` through the event sink and returns guidance
+    /// telling the model to stop and wait for the user.
+    #[tokio::test]
+    async fn request_mode_change_journals_event_and_returns_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = request_ctx(&dir, Mode::Plan, None);
+        let mut events: Vec<JournalEventKind> = Vec::new();
+        let mut on_event = |kind: JournalEventKind| events.push(kind);
+        let out = execute_tool(
+            &ctx,
+            TOOL_REQUEST_MODE_CHANGE,
+            r#"{"mode":"build","message":"may I switch to build mode to implement the plan?"}"#,
+            "call_rmc",
+            &mut on_event,
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("Mode change request sent"), "got: {out}");
+        assert!(out.contains("build"), "got: {out}");
+        assert!(out.contains("Stop working now"), "got: {out}");
+        assert_eq!(events.len(), 1, "events: {events:#?}");
+        match &events[0] {
+            JournalEventKind::ModeChangeRequest { mode, message } => {
+                assert_eq!(*mode, Mode::Build);
+                assert_eq!(message, "may I switch to build mode to implement the plan?");
+            }
+            other => panic!("expected mode_change_request, got: {other:?}"),
+        }
+    }
+
+    /// Requesting the mode the session is already in is a no-op error.
+    #[tokio::test]
+    async fn request_mode_change_rejects_same_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = request_ctx(&dir, Mode::Plan, None);
+        let mut no_event = |_: JournalEventKind| {};
+        let err = execute_tool(
+            &ctx,
+            TOOL_REQUEST_MODE_CHANGE,
+            r#"{"mode":"plan","message":"let me stay in plan mode"}"#,
+            "c1",
+            &mut no_event,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("already in plan mode"), "got: {err}");
+    }
+
+    /// Subagents cannot request a mode change: the request is shown to the
+    /// user in the UI, which only root sessions have.
+    #[tokio::test]
+    async fn request_mode_change_rejects_subagent() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = request_ctx(&dir, Mode::Plan, Some("parent-1".to_string()));
+        let mut no_event = |_: JournalEventKind| {};
+        let err = execute_tool(
+            &ctx,
+            TOOL_REQUEST_MODE_CHANGE,
+            r#"{"mode":"build","message":"may I switch?"}"#,
+            "c1",
+            &mut no_event,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("subagents cannot request"), "got: {err}");
+    }
+
+    /// A second request while one is already pending is refused — the user
+    /// has not answered yet.
+    #[tokio::test]
+    async fn request_mode_change_rejects_when_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = request_ctx(&dir, Mode::Plan, None);
+        let mut journal =
+            mo_core::JournalWriter::open(std::path::Path::new(&ctx.session.journal_path)).unwrap();
+        journal
+            .append(JournalEventKind::ModeChangeRequest {
+                mode: Mode::Build,
+                message: "first request".to_string(),
+            })
+            .unwrap();
+        drop(journal);
+
+        let mut no_event = |_: JournalEventKind| {};
+        let err = execute_tool(
+            &ctx,
+            TOOL_REQUEST_MODE_CHANGE,
+            r#"{"mode":"build","message":"second request"}"#,
+            "c1",
+            &mut no_event,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("already pending"), "got: {err}");
+    }
+
+    /// After the pending request was resolved (approved or rejected), a new
+    /// request is allowed again.
+    #[tokio::test]
+    async fn request_mode_change_allowed_after_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = request_ctx(&dir, Mode::Plan, None);
+        let mut journal =
+            mo_core::JournalWriter::open(std::path::Path::new(&ctx.session.journal_path)).unwrap();
+        journal
+            .append(JournalEventKind::ModeChangeRequest {
+                mode: Mode::Build,
+                message: "first request".to_string(),
+            })
+            .unwrap();
+        // Resolved by the user's rejection.
+        journal
+            .append(JournalEventKind::ModeChangeRequestDeclined { mode: Mode::Build })
+            .unwrap();
+        drop(journal);
+
+        let mut events: Vec<JournalEventKind> = Vec::new();
+        let mut on_event = |kind: JournalEventKind| events.push(kind);
+        let out = execute_tool(
+            &ctx,
+            TOOL_REQUEST_MODE_CHANGE,
+            r#"{"mode":"build","message":"second request"}"#,
+            "call_2",
+            &mut on_event,
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("Mode change request sent"), "got: {out}");
+        assert_eq!(events.len(), 1, "events: {events:#?}");
+    }
+
+    /// An unparseable mode is rejected as invalid arguments.
+    #[tokio::test]
+    async fn request_mode_change_rejects_invalid_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = request_ctx(&dir, Mode::Plan, None);
+        let mut no_event = |_: JournalEventKind| {};
+        let err = execute_tool(
+            &ctx,
+            TOOL_REQUEST_MODE_CHANGE,
+            r#"{"mode":"nope","message":"hi"}"#,
+            "c1",
+            &mut no_event,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("invalid arguments"), "got: {err}");
+    }
+
+    /// An empty request message is rejected.
+    #[tokio::test]
+    async fn request_mode_change_rejects_empty_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = request_ctx(&dir, Mode::Plan, None);
+        let mut no_event = |_: JournalEventKind| {};
+        let err = execute_tool(
+            &ctx,
+            TOOL_REQUEST_MODE_CHANGE,
+            r#"{"mode":"build","message":"  "}"#,
+            "c1",
+            &mut no_event,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("message must not be empty"), "got: {err}");
     }
 }
