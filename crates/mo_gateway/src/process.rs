@@ -82,6 +82,12 @@ pub fn spawn_worker(state: &AppState, session: &Session) -> std::io::Result<u32>
             cmd.env("MO_CONTEXT_WINDOW", window.to_string());
         }
     }
+    // Tool-call concurrency bound from `mo.toml` (max_tool_concurrency);
+    // the worker falls back to its default when unset.
+    cmd.env(
+        "MO_MAX_TOOL_CONCURRENCY",
+        state.max_tool_concurrency.to_string(),
+    );
 
     let mut child = cmd.spawn()?;
     let pid = child

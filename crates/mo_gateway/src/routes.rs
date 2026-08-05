@@ -746,6 +746,7 @@ mod tests {
             worker_bin,
             cwd: dir.path().to_path_buf(),
             agents_dir: dir.path().join("agents"),
+            max_tool_concurrency: mo_core::config::DEFAULT_MAX_TOOL_CONCURRENCY,
             models: Vec::new(),
         });
         TestApp { state, _dir: dir }

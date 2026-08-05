@@ -16,6 +16,10 @@
 //!                                     # changes behavior): root sessions are always
 //!                                     # depth 0; nesting is hard-capped at 1
 //! worker_bin    = "..."               # worker binary (default: sibling of mo_gateway)
+//! max_tool_concurrency = 8            # optional: how many tool calls from a single
+//!                                     # assistant message may run at once (default 8;
+//!                                     # clamped to at least 1). Tool calls in one
+//!                                     # message run concurrently up to this bound.
 //!
 //! [[models]]                          # at least one required; first = default
 //! base_url  = "https://api.deepseek.com"
@@ -35,6 +39,10 @@ use serde::Deserialize;
 
 /// Default gateway HTTP port.
 pub const DEFAULT_PORT: u16 = 3031;
+
+/// Default maximum number of tool calls from a single assistant message
+/// that execute concurrently (see `MoConfig::max_tool_concurrency`).
+pub const DEFAULT_MAX_TOOL_CONCURRENCY: usize = 8;
 
 /// One configured LLM endpoint.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -71,6 +79,8 @@ pub struct FileConfig {
     #[serde(default)]
     pub worker_bin: Option<PathBuf>,
     #[serde(default)]
+    pub max_tool_concurrency: Option<usize>,
+    #[serde(default)]
     pub models: Vec<ModelConfig>,
 }
 
@@ -84,6 +94,10 @@ pub struct MoConfig {
     pub port: u16,
     pub subagent_depth: u32,
     pub worker_bin: Option<PathBuf>,
+    /// Maximum number of tool calls from a single assistant message that
+    /// execute concurrently. Clamped to at least 1 by consumers; the
+    /// default is `DEFAULT_MAX_TOOL_CONCURRENCY`.
+    pub max_tool_concurrency: usize,
     pub models: Vec<ModelConfig>,
     /// The config file that was loaded; `None` when built from env vars.
     pub source: Option<PathBuf>,
@@ -147,6 +161,10 @@ impl MoConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
             worker_bin: env::var("MO_WORKER_BIN").ok().map(PathBuf::from),
+            max_tool_concurrency: env::var("MO_MAX_TOOL_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_MAX_TOOL_CONCURRENCY),
             models,
             source: None,
         }
@@ -166,6 +184,9 @@ impl FileConfig {
             port: self.port.unwrap_or(DEFAULT_PORT),
             subagent_depth: self.subagent_depth.unwrap_or(0),
             worker_bin: self.worker_bin,
+            max_tool_concurrency: self
+                .max_tool_concurrency
+                .unwrap_or(DEFAULT_MAX_TOOL_CONCURRENCY),
             models: self.models,
             source: None,
         }
@@ -256,6 +277,7 @@ mod tests {
             "MO_AUTH_TOKEN",
             "MO_PORT",
             "MO_DATA_DIR",
+            "MO_MAX_TOOL_CONCURRENCY",
         ] {
             unsafe {
                 env::remove_var(key);
@@ -281,6 +303,7 @@ mod tests {
             r#"
                 port = 4040
                 subagent_depth = 2
+                max_tool_concurrency = 4
                 [[models]]
                 base_url = "https://a.example.com"
                 name = "model-a"
@@ -297,6 +320,7 @@ mod tests {
         let config = MoConfig::load(Some(&path)).unwrap();
         assert_eq!(config.port, 4040);
         assert_eq!(config.subagent_depth, 2);
+        assert_eq!(config.max_tool_concurrency, 4);
         assert_eq!(config.models.len(), 2);
         assert_eq!(config.default_model().unwrap().name, "model-a");
         assert_eq!(
@@ -316,6 +340,16 @@ mod tests {
         // Unset keys fall back to defaults.
         assert_eq!(config.data_dir, PathBuf::from("./data"));
         assert_eq!(config.worker_bin, None);
+    }
+
+    #[test]
+    fn max_tool_concurrency_defaults_to_8() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mo.toml");
+        std::fs::write(&path, "port = 4040\n").unwrap();
+        let config = MoConfig::load(Some(&path)).unwrap();
+        assert_eq!(config.max_tool_concurrency, DEFAULT_MAX_TOOL_CONCURRENCY);
     }
 
     #[test]
@@ -405,12 +439,14 @@ mod tests {
             env::set_var("MO_MODEL_NAME", "env-model");
             env::set_var("MO_AUTH_TOKEN", "env-tok");
             env::set_var("MO_PORT", "9999");
+            env::set_var("MO_MAX_TOOL_CONCURRENCY", "3");
         }
         let config = MoConfig::load(None).unwrap();
         assert_eq!(config.models.len(), 1);
         assert_eq!(config.models[0].name, "env-model");
         assert_eq!(config.models[0].token.as_deref(), Some("env-tok"));
         assert_eq!(config.port, 9999);
+        assert_eq!(config.max_tool_concurrency, 3);
         assert_eq!(config.source, None);
 
         unsafe {
@@ -418,6 +454,7 @@ mod tests {
             env::remove_var("MO_MODEL_NAME");
             env::remove_var("MO_AUTH_TOKEN");
             env::remove_var("MO_PORT");
+            env::remove_var("MO_MAX_TOOL_CONCURRENCY");
         }
         env::set_current_dir(&cwd).unwrap();
     }

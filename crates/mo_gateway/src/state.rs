@@ -16,6 +16,10 @@ pub struct AppState {
     /// Global agents dir passed to every worker (`$HOME/.agents` by
     /// default; see `mo_core::config::default_agents_dir`).
     pub agents_dir: PathBuf,
+    /// Maximum number of tool calls from a single assistant message that
+    /// execute concurrently; passed to every worker as
+    /// `MO_MAX_TOOL_CONCURRENCY` (from `mo.toml`).
+    pub max_tool_concurrency: usize,
     /// All configured models (from `mo.toml`); the first is the default.
     pub models: Vec<ModelConfig>,
 }

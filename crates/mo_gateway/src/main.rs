@@ -83,6 +83,7 @@ async fn main() {
         worker_bin,
         cwd,
         agents_dir: config.agents_dir,
+        max_tool_concurrency: config.max_tool_concurrency,
         models: config.models,
     });
     let app = create_router(state);

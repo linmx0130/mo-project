@@ -6,9 +6,10 @@
 //! value keeps the canonical (capped) full output for the `ToolResult`
 //! event and for the model context.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use mo_core::JournalEventKind;
@@ -25,27 +26,49 @@ pub const DELTA_STREAM_CAP: usize = 10 * 1024 * 1024; // 10 MB
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// The process-group id of the currently running bash child, if any. The
-/// worker's SIGTERM handler kills this group so a cancel also stops the
-/// command's pipeline children (gradlew, tail, ...), which would otherwise
-/// survive as orphans once the worker process dies. The value lives in a
-/// shared static (rather than a tokio channel) so the signal handler can
-/// read it even when the runtime is under load.
-pub static ACTIVE_BASH_PGID: Mutex<Option<u32>> = Mutex::new(None);
+/// The process-group ids of the currently running bash children, if any.
+/// The worker's SIGTERM handler kills these groups so a cancel also stops
+/// the commands' pipeline children (gradlew, tail, ...), which would
+/// otherwise survive as orphans once the worker process dies. The value
+/// lives in a shared static (rather than a tokio channel) so the signal
+/// handler can read it even when the runtime is under load. A set (not a
+/// single slot): tool calls in one message run concurrently, so several
+/// commands may be in flight at once.
+pub static ACTIVE_BASH_PGIDS: LazyLock<Mutex<HashSet<u32>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
-pub fn active_bash_pgid() -> Option<u32> {
-    *ACTIVE_BASH_PGID.lock().unwrap_or_else(|e| e.into_inner())
+pub fn active_bash_pgids() -> Vec<u32> {
+    ACTIVE_BASH_PGIDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .collect()
 }
 
-fn set_active_bash_pgid(pgid: Option<u32>) {
-    *ACTIVE_BASH_PGID.lock().unwrap_or_else(|e| e.into_inner()) = pgid;
+fn add_active_bash_pgid(pgid: u32) {
+    ACTIVE_BASH_PGIDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(pgid);
 }
 
-/// Clears `ACTIVE_BASH_PGID` when a bash call ends (any return path).
-struct BashPgidGuard;
+fn remove_active_bash_pgid(pgid: u32) {
+    ACTIVE_BASH_PGIDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&pgid);
+}
+
+/// Removes its own process group from `ACTIVE_BASH_PGIDS` when a bash call
+/// ends (any return path) — only its own, so concurrent commands' entries
+/// are never clobbered.
+struct BashPgidGuard {
+    pgid: u32,
+}
 impl Drop for BashPgidGuard {
     fn drop(&mut self) {
-        set_active_bash_pgid(None);
+        remove_active_bash_pgid(self.pgid);
     }
 }
 
@@ -55,13 +78,15 @@ impl Drop for BashPgidGuard {
 ///
 /// While the command runs, raw stdout/stderr chunks are forwarded to
 /// `on_event` as `ToolOutputDelta { id: tool_call_id, name: "bash", .. }`
-/// events so readers can stream the output live.
+/// events so readers can stream the output live. `on_event` is a shared
+/// (non-`mut`) sink because concurrent tool calls journal through the same
+/// closure.
 pub async fn bash(
     workdir: &Path,
     command: &str,
     timeout: Duration,
     tool_call_id: &str,
-    on_event: &mut (dyn FnMut(JournalEventKind) + Send),
+    on_event: &(dyn Fn(JournalEventKind) + Send + Sync),
 ) -> Result<String, String> {
     if command.trim().is_empty() {
         return Err("command must not be empty".to_string());
@@ -79,8 +104,10 @@ pub async fn bash(
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("failed to spawn sh: {e}"))?;
-    set_active_bash_pgid(child.id());
-    let _pgid_guard = BashPgidGuard;
+    add_active_bash_pgid(child.id().expect("spawned child must have a pid"));
+    let _pgid_guard = BashPgidGuard {
+        pgid: child.id().expect("spawned child must have a pid"),
+    };
 
     let mut stdout = child
         .stdout
@@ -270,17 +297,41 @@ fn partial_output(stdout_buf: &[u8], stderr_buf: &[u8], truncated: bool) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    fn noop_sink() -> impl Fn(JournalEventKind) {
+        |_: JournalEventKind| {}
+    }
+
+    /// A sink that collects the streamed `tool_output_delta` chunks. A
+    /// `Mutex` keeps the closure `Fn` (the shared-sink signature requires
+    /// it, not `FnMut`).
+    fn collecting_sink() -> (Arc<Mutex<Vec<String>>>, impl Fn(JournalEventKind)) {
+        let collected = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = {
+            let collected = Arc::clone(&collected);
+            move |kind: JournalEventKind| {
+                if let JournalEventKind::ToolOutputDelta { output, .. } = kind {
+                    collected
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(output);
+                }
+            }
+        };
+        (collected, sink)
+    }
 
     #[tokio::test]
     async fn runs_command_and_reports_exit_code() {
         let dir = tempfile::tempdir().unwrap();
-        let mut sink = |_: JournalEventKind| {};
+        let sink = noop_sink();
         let out = bash(
             dir.path(),
             "echo hello && exit 3",
             Duration::from_secs(10),
             "call_1",
-            &mut sink,
+            &sink,
         )
         .await
         .unwrap();
@@ -291,13 +342,13 @@ mod tests {
     #[tokio::test]
     async fn captures_stderr() {
         let dir = tempfile::tempdir().unwrap();
-        let mut sink = |_: JournalEventKind| {};
+        let sink = noop_sink();
         let out = bash(
             dir.path(),
             "echo boom 1>&2",
             Duration::from_secs(10),
             "call_1",
-            &mut sink,
+            &sink,
         )
         .await
         .unwrap();
@@ -307,27 +358,20 @@ mod tests {
     #[tokio::test]
     async fn streams_output_chunks_live() {
         let dir = tempfile::tempdir().unwrap();
-        let mut streamed: Vec<String> = Vec::new();
-        let out = {
-            let mut sink = |kind: JournalEventKind| {
-                if let JournalEventKind::ToolOutputDelta { output, .. } = kind {
-                    streamed.push(output);
-                }
-            };
-            bash(
-                dir.path(),
-                "printf 'one\\ntwo\\n'; printf 'boom' 1>&2",
-                Duration::from_secs(10),
-                "call_1",
-                &mut sink,
-            )
-            .await
-            .unwrap()
-        };
+        let (collected, sink) = collecting_sink();
+        let out = bash(
+            dir.path(),
+            "printf 'one\\ntwo\\n'; printf 'boom' 1>&2",
+            Duration::from_secs(10),
+            "call_1",
+            &sink,
+        )
+        .await
+        .unwrap();
         assert!(out.contains("one"), "got: {out}");
         assert!(out.contains("boom"), "got: {out}");
         // Every chunk was streamed through the sink, tagged with the tool id.
-        let joined = streamed.concat();
+        let joined = collected.lock().unwrap_or_else(|e| e.into_inner()).concat();
         assert!(joined.contains("one"), "streamed: {joined}");
         assert!(joined.contains("two"), "streamed: {joined}");
         assert!(joined.contains("boom"), "streamed: {joined}");
@@ -336,13 +380,13 @@ mod tests {
     #[tokio::test]
     async fn times_out_and_kills() {
         let dir = tempfile::tempdir().unwrap();
-        let mut sink = |_: JournalEventKind| {};
+        let sink = noop_sink();
         let err = bash(
             dir.path(),
             "sleep 30",
             Duration::from_millis(300),
             "call_1",
-            &mut sink,
+            &sink,
         )
         .await;
         assert!(err.is_err());
@@ -352,13 +396,13 @@ mod tests {
     #[tokio::test]
     async fn timeout_kills_whole_process_group() {
         let dir = tempfile::tempdir().unwrap();
-        let mut sink = |_: JournalEventKind| {};
+        let sink = noop_sink();
         let err = bash(
             dir.path(),
             "sleep 30 & echo $!; wait",
             Duration::from_millis(300),
             "call_1",
-            &mut sink,
+            &sink,
         )
         .await;
         assert!(err.is_err());
@@ -379,16 +423,51 @@ mod tests {
         );
     }
 
+    /// Two concurrent bash commands genuinely overlap: two `sleep`s that
+    /// would take 0.9s back-to-back finish in ~0.6s when run together
+    /// (tokio::join! polls both futures concurrently), and each stream is
+    /// tagged with its own call id.
+    #[tokio::test]
+    async fn concurrent_commands_run_in_parallel() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = noop_sink();
+        let start = std::time::Instant::now();
+        let (a, b) = tokio::join!(
+            bash(
+                dir.path(),
+                "sleep 0.6; echo slow",
+                Duration::from_secs(10),
+                "call_a",
+                &sink,
+            ),
+            bash(
+                dir.path(),
+                "sleep 0.3; echo fast",
+                Duration::from_secs(10),
+                "call_b",
+                &sink,
+            )
+        );
+        let elapsed = start.elapsed();
+        assert!(a.as_ref().unwrap().contains("slow"), "got: {a:?}");
+        assert!(b.as_ref().unwrap().contains("fast"), "got: {b:?}");
+        // 0.6s + 0.3s = 0.9s if sequential; overlap keeps it near 0.6s.
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "commands did not overlap: {elapsed:?}"
+        );
+    }
+
     #[tokio::test]
     async fn timeout_reports_partial_output() {
         let dir = tempfile::tempdir().unwrap();
-        let mut sink = |_: JournalEventKind| {};
+        let sink = noop_sink();
         let err = bash(
             dir.path(),
             "printf 'downloading deps...\\n'; sleep 30",
             Duration::from_millis(500),
             "call_1",
-            &mut sink,
+            &sink,
         )
         .await
         .unwrap_err();
@@ -403,13 +482,13 @@ mod tests {
     #[tokio::test]
     async fn timeout_with_no_output_hints_at_buffering() {
         let dir = tempfile::tempdir().unwrap();
-        let mut sink = |_: JournalEventKind| {};
+        let sink = noop_sink();
         let err = bash(
             dir.path(),
             "sleep 30",
             Duration::from_millis(300),
             "call_1",
-            &mut sink,
+            &sink,
         )
         .await
         .unwrap_err();
@@ -424,24 +503,23 @@ mod tests {
     async fn full_output_streams_while_retained_is_capped() {
         let dir = tempfile::tempdir().unwrap();
         let total = OUTPUT_CAP + 256 * 1024; // ~1.25 MB
-        let mut streamed: usize = 0;
-        let out = {
-            let mut sink = |kind: JournalEventKind| {
-                if let JournalEventKind::ToolOutputDelta { output, .. } = kind {
-                    streamed += output.len();
-                }
-            };
-            bash(
-                dir.path(),
-                &format!("head -c {total} /dev/zero | tr '\\0' 'x'"),
-                Duration::from_secs(30),
-                "call_1",
-                &mut sink,
-            )
-            .await
-            .unwrap()
-        };
+        let (collected, sink) = collecting_sink();
+        let out = bash(
+            dir.path(),
+            &format!("head -c {total} /dev/zero | tr '\\0' 'x'"),
+            Duration::from_secs(30),
+            "call_1",
+            &sink,
+        )
+        .await
+        .unwrap();
         // Every byte streamed to the UI/journal...
+        let streamed: usize = collected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|s| s.len())
+            .sum();
         assert!(streamed >= total, "streamed only {streamed} of {total}");
         // ...while the canonical result stays bounded at ~1 MB.
         assert!(
@@ -460,24 +538,23 @@ mod tests {
     async fn delta_stream_is_capped_with_marker() {
         let dir = tempfile::tempdir().unwrap();
         let total = DELTA_STREAM_CAP + 1024 * 1024;
-        let mut streamed: usize = 0;
-        let out = {
-            let mut sink = |kind: JournalEventKind| {
-                if let JournalEventKind::ToolOutputDelta { output, .. } = kind {
-                    streamed += output.len();
-                }
-            };
-            bash(
-                dir.path(),
-                &format!("head -c {total} /dev/zero | tr '\\0' 'x'"),
-                Duration::from_secs(30),
-                "call_1",
-                &mut sink,
-            )
-            .await
-            .unwrap()
-        };
+        let (collected, sink) = collecting_sink();
+        let out = bash(
+            dir.path(),
+            &format!("head -c {total} /dev/zero | tr '\\0' 'x'"),
+            Duration::from_secs(30),
+            "call_1",
+            &sink,
+        )
+        .await
+        .unwrap();
         // The marker replaced further deltas once the budget ran out.
+        let streamed: usize = collected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|s| s.len())
+            .sum();
         assert!(
             streamed < DELTA_STREAM_CAP + 4096,
             "delta stream not capped: {streamed} bytes"

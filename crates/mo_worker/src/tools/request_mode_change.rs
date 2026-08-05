@@ -26,7 +26,7 @@ use crate::tools::ToolContext;
 pub fn request_mode_change(
     ctx: &ToolContext,
     args: &RequestModeChangeArgs,
-    on_event: &mut dyn FnMut(JournalEventKind),
+    on_event: &dyn Fn(JournalEventKind),
 ) -> Result<String, String> {
     let mode = args
         .mode

@@ -24,6 +24,13 @@
 # further subagents).
 # subagent_depth = 0
 
+# Max number of tool calls from a single assistant message that execute
+# concurrently (default 8, clamped to at least 1). Tool calls in one message
+# run in parallel up to this bound — the UI shows all tool blocks at once
+# and each completes independently. Dependent calls should still go in
+# separate messages (completion order is not guaranteed).
+# max_tool_concurrency = 8
+
 # Worker binary (default: sibling of the mo_gateway executable named
 # mo_worker).
 # worker_bin = "./target/debug/mo_worker"

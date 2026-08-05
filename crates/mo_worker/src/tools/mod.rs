@@ -25,8 +25,9 @@ pub const TOOL_REQUEST_MODE_CHANGE: &str = "request_mode_change";
 /// Everything a tool needs to run: the sandboxed workdir, the shared data
 /// dir (for subagent sessions), the global agents dir (passed down so
 /// subagents inject the same global instructions/skills), this worker's
-/// session row, model config, and the session scratch dir (`<data_dir>/
-/// sessions/<id>/tmp`) where non-Build modes may create/edit/remove files.
+/// session row, model config, the session scratch dir (`<data_dir>/
+/// sessions/<id>/tmp`) where non-Build modes may create/edit/remove files,
+/// and the max tool concurrency (passed down to subagents).
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub workdir: PathBuf,
@@ -35,6 +36,10 @@ pub struct ToolContext {
     pub session: Session,
     pub scratch: PathBuf,
     pub subagent_depth: u32,
+    /// Max number of tool calls from a single assistant message that
+    /// execute concurrently (clamped to at least 1); passed to spawned
+    /// subagents so they inherit the same bound.
+    pub max_tool_concurrency: usize,
     pub model_base_url: String,
     pub model_name: String,
     pub auth_token: Option<String>,
@@ -241,13 +246,15 @@ fn write_root_for(ctx: &ToolContext, raw: &str) -> Result<PathBuf, String> {
 /// `on_event` receives non-result journal events while a tool runs: the
 /// `ToolOutputDelta` chunks of a streaming tool (bash), or the
 /// `ModeChangeRequest` a `request_mode_change` call emits — the caller
-/// appends them to the journal so the frontend sees them live.
+/// appends them to the journal so the frontend sees them live. `on_event`
+/// is a shared (non-`mut`) sink: with parallel tool execution, concurrent
+/// calls journal through the same closure.
 pub async fn execute_tool(
     ctx: &ToolContext,
     name: &str,
     arguments: &str,
     tool_call_id: &str,
-    on_event: &mut (dyn FnMut(JournalEventKind) + Send),
+    on_event: &(dyn Fn(JournalEventKind) + Send + Sync),
 ) -> Result<String, String> {
     match name {
         TOOL_READ_FILE => {
@@ -352,6 +359,7 @@ mod tests {
             },
             scratch,
             subagent_depth: 0,
+            max_tool_concurrency: mo_core::config::DEFAULT_MAX_TOOL_CONCURRENCY,
             model_base_url: "http://localhost:1".into(),
             model_name: "m".into(),
             auth_token: None,
@@ -402,8 +410,8 @@ mod tests {
     #[tokio::test]
     async fn unknown_tool_errors() {
         let ctx = test_ctx(PathBuf::from("/tmp/agents"));
-        let mut no_event = |_: JournalEventKind| {};
-        let err = execute_tool(&ctx, "nope", "{}", "call_x", &mut no_event)
+        let no_event = |_: JournalEventKind| {};
+        let err = execute_tool(&ctx, "nope", "{}", "call_x", &no_event)
             .await
             .unwrap_err();
         assert!(err.contains("unknown tool"));
@@ -421,13 +429,13 @@ mod tests {
         )
         .unwrap();
         let ctx = test_ctx(agents);
-        let mut no_event = |_: JournalEventKind| {};
+        let no_event = |_: JournalEventKind| {};
         let out = execute_tool(
             &ctx,
             TOOL_LOAD_SKILL,
             r#"{"name":"greeter"}"#,
             "call_s",
-            &mut no_event,
+            &no_event,
         )
         .await
         .unwrap();
@@ -442,7 +450,7 @@ mod tests {
             TOOL_LOAD_SKILL,
             r#"{"name":"nope"}"#,
             "call_s",
-            &mut no_event,
+            &no_event,
         )
         .await
         .unwrap_err();
@@ -480,6 +488,7 @@ mod tests {
             },
             scratch,
             subagent_depth: 0,
+            max_tool_concurrency: mo_core::config::DEFAULT_MAX_TOOL_CONCURRENCY,
             model_base_url: "http://localhost:1".into(),
             model_name: "m".into(),
             auth_token: None,
@@ -492,7 +501,7 @@ mod tests {
         for mode in [Mode::Plan, Mode::Explore] {
             let dir = tempfile::tempdir().unwrap();
             let ctx = plan_ctx(&dir, mode);
-            let mut no_event = |_: JournalEventKind| {};
+            let no_event = |_: JournalEventKind| {};
 
             // Writing into the codebase (relative or absolute) is denied
             // with a mode-aware message.
@@ -503,7 +512,7 @@ mod tests {
                     ctx.workdir.join("new.txt").display()
                 ),
             ] {
-                let err = execute_tool(&ctx, TOOL_CREATE_FILE, &args, "c1", &mut no_event)
+                let err = execute_tool(&ctx, TOOL_CREATE_FILE, &args, "c1", &no_event)
                     .await
                     .unwrap_err();
                 assert!(err.contains("read-only"), "got: {err}");
@@ -518,7 +527,7 @@ mod tests {
                 TOOL_EDIT_FILE,
                 r#"{"path":"notes.txt","old_string":"codebase","new_string":"hacked"}"#,
                 "c2",
-                &mut no_event,
+                &no_event,
             )
             .await
             .unwrap_err();
@@ -529,7 +538,7 @@ mod tests {
                 TOOL_REMOVE_FILE,
                 r#"{"path":"notes.txt"}"#,
                 "c3",
-                &mut no_event,
+                &no_event,
             )
             .await
             .unwrap_err();
@@ -542,11 +551,11 @@ mod tests {
                 r#"{{"path":"{}","content":"draft"}}"#,
                 scratch_file.display()
             );
-            execute_tool(&ctx, TOOL_CREATE_FILE, &create_args, "c4", &mut no_event)
+            execute_tool(&ctx, TOOL_CREATE_FILE, &create_args, "c4", &no_event)
                 .await
                 .unwrap();
             let read_args = format!(r#"{{"path":"{}"}}"#, scratch_file.display());
-            let out = execute_tool(&ctx, TOOL_READ_FILE, &read_args, "c5", &mut no_event)
+            let out = execute_tool(&ctx, TOOL_READ_FILE, &read_args, "c5", &no_event)
                 .await
                 .unwrap();
             assert!(out.contains("draft"), "got: {out}");
@@ -554,11 +563,11 @@ mod tests {
                 r#"{{"path":"{}","old_string":"draft","new_string":"plan"}}"#,
                 scratch_file.display()
             );
-            execute_tool(&ctx, TOOL_EDIT_FILE, &edit_args, "c6", &mut no_event)
+            execute_tool(&ctx, TOOL_EDIT_FILE, &edit_args, "c6", &no_event)
                 .await
                 .unwrap();
             let remove_args = format!(r#"{{"path":"{}"}}"#, scratch_file.display());
-            execute_tool(&ctx, TOOL_REMOVE_FILE, &remove_args, "c7", &mut no_event)
+            execute_tool(&ctx, TOOL_REMOVE_FILE, &remove_args, "c7", &no_event)
                 .await
                 .unwrap();
             assert!(!scratch_file.exists());
@@ -575,13 +584,13 @@ mod tests {
     async fn build_mode_writes_to_workdir() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = plan_ctx(&dir, Mode::Build);
-        let mut no_event = |_: JournalEventKind| {};
+        let no_event = |_: JournalEventKind| {};
         execute_tool(
             &ctx,
             TOOL_CREATE_FILE,
             r#"{"path":"new.txt","content":"built"}"#,
             "c1",
-            &mut no_event,
+            &no_event,
         )
         .await
         .unwrap();
@@ -596,13 +605,13 @@ mod tests {
     async fn spawn_subagent_rejects_unknown_mode() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = plan_ctx(&dir, Mode::Build);
-        let mut no_event = |_: JournalEventKind| {};
+        let no_event = |_: JournalEventKind| {};
         let err = execute_tool(
             &ctx,
             TOOL_SPAWN_SUBAGENT,
             r#"{"prompt":"do it","mode":"nope"}"#,
             "c1",
-            &mut no_event,
+            &no_event,
         )
         .await
         .unwrap_err();
@@ -628,20 +637,26 @@ mod tests {
     async fn request_mode_change_journals_event_and_returns_guidance() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = request_ctx(&dir, Mode::Plan, None);
-        let mut events: Vec<JournalEventKind> = Vec::new();
-        let mut on_event = |kind: JournalEventKind| events.push(kind);
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<JournalEventKind>::new()));
+        let on_event = {
+            let events = std::sync::Arc::clone(&events);
+            move |kind: JournalEventKind| {
+                events.lock().unwrap_or_else(|e| e.into_inner()).push(kind);
+            }
+        };
         let out = execute_tool(
             &ctx,
             TOOL_REQUEST_MODE_CHANGE,
             r#"{"mode":"build","message":"may I switch to build mode to implement the plan?"}"#,
             "call_rmc",
-            &mut on_event,
+            &on_event,
         )
         .await
         .unwrap();
         assert!(out.contains("Mode change request sent"), "got: {out}");
         assert!(out.contains("build"), "got: {out}");
         assert!(out.contains("Stop working now"), "got: {out}");
+        let events = events.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(events.len(), 1, "events: {events:#?}");
         match &events[0] {
             JournalEventKind::ModeChangeRequest { mode, message } => {
@@ -657,13 +672,13 @@ mod tests {
     async fn request_mode_change_rejects_same_mode() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = request_ctx(&dir, Mode::Plan, None);
-        let mut no_event = |_: JournalEventKind| {};
+        let no_event = |_: JournalEventKind| {};
         let err = execute_tool(
             &ctx,
             TOOL_REQUEST_MODE_CHANGE,
             r#"{"mode":"plan","message":"let me stay in plan mode"}"#,
             "c1",
-            &mut no_event,
+            &no_event,
         )
         .await
         .unwrap_err();
@@ -676,13 +691,13 @@ mod tests {
     async fn request_mode_change_rejects_subagent() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = request_ctx(&dir, Mode::Plan, Some("parent-1".to_string()));
-        let mut no_event = |_: JournalEventKind| {};
+        let no_event = |_: JournalEventKind| {};
         let err = execute_tool(
             &ctx,
             TOOL_REQUEST_MODE_CHANGE,
             r#"{"mode":"build","message":"may I switch?"}"#,
             "c1",
-            &mut no_event,
+            &no_event,
         )
         .await
         .unwrap_err();
@@ -705,13 +720,13 @@ mod tests {
             .unwrap();
         drop(journal);
 
-        let mut no_event = |_: JournalEventKind| {};
+        let no_event = |_: JournalEventKind| {};
         let err = execute_tool(
             &ctx,
             TOOL_REQUEST_MODE_CHANGE,
             r#"{"mode":"build","message":"second request"}"#,
             "c1",
-            &mut no_event,
+            &no_event,
         )
         .await
         .unwrap_err();
@@ -738,19 +753,24 @@ mod tests {
             .unwrap();
         drop(journal);
 
-        let mut events: Vec<JournalEventKind> = Vec::new();
-        let mut on_event = |kind: JournalEventKind| events.push(kind);
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<JournalEventKind>::new()));
+        let on_event = {
+            let events = std::sync::Arc::clone(&events);
+            move |kind: JournalEventKind| {
+                events.lock().unwrap_or_else(|e| e.into_inner()).push(kind);
+            }
+        };
         let out = execute_tool(
             &ctx,
             TOOL_REQUEST_MODE_CHANGE,
             r#"{"mode":"build","message":"second request"}"#,
             "call_2",
-            &mut on_event,
+            &on_event,
         )
         .await
         .unwrap();
         assert!(out.contains("Mode change request sent"), "got: {out}");
-        assert_eq!(events.len(), 1, "events: {events:#?}");
+        assert_eq!(events.lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
     }
 
     /// An unparseable mode is rejected as invalid arguments.
@@ -758,13 +778,13 @@ mod tests {
     async fn request_mode_change_rejects_invalid_mode() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = request_ctx(&dir, Mode::Plan, None);
-        let mut no_event = |_: JournalEventKind| {};
+        let no_event = |_: JournalEventKind| {};
         let err = execute_tool(
             &ctx,
             TOOL_REQUEST_MODE_CHANGE,
             r#"{"mode":"nope","message":"hi"}"#,
             "c1",
-            &mut no_event,
+            &no_event,
         )
         .await
         .unwrap_err();
@@ -776,13 +796,13 @@ mod tests {
     async fn request_mode_change_rejects_empty_message() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = request_ctx(&dir, Mode::Plan, None);
-        let mut no_event = |_: JournalEventKind| {};
+        let no_event = |_: JournalEventKind| {};
         let err = execute_tool(
             &ctx,
             TOOL_REQUEST_MODE_CHANGE,
             r#"{"mode":"build","message":"  "}"#,
             "c1",
-            &mut no_event,
+            &no_event,
         )
         .await
         .unwrap_err();

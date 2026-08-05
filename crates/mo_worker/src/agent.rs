@@ -2,7 +2,9 @@
 //! execute any tool calls, feed results back, and repeat until the model
 //! produces a final answer.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -32,6 +34,10 @@ pub struct AgentConfig {
     /// each `ContextUsage` journal event; `None` = unlimited.
     pub context_window: Option<u64>,
     pub subagent_depth: u32,
+    /// Max number of tool calls from a single assistant message that
+    /// execute concurrently (from `mo.toml`'s `max_tool_concurrency`;
+    /// clamped to at least 1).
+    pub max_tool_concurrency: usize,
 }
 
 /// Run the full agent loop for one session, journaling as it goes.
@@ -97,6 +103,7 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
         session: config.session.clone(),
         scratch,
         subagent_depth: config.subagent_depth,
+        max_tool_concurrency: config.max_tool_concurrency,
         model_base_url: config.model_base_url.clone(),
         model_name: config.model_name.clone(),
         auth_token: config.auth_token.clone(),
@@ -128,46 +135,86 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
             return Ok(());
         };
 
-        let mut tool_messages = Vec::new();
-        for tc in &tool_calls {
-            journal.append(JournalEventKind::ToolCallStart {
-                id: tc.id.clone(),
-                name: tc.function.name.clone(),
-                arguments: tc.function.arguments.clone(),
-            })?;
-            // Streaming tools (bash) emit `ToolOutputDelta` events through
-            // this sink while they run, and `request_mode_change` emits its
-            // `ModeChangeRequest` event, so the frontend sees them live.
-            let result = {
-                let mut on_event = |kind: JournalEventKind| {
-                    let _ = journal.append(kind);
-                };
-                tools::execute_tool(
-                    &tool_ctx,
-                    &tc.function.name,
-                    &tc.function.arguments,
-                    &tc.id,
-                    &mut on_event,
-                )
-                .await
+        // Execute the message's tool calls CONCURRENTLY, bounded by
+        // `max_tool_concurrency` (from `mo.toml`):
+        //   1. Every `ToolCallStart` event is journaled first, so the UI
+        //      shows all tool blocks at once.
+        //   2. The calls run in parallel; each `ToolResult` is journaled as
+        //      its call completes, so the UI updates blocks independently
+        //      and some finish before others.
+        //   3. The model-facing tool messages are rebuilt in the ORIGINAL
+        //      call order (results looked up by call id), so the model sees
+        //      a deterministic context regardless of completion order.
+        let mut tool_messages = Vec::with_capacity(tool_calls.len());
+        if !tool_calls.is_empty() {
+            for tc in &tool_calls {
+                journal.append(JournalEventKind::ToolCallStart {
+                    id: tc.id.clone(),
+                    name: tc.function.name.clone(),
+                    arguments: tc.function.arguments.clone(),
+                })?;
+            }
+
+            // Shared journal sink: the concurrent tool calls append their
+            // events (bash `ToolOutputDelta`s, `ModeChangeRequest`,
+            // `SubagentStarted`, `ToolResult`) through this closure, which
+            // locks the writer per event. Appends are short synchronous
+            // write+flush sections — never held across an await — and `seq`
+            // stays monotonic because assignment happens under the lock.
+            let sink = {
+                let shared = Arc::new(Mutex::new(&mut *journal));
+                move |kind: JournalEventKind| {
+                    let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = guard.append(kind);
+                }
             };
-            let (ok, output) = match result {
-                Ok(output) => (true, output),
-                Err(err) => (false, err),
-            };
-            journal.append(JournalEventKind::ToolResult {
-                id: tc.id.clone(),
-                name: tc.function.name.clone(),
-                ok,
-                output: output.clone(),
-            })?;
-            tool_messages.push(ChatMessage {
-                role: "tool".to_string(),
-                content: ChatMessageContentValue::Text(output),
-                reasoning_content: None,
-                tool_call_id: Some(tc.id.clone()),
-                tool_calls: None,
-            });
+
+            // `buffer_unordered(n)` polls up to `n` tool futures at once;
+            // per-call timeouts (bash's 120s) only start once a call is
+            // actually polled. Each future journals its own `ToolResult` as
+            // it completes.
+            let results: Vec<(String, String)> = futures_util::stream::iter(tool_calls.iter())
+                .map(|tc| async {
+                    let (ok, output) = match tools::execute_tool(
+                        &tool_ctx,
+                        &tc.function.name,
+                        &tc.function.arguments,
+                        &tc.id,
+                        &sink,
+                    )
+                    .await
+                    {
+                        Ok(output) => (true, output),
+                        Err(err) => (false, err),
+                    };
+                    sink(JournalEventKind::ToolResult {
+                        id: tc.id.clone(),
+                        name: tc.function.name.clone(),
+                        ok,
+                        output: output.clone(),
+                    });
+                    (tc.id.clone(), output)
+                })
+                .buffer_unordered(config.max_tool_concurrency.max(1))
+                .collect()
+                .await;
+            let by_id: HashMap<&str, &str> = results
+                .iter()
+                .map(|(id, output)| (id.as_str(), output.as_str()))
+                .collect();
+            for tc in &tool_calls {
+                let output = by_id
+                    .get(tc.id.as_str())
+                    .copied()
+                    .unwrap_or("[tool call failed to produce a result]");
+                tool_messages.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: ChatMessageContentValue::Text(output.to_string()),
+                    reasoning_content: None,
+                    tool_call_id: Some(tc.id.clone()),
+                    tool_calls: None,
+                });
+            }
         }
         messages.push(assistant);
         messages.extend(tool_messages);
@@ -181,7 +228,11 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
 /// included); `tool_result` events become the `tool`-role messages that must
 /// follow an assistant tool call. The journal interleaves them in the
 /// correct order, so a completed session can be resumed exactly where it
-/// left off.
+/// left off. Tool results are journaled in *completion* order (tool calls
+/// in one message run concurrently), so the tool messages following an
+/// assistant `tool_calls` message are reordered to match the calls' array
+/// order — the model-facing context is deterministic regardless of which
+/// call finished first.
 ///
 /// A worker that died or was stopped mid-tool leaves the journal ending
 /// with an assistant `tool_calls` message that no `tool_result` ever
@@ -245,7 +296,10 @@ fn history_from_journal(journal_path: &Path) -> Result<(Option<String>, Vec<Chat
     }
     // Drop dangling tool-call messages (and the partial tool results that
     // followed them) so the rebuilt context never carries `tool_calls`
-    // without matching tool messages.
+    // without matching tool messages — and, for answered calls, reorder the
+    // tool messages that follow to match the assistant's `tool_calls` array
+    // order (the journal records parallel results in completion order, which
+    // may vary; the model-facing context must be deterministic).
     let mut i = 0;
     let mut cleaned = Vec::with_capacity(messages.len());
     while i < messages.len() {
@@ -256,8 +310,35 @@ fn history_from_journal(journal_path: &Path) -> Result<(Option<String>, Vec<Chat
             }
             continue;
         }
-        cleaned.push(messages[i].clone());
-        i += 1;
+        if messages[i].role == "assistant"
+            && messages[i]
+                .tool_calls
+                .as_ref()
+                .is_some_and(|c| !c.is_empty())
+        {
+            let calls = messages[i].tool_calls.clone().expect("checked above");
+            let mut run: Vec<ChatMessage> = Vec::new();
+            let mut j = i + 1;
+            while j < messages.len() && messages[j].role == "tool" {
+                run.push(messages[j].clone());
+                j += 1;
+            }
+            // Deterministic order: by the index of each tool message's call
+            // id within the assistant's tool_calls array; unknown ids sink
+            // last (they should not occur for answered calls).
+            run.sort_by_key(|m| {
+                calls
+                    .iter()
+                    .position(|c| c.id == m.tool_call_id.as_deref().unwrap_or(""))
+                    .unwrap_or(usize::MAX)
+            });
+            cleaned.push(messages[i].clone());
+            cleaned.extend(run);
+            i = j;
+        } else {
+            cleaned.push(messages[i].clone());
+            i += 1;
+        }
     }
     Ok((system_prompt, cleaned))
 }
@@ -629,6 +710,259 @@ mod tests {
         assert_eq!(messages[3].content.to_string(), "done");
     }
 
+    /// Tool results are journaled in *completion* order (parallel
+    /// execution), but the rebuilt context must present them in the
+    /// assistant's `tool_calls` array order — the model-facing history is
+    /// deterministic regardless of which call finished first.
+    #[test]
+    fn history_reorders_tool_messages_to_match_call_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let mut journal = JournalWriter::open(&path).unwrap();
+        journal
+            .append(JournalEventKind::Message(JournalMessage {
+                role: "user".to_string(),
+                content: "read both files".to_string(),
+                reasoning_content: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }))
+            .unwrap();
+        // The assistant called read_file(a) first, then read_file(b).
+        journal
+            .append(JournalEventKind::Message(JournalMessage {
+                role: "assistant".to_string(),
+                content: String::new(),
+                reasoning_content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![
+                    ToolCallInfo {
+                        id: "call_a".to_string(),
+                        name: "read_file".to_string(),
+                        arguments: r#"{"path":"a.txt"}"#.to_string(),
+                    },
+                    ToolCallInfo {
+                        id: "call_b".to_string(),
+                        name: "read_file".to_string(),
+                        arguments: r#"{"path":"b.txt"}"#.to_string(),
+                    },
+                ]),
+            }))
+            .unwrap();
+        // ...but call_b finished first, so its result was journaled first.
+        journal
+            .append(JournalEventKind::ToolResult {
+                id: "call_b".to_string(),
+                name: "read_file".to_string(),
+                ok: true,
+                output: "content of b".to_string(),
+            })
+            .unwrap();
+        journal
+            .append(JournalEventKind::ToolResult {
+                id: "call_a".to_string(),
+                name: "read_file".to_string(),
+                ok: true,
+                output: "content of a".to_string(),
+            })
+            .unwrap();
+        journal
+            .append(JournalEventKind::Message(JournalMessage {
+                role: "assistant".to_string(),
+                content: "done".to_string(),
+                reasoning_content: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }))
+            .unwrap();
+        drop(journal);
+
+        let (system, messages) = history_from_journal(&path).unwrap();
+        assert!(system.is_none(), "no system prompt journaled here");
+        assert_eq!(messages.len(), 5, "messages: {messages:#?}");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[2].role, "tool");
+        // Deterministic order: call_a's result before call_b's, even though
+        // the journal has them in the opposite (completion) order.
+        assert_eq!(
+            messages[2].tool_call_id.as_deref(),
+            Some("call_a"),
+            "messages: {messages:#?}"
+        );
+        assert_eq!(messages[2].content.to_string(), "content of a");
+        assert_eq!(
+            messages[3].tool_call_id.as_deref(),
+            Some("call_b"),
+            "messages: {messages:#?}"
+        );
+        assert_eq!(messages[3].content.to_string(), "content of b");
+        assert_eq!(messages[4].role, "assistant");
+        assert_eq!(messages[4].content.to_string(), "done");
+    }
+
+    /// Two tool calls in a single assistant message run concurrently and
+    /// are answered in one round-trip: all `ToolCallStart` events land
+    /// before any `ToolResult`, both results are journaled, and the
+    /// follow-up LLM request carries the tool messages in the original call
+    /// order (deterministic regardless of completion order).
+    #[tokio::test]
+    async fn e2e_parallel_tool_calls_are_batched_in_call_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().join("work");
+        std::fs::create_dir_all(&workdir).unwrap();
+        std::fs::write(workdir.join("a.txt"), "AAA\n").unwrap();
+        std::fs::write(workdir.join("b.txt"), "BBB\n").unwrap();
+        let data_dir = dir.path().join("data");
+        let agents_dir = dir.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+
+        let conn = open_db(&data_dir.join("mo.db")).unwrap();
+        let session = sample_session(
+            &workdir,
+            &data_dir.join("sessions").join("e2e").join("journal.jsonl"),
+        );
+        db::create_session(&conn, &session).unwrap();
+        drop(conn);
+
+        // Mock LLM server. Request 1: two tool calls in ONE assistant
+        // message. Request 2: the final answer; its body must show the two
+        // tool messages in call order (call_1 before call_2) even though
+        // the tools ran concurrently.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new()
+            .route(
+                "/chat/completions",
+                post(
+                    |calls: axum::extract::State<Arc<AtomicUsize>>,
+                     body: axum::extract::Json<Value>| async move {
+                        let n = calls.fetch_add(1, Ordering::SeqCst);
+                        if n == 1 {
+                            // Second request: the tool results are fed back.
+                            let msgs = body["messages"].as_array().unwrap();
+                            let tail: Vec<&Value> = msgs.iter().rev().take(3).collect();
+                            // [assistant(tool_calls), tool(call_1), tool(call_2)]
+                            assert_eq!(tail[2]["role"], "assistant");
+                            assert_eq!(tail[1]["role"], "tool");
+                            assert_eq!(tail[1]["tool_call_id"], "call_1");
+                            assert!(
+                                tail[1]["content"].as_str().unwrap().contains("AAA"),
+                                "got: {}",
+                                tail[1]
+                            );
+                            assert_eq!(tail[0]["role"], "tool");
+                            assert_eq!(tail[0]["tool_call_id"], "call_2");
+                            assert!(
+                                tail[0]["content"].as_str().unwrap().contains("BBB"),
+                                "got: {}",
+                                tail[0]
+                            );
+                        }
+                        let body = if n == 0 {
+                            sse_payload_with_usage(
+                                &[
+                                    delta_role("assistant"),
+                                    delta_tool_call(
+                                        0,
+                                        "call_1",
+                                        "read_file",
+                                        r#"{"path":"a.txt"}"#,
+                                    ),
+                                    delta_tool_call(
+                                        1,
+                                        "call_2",
+                                        "read_file",
+                                        r#"{"path":"b.txt"}"#,
+                                    ),
+                                ],
+                                40,
+                                6,
+                            )
+                        } else {
+                            sse_payload_with_usage(
+                                &[
+                                    delta_role("assistant"),
+                                    delta_content("saw "),
+                                    delta_content("A and B"),
+                                ],
+                                60,
+                                3,
+                            )
+                        };
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                            body,
+                        )
+                    },
+                ),
+            )
+            .with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let agent_cfg = AgentConfig {
+            session: session.clone(),
+            workdir: workdir.clone(),
+            data_dir: data_dir.clone(),
+            agents_dir,
+            model_base_url: format!("http://{addr}"),
+            model_name: "mock-model".to_string(),
+            auth_token: None,
+            context_window: Some(4096),
+            subagent_depth: 0,
+            max_tool_concurrency: 8,
+        };
+        let mut journal = JournalWriter::open(std::path::Path::new(&session.journal_path)).unwrap();
+        journal
+            .append(JournalEventKind::Message(JournalMessage {
+                role: "user".to_string(),
+                content: "read a.txt and b.txt".to_string(),
+                reasoning_content: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }))
+            .unwrap();
+        run_agent(agent_cfg, &mut journal).await.unwrap();
+
+        let events = mo_core::read_events(std::path::Path::new(&session.journal_path)).unwrap();
+        let kinds: Vec<&JournalEventKind> = events.iter().map(|e| &e.kind).collect();
+        let start_positions: Vec<usize> = kinds
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, k)| {
+                matches!(k, JournalEventKind::ToolCallStart { name, .. } if name == "read_file")
+                    .then_some(idx)
+            })
+            .collect();
+        let result_positions: Vec<usize> = kinds
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, k)| {
+                matches!(k, JournalEventKind::ToolResult { ok: true, output, .. } if output.contains("AAA") || output.contains("BBB"))
+                    .then_some(idx)
+            })
+            .collect();
+        assert_eq!(start_positions.len(), 2, "starts: {start_positions:?}");
+        assert_eq!(result_positions.len(), 2, "results: {result_positions:?}");
+        // Every ToolCallStart lands before any ToolResult (the UI shows all
+        // tool blocks at once, then each completes independently).
+        assert!(
+            start_positions.iter().max().unwrap() < result_positions.iter().min().unwrap(),
+            "a tool result was journaled before all starts: {kinds:#?}"
+        );
+        // The final answer arrived.
+        assert!(
+            kinds.iter().any(|k| matches!(
+                k,
+                JournalEventKind::Message(m)
+                    if m.role == "assistant" && m.content.contains("A and B")
+            )),
+            "kinds: {kinds:#?}"
+        );
+    }
+
     /// End-to-end agent loop test against a tiny mock LLM server that
     /// replays canned chat-completion SSE responses:
     /// request 1 -> assistant tool_call(read_file notes.txt),
@@ -738,6 +1072,7 @@ mod tests {
             auth_token: None,
             context_window: Some(4096),
             subagent_depth: 0,
+            max_tool_concurrency: 8,
         };
         let mut journal = JournalWriter::open(std::path::Path::new(&session.journal_path)).unwrap();
         // The gateway journals the user message before spawning the worker;

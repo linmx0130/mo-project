@@ -19,6 +19,9 @@
 //!   global `AGENTS.md` and global skills (`<dir>/<skill>/SKILL.md` or
 //!   `<dir>/skills/<skill>/SKILL.md`). Skill name + description are injected
 //!   into the system prompt; the body is loaded on demand via `load_skill`.
+//! * `MO_MAX_TOOL_CONCURRENCY` — max number of tool calls from a single
+//!   assistant message that execute at once (default 8, clamped to ≥ 1);
+//!   the gateway passes the `max_tool_concurrency` value from `mo.toml`.
 
 use std::env;
 use std::path::PathBuf;
@@ -40,6 +43,11 @@ pub struct WorkerConfig {
     pub auth_token: Option<String>,
     pub context_window: Option<u64>,
     pub subagent_depth: u32,
+    /// Max number of tool calls from a single assistant message that
+    /// execute concurrently (clamped to at least 1). The gateway passes the
+    /// `max_tool_concurrency` value from `mo.toml`; standalone workers fall
+    /// back to the config file, then to the default.
+    pub max_tool_concurrency: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -120,6 +128,16 @@ pub fn parse_config() -> Result<WorkerConfig, ConfigError> {
                 }
             },
         };
+    // Tool-call concurrency: env first (the gateway passes the resolved
+    // `max_tool_concurrency` from `mo.toml`), then the config file, then the
+    // default. Clamped to at least 1 so a misconfigured 0 can never make
+    // the tool pipeline deadlock.
+    let max_tool_concurrency = env::var("MO_MAX_TOOL_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .or_else(|| file_cfg.as_ref().map(|c| c.max_tool_concurrency))
+        .unwrap_or(mo_core::config::DEFAULT_MAX_TOOL_CONCURRENCY)
+        .max(1);
 
     Ok(WorkerConfig {
         session_id,
@@ -130,6 +148,7 @@ pub fn parse_config() -> Result<WorkerConfig, ConfigError> {
         auth_token,
         context_window,
         subagent_depth,
+        max_tool_concurrency,
     })
 }
 

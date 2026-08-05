@@ -153,6 +153,9 @@ fn tool_usage_rules(mode: Mode, scratch: &Path) -> String {
                (use replace_all only when every occurrence should change).\n\
              - Use bash for anything outside the file tools: builds, tests, git, etc.\n\
              - After making changes, verify them with read_file or bash before finishing.\n\
+             - Tool calls in one message run concurrently (up to max_tool_concurrency);\n\
+               completion order is not guaranteed, so never put dependent calls in the\n\
+               same message — wait for a result, then make the next call.\n\
              - Report your final answer as a plain text message when no more tool calls\n\
                are needed.\n\n"
             .to_string(),
@@ -164,6 +167,9 @@ fn tool_usage_rules(mode: Mode, scratch: &Path) -> String {
                modifications there are denied.\n\
              - Use bash for anything outside the file tools (builds, tests, git, ...),\n\
                keeping it read-only.\n\
+             - Tool calls in one message run concurrently (up to max_tool_concurrency);\n\
+               completion order is not guaranteed, so never put dependent calls in the\n\
+               same message — wait for a result, then make the next call.\n\
              - Report your final answer as a plain text message when no more tool calls\n\
                are needed.\n\n",
             scratch.display()

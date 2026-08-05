@@ -29,7 +29,7 @@ pub async fn spawn_subagent(
     prompt: &str,
     mode: Mode,
     tool_call_id: &str,
-    on_event: &mut (dyn FnMut(JournalEventKind) + Send),
+    on_event: &(dyn Fn(JournalEventKind) + Send + Sync),
 ) -> Result<String, String> {
     // Hard limit: subagents cannot spawn further subagents. A session with
     // a `parent_id` is a subagent, so it is refused here regardless of the
@@ -67,6 +67,10 @@ pub async fn spawn_subagent(
         .env("MO_AGENTS_DIR", &ctx.agents_dir)
         .env("MO_MODEL_BASE_URL", &ctx.model_base_url)
         .env("MO_MODEL_NAME", &ctx.model_name)
+        .env(
+            "MO_MAX_TOOL_CONCURRENCY",
+            ctx.max_tool_concurrency.to_string(),
+        )
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(stderr_file))
         .kill_on_drop(true);
@@ -133,7 +137,7 @@ fn create_child_session(
     prompt: &str,
     mode: Mode,
     tool_call_id: &str,
-    on_event: &mut (dyn FnMut(JournalEventKind) + Send),
+    on_event: &(dyn Fn(JournalEventKind) + Send + Sync),
 ) -> Result<String, String> {
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
@@ -192,6 +196,7 @@ fn last_assistant_message(journal_path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     /// A ctx whose data dir is a tempdir (so `create_child_session` can
     /// write the DB + journal) and whose session is a *root* session
@@ -219,6 +224,7 @@ mod tests {
             session,
             scratch: dir.path().join("data/sessions/parent/tmp"),
             subagent_depth: 0,
+            max_tool_concurrency: mo_core::config::DEFAULT_MAX_TOOL_CONCURRENCY,
             model_base_url: "http://localhost:1".into(),
             model_name: "m".into(),
             auth_token: None,
@@ -232,14 +238,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(&dir, Some("root".to_string()));
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut no_event = |_: JournalEventKind| {};
+        let no_event = |_: JournalEventKind| {};
         let err = rt
             .block_on(spawn_subagent(
                 &ctx,
                 "do it",
                 Mode::Explore,
                 "call_x",
-                &mut no_event,
+                &no_event,
             ))
             .unwrap_err();
         assert!(
@@ -257,15 +263,20 @@ mod tests {
     fn create_child_session_titles_and_seeds_journal() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx(&dir, None);
-        let mut events: Vec<JournalEventKind> = Vec::new();
-        let mut on_event = |kind: JournalEventKind| events.push(kind);
+        let events = Arc::new(Mutex::new(Vec::<JournalEventKind>::new()));
+        let on_event = {
+            let events = Arc::clone(&events);
+            move |kind: JournalEventKind| {
+                events.lock().unwrap_or_else(|e| e.into_inner()).push(kind);
+            }
+        };
 
         let id = create_child_session(
             &ctx,
             "subagent task text",
             Mode::Explore,
             "call_x",
-            &mut on_event,
+            &on_event,
         )
         .unwrap();
 
@@ -297,6 +308,7 @@ mod tests {
         }
 
         // The SubagentStarted event links the tool block to the child.
+        let events = events.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(events.len(), 1, "events: {events:#?}");
         match &events[0] {
             JournalEventKind::SubagentStarted {
@@ -318,8 +330,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = test_ctx(&dir, None);
         ctx.session.prompt = "   ".to_string();
-        let mut no_event = |_: JournalEventKind| {};
-        let id = create_child_session(&ctx, "task", Mode::Build, "c1", &mut no_event).unwrap();
+        let no_event = |_: JournalEventKind| {};
+        let id = create_child_session(&ctx, "task", Mode::Build, "c1", &no_event).unwrap();
         let conn = open_db(&ctx.data_dir.join("mo.db")).unwrap();
         let row = db::get_session(&conn, &id).unwrap().unwrap();
         assert_eq!(row.prompt, "Subagent");

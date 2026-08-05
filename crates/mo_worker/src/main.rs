@@ -91,8 +91,10 @@ async fn main() {
     // the worker from being killed mid-journal-write, and gives us a chance
     // to kill any running bash command's process group first — pipeline
     // children (gradlew, tail, ...) would otherwise survive as orphans once
-    // the worker dies. Exiting here also guarantees the worker never
-    // finishes the loop and overwrites the session's `cancelled` status.
+    // the worker dies. With parallel tool execution several bash commands
+    // may run at once, so every tracked process group is killed. Exiting
+    // here also guarantees the worker never finishes the loop and
+    // overwrites the session's `cancelled` status.
     {
         use tokio::signal::unix::{SignalKind, signal};
         tokio::spawn(async move {
@@ -100,7 +102,7 @@ async fn main() {
                 return;
             };
             sigterm.recv().await;
-            if let Some(pgid) = crate::tools::bash::active_bash_pgid() {
+            for pgid in crate::tools::bash::active_bash_pgids() {
                 unsafe {
                     libc::kill(-(pgid as i32), libc::SIGKILL);
                 }
@@ -131,6 +133,7 @@ async fn main() {
         auth_token: cfg.auth_token,
         context_window: cfg.context_window,
         subagent_depth: cfg.subagent_depth,
+        max_tool_concurrency: cfg.max_tool_concurrency,
     };
 
     match agent::run_agent(agent_cfg, &mut journal).await {

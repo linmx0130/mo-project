@@ -63,6 +63,7 @@ fn setup(sleep: bool) -> (tempfile::TempDir, Router) {
         worker_bin,
         cwd: std::env::current_dir().unwrap(),
         agents_dir: dir.path().join("agents"),
+        max_tool_concurrency: mo_core::config::DEFAULT_MAX_TOOL_CONCURRENCY,
         models: test_models(),
     });
     (dir, create_router(state))
@@ -897,6 +898,7 @@ async fn spawn_worker_passes_context_window_env() {
         worker_bin,
         cwd: std::env::current_dir().unwrap(),
         agents_dir: dir.path().join("agents"),
+        max_tool_concurrency: mo_core::config::DEFAULT_MAX_TOOL_CONCURRENCY,
         models: test_models(),
     });
     let app = create_router(state);

@@ -71,6 +71,8 @@ port = 3031                    # gateway HTTP port (default 3031)
                               # changes behavior): root sessions are always
                               # depth 0 (never framed as subagents); nesting is
                               # hard-capped at 1
+# max_tool_concurrency = 8     # max tool calls from one assistant message
+                              # that run concurrently (default 8, min 1)
 
 # At least one model is required. The first one is the default model used
 # to launch jobs and generate session titles; it is pre-selected in the
@@ -244,6 +246,17 @@ preview for the canonical, complete text. Delta events are skipped when the
 worker rebuilds chat history from the journal, so the model context stays
 clean.
 
+**Parallel tool calls.** Tool calls in a single assistant message run
+*concurrently*, bounded by `max_tool_concurrency` (`mo.toml`, default 8).
+The worker journals every `tool_call_start` up front, so the UI shows all
+tool blocks at once; each `tool_result` lands as its call completes, so
+some blocks finish before others and each bash output streams into its own
+block. Tool results are fed back to the model in the *original* call order
+(results looked up by call id), and the journal-based history rebuild
+reorders them the same way, so the model-facing context is deterministic
+regardless of completion order. Dependent calls should still be sent in
+separate messages.
+
 ## Status bar
 
 The session view has a status bar pinned to the bottom showing a mode
@@ -273,6 +286,7 @@ kept for existing setups; new deployments should use the config file:
 | `MO_MODEL_NAME` | worker (required) | — |
 | `MO_AUTH_TOKEN` | worker | unset |
 | `MO_SUBAGENT_DEPTH` | worker | `0` for root sessions (subagents inherit parent depth + 1; nesting is hard-capped at 1 — a subagent can never spawn further subagents) |
+| `MO_MAX_TOOL_CONCURRENCY` | worker | `8` (max tool calls from one assistant message that run concurrently; min 1) |
 | `MO_WORKER_BIN` | gateway | sibling of `mo_gateway` exe named `mo_worker` |
 | `MO_PORT` | gateway | `3031` |
 
