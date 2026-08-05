@@ -573,6 +573,9 @@ async fn get_session(
 /// DELETE /api/sessions/:id — permanently remove a session: stop a running
 /// worker (SIGTERM → SIGKILL its process group), delete the per-session
 /// directory from disk (journal, worker log, ...), then drop the DB row.
+/// Subagent sessions spawned by it are removed with it (rows + directories)
+/// — the group kill already stops their workers, and they are hidden from
+/// the session list, so the user could not otherwise reach them.
 /// Returns 204 No Content on success, 404 for an unknown session.
 async fn delete_session(
     State(state): State<Arc<AppState>>,
@@ -592,6 +595,9 @@ async fn delete_session(
     {
         process::cancel_session_pid(pid).await;
     }
+    // Remove the subagent trees first: a failure here leaves the session
+    // fully intact (rows + files), so the client can retry.
+    delete_descendants(&state, &id);
     // Remove the per-session directory first: a failure here leaves the
     // session fully intact (row + files), so the client can retry.
     process::remove_session_dir(&state.data_dir, &id)
@@ -601,6 +607,24 @@ async fn delete_session(
         db::delete_session(&conn, &id).map_err(ApiError::internal)?;
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Recursively remove a session's subagents (children, grandchildren, …):
+/// their per-session directories and DB rows are deleted with the parent so
+/// no orphaned subagent rows accumulate (subagents are hidden from the
+/// session list). Their workers are already dead — subagent workers inherit
+/// the parent worker's process group, which `cancel_session_pid` killed.
+fn delete_descendants(state: &AppState, id: &str) {
+    let children = {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::list_children(&conn, id).unwrap_or_default()
+    };
+    for child in children {
+        delete_descendants(state, &child.id);
+        let _ = process::remove_session_dir(&state.data_dir, &child.id);
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = db::delete_session(&conn, &child.id);
+    }
 }
 
 #[derive(Deserialize)]
@@ -646,10 +670,14 @@ async fn cancel(
         // Mark the session cancelled *before* killing: the kill has a grace
         // period, and while it is in flight the liveness check would see a
         // dead pid with a `running` status and race the session to `failed`.
+        // The session's subagents are marked cancelled too (their workers
+        // die with the parent's process group), so their rows never stay
+        // `running` with a dead pid.
         {
             let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
             let _ = db::update_status(&conn, &id, SessionStatus::Cancelled, None);
         }
+        cancel_descendants(&state, &id);
         if let Some(pid) = pid {
             process::cancel_session_pid(pid).await;
         }
@@ -659,6 +687,26 @@ async fn cancel(
     match session {
         Some(session) => Ok(Json(session)),
         None => Err(ApiError::not_found("session not found")),
+    }
+}
+
+/// Recursively mark a session's subagents (children, grandchildren, …)
+/// `cancelled`. The process-group kill in `cancel_session_pid` already
+/// stops their workers — subagent workers inherit the parent worker's
+/// process group — so this only keeps their DB rows from staying
+/// `running` with a dead pid (and lets a subagent modal's SSE show
+/// `cancelled` instead of flipping to `failed`).
+fn cancel_descendants(state: &AppState, id: &str) {
+    let children = {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::list_children(&conn, id).unwrap_or_default()
+    };
+    for child in children {
+        if child.status == SessionStatus::Running || child.status == SessionStatus::Pending {
+            let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = db::update_status(&conn, &child.id, SessionStatus::Cancelled, None);
+        }
+        cancel_descendants(state, &child.id);
     }
 }
 

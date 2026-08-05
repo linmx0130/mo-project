@@ -104,13 +104,31 @@ pub fn get_session(conn: &Connection, id: &str) -> Result<Option<Session>> {
     Ok(row)
 }
 
+/// List root sessions (newest first). Subagent sessions (`parent_id`
+/// set) are excluded: they are hidden from the session list — they are
+/// reached through their parent's `spawn_subagent` tool blocks instead
+/// (see the frontend's subagent modal).
 pub fn list_sessions(conn: &Connection) -> Result<Vec<Session>> {
     let mut stmt = conn.prepare(
         "SELECT id, parent_id, workdir, prompt, model, status, mode, pid, journal_path, created_at, updated_at, heartbeat_at, error
-         FROM sessions ORDER BY created_at DESC",
+         FROM sessions WHERE parent_id IS NULL ORDER BY created_at DESC",
     )?;
     let rows = stmt
         .query_map([], row_to_session)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// List the subagent sessions spawned by a session (oldest first). Used by
+/// the gateway when cancelling/deleting a session: its subagents must be
+/// stopped and cleaned up with it.
+pub fn list_children(conn: &Connection, parent_id: &str) -> Result<Vec<Session>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, parent_id, workdir, prompt, model, status, mode, pid, journal_path, created_at, updated_at, heartbeat_at, error
+         FROM sessions WHERE parent_id = ?1 ORDER BY created_at ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![parent_id], row_to_session)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -287,6 +305,40 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].id, "new");
         assert_eq!(sessions[1].id, "old");
+    }
+
+    /// Subagent sessions (`parent_id` set) are hidden from the session
+    /// list; they are reachable through `list_children` instead.
+    #[test]
+    fn list_excludes_subagents_and_lists_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("mo.db")).unwrap();
+        let mut root = sample_session("root");
+        root.prompt = "the root session".to_string();
+        create_session(&conn, &root).unwrap();
+        let mut child = sample_session("child");
+        child.parent_id = Some("root".to_string());
+        child.prompt = "Subagent for the root session".to_string();
+        create_session(&conn, &child).unwrap();
+        // A grandchild (defensive: depth is capped at 1, but the query must
+        // hide any nested session).
+        let mut grandchild = sample_session("grandchild");
+        grandchild.parent_id = Some("child".to_string());
+        create_session(&conn, &grandchild).unwrap();
+
+        // Only the root appears in the list.
+        let sessions = list_sessions(&conn).unwrap();
+        assert_eq!(sessions.len(), 1, "sessions: {sessions:#?}");
+        assert_eq!(sessions[0].id, "root");
+
+        // list_children returns each parent's direct children.
+        let children = list_children(&conn, "root").unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].id, "child");
+        let children = list_children(&conn, "child").unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].id, "grandchild");
+        assert!(list_children(&conn, "missing").unwrap().is_empty());
     }
 
     #[test]

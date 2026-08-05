@@ -1131,3 +1131,50 @@ p {
   color: var(--accent);
   font-weight: 600;
 }
+
+/* ---------- subagent modal ---------- */
+
+/* "view subagent" affordance inside a `spawn_subagent` tool block's
+   summary row (only rendered when the block actually spawned a child). */
+.subagent-link {
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  color: var(--accent);
+  font: inherit;
+  font-size: 12px;
+  padding: 2px 9px;
+  cursor: pointer;
+}
+
+.subagent-link:hover {
+  background: var(--accent-bg);
+}
+
+/* The read-only modal that lists a subagent session's messages. Reuses the
+   generic .dialog-overlay / .dialog shell; the body is a scrollable
+   timeline. There is no composer — subagents never receive user input. */
+.subagent-modal {
+  width: min(720px, 100%);
+}
+
+.subagent-subtitle {
+  font-size: 13px;
+  word-break: break-word;
+}
+
+.subagent-mode {
+  margin-left: 8px;
+  vertical-align: 1px;
+}
+
+.subagent-body {
+  min-height: 240px;
+  max-height: 60vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-right: 4px;
+}

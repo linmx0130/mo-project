@@ -109,6 +109,12 @@ export type JournalEventKind =
   /** Streamed output of a running tool (bash); the following `tool_result`
    *  event carries the complete, capped output and replaces the preview. */
   | { kind: 'tool_output_delta'; id: string; name: string; output: string }
+  /** The parent worker spawned a subagent session: `child_id` is the
+   *  subagent's session id and `tool_call_id` links it to the parent's
+   *  `spawn_subagent` tool block, which the UI renders with a "view
+   *  subagent" affordance opening a read-only modal of the child's
+   *  messages. `mode` is the mode the subagent runs under. */
+  | { kind: 'subagent_started'; child_id: string; tool_call_id: string; mode: Mode }
   /** Context length (API-reported prompt tokens) after an LLM call; the
    *  status bar shows the latest one. `context_window` is the model's
    *  configured window at session time, or null for unlimited. */

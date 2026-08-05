@@ -12,7 +12,8 @@
 //! data_dir      = "./data"            # runtime data dir (default ./data)
 //! agents_dir    = "~/.agents"         # global agents dir (default $HOME/.agents)
 //! port          = 3031                # gateway HTTP port (default 3031)
-//! subagent_depth = 0                  # worker subagent depth (default 0, cap 3)
+//! subagent_depth = 0                  # worker subagent depth (default 0, hard cap 1:
+//!                                     # subagents can never spawn further subagents)
 //! worker_bin    = "..."               # worker binary (default: sibling of mo_gateway)
 //!
 //! [[models]]                          # at least one required; first = default

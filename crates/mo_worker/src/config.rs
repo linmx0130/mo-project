@@ -12,7 +12,8 @@
 //! * `MO_AUTH_TOKEN` — optional Bearer token / API key.
 //! * `MO_CONTEXT_WINDOW` — optional model context window in tokens (unset =
 //!   unlimited); embedded in `context_usage` journal events for the status bar.
-//! * `MO_SUBAGENT_DEPTH` — subagent nesting depth (default 0, hard cap 3).
+//! * `MO_SUBAGENT_DEPTH` — subagent nesting depth (default 0, hard cap 1:
+//!   subagents can never spawn further subagents).
 //! * `MO_AGENTS_DIR` — global agents dir (default `$HOME/.agents`); holds the
 //!   global `AGENTS.md` and global skills (`<dir>/<skill>/SKILL.md` or
 //!   `<dir>/skills/<skill>/SKILL.md`). Skill name + description are injected
@@ -21,7 +22,12 @@
 use std::env;
 use std::path::PathBuf;
 
-pub const MAX_SUBAGENT_DEPTH: u32 = 3;
+/// The hard cap on subagent nesting. Subagents (sessions with a `parent_id`)
+/// can never spawn further subagents — the depth limit is 1: a root session
+/// may spawn subagents, and those subagents are leaves. The numeric
+/// `subagent_depth` value a worker carries is clamped to this cap so the
+/// system-prompt framing never claims a deeper nesting.
+pub const MAX_SUBAGENT_DEPTH: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -123,7 +129,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn depth_cap_is_three() {
-        assert_eq!(MAX_SUBAGENT_DEPTH, 3);
+    fn depth_cap_is_one() {
+        assert_eq!(MAX_SUBAGENT_DEPTH, 1);
     }
 }

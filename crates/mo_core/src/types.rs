@@ -288,6 +288,21 @@ pub enum JournalEventKind {
         #[serde(skip_serializing_if = "Option::is_none")]
         context_window: Option<u64>,
     },
+    /// The parent worker spawned a subagent session. Journaled by the
+    /// `spawn_subagent` tool into the *parent's* journal, right after the
+    /// child session row is created, so readers can link the parent's
+    /// `spawn_subagent` tool block (identified by `tool_call_id`) to the
+    /// child session (`child_id`) and render its messages in a modal.
+    /// `mode` is the mode the child runs under.
+    ///
+    /// Like `ModeChangeRequest`, this is flow metadata for the UI, never a
+    /// chat message: the worker's history rebuild and the mode-marker scan
+    /// both skip it.
+    SubagentStarted {
+        child_id: String,
+        tool_call_id: String,
+        mode: Mode,
+    },
 }
 
 /// One line of a session journal.

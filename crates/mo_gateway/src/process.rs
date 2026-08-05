@@ -34,8 +34,11 @@ pub fn is_heartbeat_stale(heartbeat_at: &Option<String>) -> bool {
 
 /// Spawn `mo_worker --session-id <id>` with stdout/stderr going to
 /// `data/sessions/<id>/worker.log`. The worker gets its own process group
-/// so cancel can signal the whole tree (including subagents). Returns the
-/// child pid. A background task reaps the child so no zombies accumulate.
+/// so cancel can signal the whole tree (including subagents): subagent
+/// workers are spawned by the worker *without* their own `process_group`,
+/// so they inherit this group (pgid == worker pid) and die with it when
+/// `cancel_session_pid` SIGTERMs/SIGKILLs `-pid`. Returns the child pid. A
+/// background task reaps the child so no zombies accumulate.
 ///
 /// The worker's configuration travels through the environment: the session's
 /// model (resolved from the config file by name; the default model is the

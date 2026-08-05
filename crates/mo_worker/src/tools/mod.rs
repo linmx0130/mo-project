@@ -126,7 +126,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": TOOL_SPAWN_SUBAGENT,
-                "description": "Spawn a subagent (a nested agent session with the same working directory) to work on a self-contained subtask, and wait for its final answer. Depth is capped at 3. The subagent runs in the given mode (default: this session's current mode) — build has full access; plan and explore keep the codebase read-only (writes go to the subagent's own scratch dir).",
+                "description": "Spawn a subagent (a nested agent session with the same working directory) to work on a self-contained subtask, and wait for its final answer. Subagents cannot spawn further subagents (the depth hard limit is 1). The subagent runs in the given mode (default: this session's current mode) — build has full access; plan and explore keep the codebase read-only (writes go to the subagent's own scratch dir).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -307,7 +307,7 @@ pub async fn execute_tool(
                     .map_err(|e| format!("invalid arguments for {name}: {e}"))?,
                 None => ctx.session.mode,
             };
-            subagent::spawn_subagent(ctx, &args.prompt, mode).await
+            subagent::spawn_subagent(ctx, &args.prompt, mode, tool_call_id, on_event).await
         }
         TOOL_LOAD_SKILL => {
             let args: LoadSkillArgs = serde_json::from_str(arguments)

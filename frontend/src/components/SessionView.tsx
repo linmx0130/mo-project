@@ -1,7 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
-import type { JournalEvent, JournalMessage, Mode, Session, SessionStatus } from '../api'
+import type { JournalEvent, Mode, Session, SessionStatus } from '../api'
 import {
   approveModeChange,
   cancelSession,
@@ -12,174 +10,14 @@ import {
   switchMode,
 } from '../api'
 import Composer from './Composer'
-import CopyButton from './CopyButton'
 import StatusBar from './StatusBar'
+import SubagentModal from './SubagentModal'
+import { buildTimeline, isTerminal } from '../timeline'
+import { EventRow, MessageRow, ToolBlockRow } from './Timeline'
 
 interface Props {
   session: Session
   onStatusChange: () => void
-}
-
-function isTerminal(status: SessionStatus): boolean {
-  return status === 'completed' || status === 'failed' || status === 'cancelled'
-}
-
-interface ToolBlock {
-  id: string
-  name: string
-  arguments: string
-  output?: string
-  ok?: boolean
-  /** True while output deltas are still arriving (tool still running). */
-  streaming?: boolean
-  /** Epoch ms of the `tool_call_start` event, for the elapsed badge. */
-  startedAt?: number
-}
-
-/** An assistant message as rendered; `streaming` marks a message whose
- *  content is still being assembled from `message_delta` events. */
-type MessageBlock = JournalMessage & { streaming?: boolean }
-
-type TimelineItem =
-  | { type: 'message'; message: MessageBlock }
-  | { type: 'tool'; block: ToolBlock }
-  | { type: 'event'; event: JournalEvent }
-
-/** True when the message deserves its own timeline row. An assistant
- *  message with no text and no reasoning that only wraps tool calls is
- *  fully represented by the tool blocks that follow it, so the empty
- *  "assistant" bubble is skipped. */
-function isRenderableMessage(msg: JournalMessage): boolean {
-  if (msg.role !== 'assistant') return true
-  const hasText = (msg.content ?? '').trim().length > 0
-  const hasReasoning = (msg.reasoning_content ?? '').trim().length > 0
-  return hasText || hasReasoning || (msg.tool_calls?.length ?? 0) === 0
-}
-
-/** Fold the journal event stream into renderable items.
- *
- * - `message_delta` events append to the assistant message currently being
- *   assembled (token-by-token preview of both the visible text and the
- *   reasoning content); the following `message` event replaces its content
- *   with the canonical assembled text — which also repairs the transient
- *   state when a retried LLM call left partial deltas behind.
- * - `tool_output_delta` events append to the open tool block with the same
- *   id (bash output streaming); the following `tool_result` event replaces
- *   the preview with the complete, capped output.
- * - `tool_call_start`/`tool_result` are paired into one block as before.
- * - An assistant `message` with no text and no reasoning that only wraps
- *   tool calls is skipped — the tool blocks that follow it carry the
- *   action (the journal keeps the message; the worker needs it to rebuild
- *   the chat context on followups).
- */
-function buildTimeline(events: JournalEvent[]): TimelineItem[] {
-  const items: TimelineItem[] = []
-  const pending = new Map<string, ToolBlock>()
-  let openMessage: MessageBlock | null = null
-  // Index in `items` of the block `openMessage` references, so it can be
-  // removed when the final message turns out to be a bare tool-call wrapper
-  // (no text, no reasoning). `items.pop()` would be unsafe here because
-  // `context_usage` events land between the deltas and the final message.
-  let openIdx = -1
-
-  for (const ev of events) {
-    const kind = ev.kind
-    switch (kind.kind) {
-      case 'message_delta': {
-        const reasoning = kind.reasoning_content ?? ''
-        if (openMessage) {
-          if (kind.content) openMessage.content += kind.content
-          if (reasoning) {
-            openMessage.reasoning_content =
-              (openMessage.reasoning_content ?? '') + reasoning
-          }
-        } else {
-          const block: MessageBlock = {
-            role: 'assistant',
-            content: kind.content,
-            reasoning_content: reasoning || null,
-            streaming: true,
-          }
-          openMessage = block
-          openIdx = items.length
-          items.push({ type: 'message', message: block })
-        }
-        break
-      }
-      case 'message': {
-        if (kind.role === 'assistant' && openMessage) {
-          // Finalize the delta-built preview with the canonical message.
-          openMessage.content = kind.content
-          openMessage.reasoning_content = kind.reasoning_content ?? null
-          openMessage.tool_call_id = kind.tool_call_id ?? null
-          openMessage.tool_calls = kind.tool_calls ?? null
-          openMessage.streaming = false
-          if (!isRenderableMessage(openMessage)) {
-            // A bare tool-call turn (no text, no reasoning): the streamed
-            // preview is dropped and the tool blocks carry the action.
-            items.splice(openIdx, 1)
-          }
-          openMessage = null
-        } else if (isRenderableMessage(kind)) {
-          items.push({
-            type: 'message',
-            message: {
-              role: kind.role,
-              content: kind.content,
-              reasoning_content: kind.reasoning_content ?? null,
-              tool_call_id: kind.tool_call_id ?? null,
-              tool_calls: kind.tool_calls ?? null,
-            },
-          })
-        }
-        break
-      }
-      case 'tool_call_start': {
-        const block: ToolBlock = {
-          id: kind.id,
-          name: kind.name,
-          arguments: kind.arguments,
-          startedAt: new Date(ev.ts).getTime(),
-        }
-        pending.set(kind.id, block)
-        items.push({ type: 'tool', block })
-        break
-      }
-      case 'tool_output_delta': {
-        const block = pending.get(kind.id)
-        if (block) {
-          block.output = (block.output ?? '') + kind.output
-          block.streaming = true
-        }
-        break
-      }
-      case 'tool_result': {
-        const block = pending.get(kind.id)
-        if (block) {
-          block.ok = kind.ok
-          block.streaming = false
-          // The canonical result is capped at ~1 MB while the delta stream
-          // is not; keep whichever is longer so the tail is never lost when
-          // the result lands (small commands still get the canonical text,
-          // including the exit-code line).
-          if (!block.output || kind.output.length >= block.output.length) {
-            block.output = kind.output
-          } else {
-            block.output = `${block.output}\n\n[tool result was truncated by the harness — showing the full streamed output]`
-          }
-          pending.delete(kind.id)
-        }
-        break
-      }
-      case 'system_prompt':
-        // Session metadata (the system prompt journaled on the first run);
-        // never rendered as a chat message.
-        break
-      default:
-        items.push({ type: 'event', event: ev })
-    }
-  }
-  return items
 }
 
 export default function SessionView({ session, onStatusChange }: Props) {
@@ -188,6 +26,9 @@ export default function SessionView({ session, onStatusChange }: Props) {
   const [error, setError] = useState<string | null>(null)
   const [cancelling, setCancelling] = useState(false)
   const [sending, setSending] = useState(false)
+  // A subagent session whose messages are shown in a read-only modal
+  // (opened from a `spawn_subagent` tool block's "view subagent" button).
+  const [subagentId, setSubagentId] = useState<string | null>(null)
   // The current mode, as shown/switched in the status bar. Switching only
   // changes the write sandbox of subsequent runs — the journaled system
   // prompt never changes. Local state is the source of truth while the
@@ -267,7 +108,8 @@ export default function SessionView({ session, onStatusChange }: Props) {
     }
   }, [session.id, onStatusChange, runId])
 
-  /** Stop the running worker (SIGTERM → SIGKILL the process group). */
+  /** Stop the running worker (SIGTERM → SIGKILL the process group; the
+   *  session's subagents die with it). */
   const stop = async () => {
     setCancelling(true)
     try {
@@ -457,6 +299,7 @@ export default function SessionView({ session, onStatusChange }: Props) {
                   key={`${item.block.id}-${i}`}
                   block={item.block}
                   now={now}
+                  onOpenSubagent={(childId) => setSubagentId(childId)}
                 />
               )
             case 'event':
@@ -499,57 +342,15 @@ export default function SessionView({ session, onStatusChange }: Props) {
         modeEnabled={!running}
         onSwitchMode={(next) => void handleModeSwitch(next)}
       />
+
+      {subagentId && (
+        <SubagentModal
+          childId={subagentId}
+          onClose={() => setSubagentId(null)}
+        />
+      )}
     </div>
   )
-}
-
-function EventRow({ event }: { event: JournalEvent }) {
-  const kind = event.kind
-  switch (kind.kind) {
-    case 'status_change':
-      return (
-        <div className="status-change">
-          <span className={`badge badge-${kind.status}`}>→ {kind.status}</span>
-          {kind.error && <span className="muted">{kind.error}</span>}
-        </div>
-      )
-    case 'mode_change':
-      // The gateway injected a mode-change notice before a followup user
-      // message; render it as a subtle notice row, not a chat bubble.
-      return (
-        <div className="mode-change">
-          <span className={`badge mode-${kind.mode}`}>→ mode: {kind.mode}</span>
-          <span className="muted">{kind.content}</span>
-        </div>
-      )
-    case 'mode_change_request':
-      // The agent asked (via request_mode_change) to switch the session's
-      // mode; the passive timeline record of the request. The actionable
-      // Agree / Reject banner is rendered above the composer while the
-      // request is pending.
-      return (
-        <div className="mode-change">
-          <span className={`badge mode-${kind.mode}`}>
-            → mode: {kind.mode} requested
-          </span>
-          <span className="muted">{kind.message}</span>
-        </div>
-      )
-    case 'mode_change_request_declined':
-      // The user rejected the request; it is resolved (no mode switch).
-      return (
-        <div className="mode-change">
-          <span className={`badge mode-${kind.mode}`}>
-            → mode: {kind.mode} rejected
-          </span>
-          <span className="muted">The user rejected the mode change request.</span>
-        </div>
-      )
-    default:
-      // message / tool events are folded into dedicated items by
-      // buildTimeline; anything else is not rendered.
-      return null
-  }
 }
 
 /** The frozen-composer banner shown while a `mode_change_request` is
@@ -586,98 +387,5 @@ function ModeChangeRequestBanner({
         </button>
       </div>
     </div>
-  )
-}
-
-function MessageRow({ message }: { message: MessageBlock }) {
-  const role = message.role
-  if (role === 'tool') {
-    return (
-      <div className="msg msg-tool">
-        <pre className="tool-output">{message.content}</pre>
-      </div>
-    )
-  }
-  if (role === 'user') {
-    return (
-      <div className="msg msg-user">
-        <div className="msg-label">user</div>
-        <div className="msg-content">{message.content}</div>
-      </div>
-    )
-  }
-  // assistant — rendered as Markdown (the worker's LLM output is Markdown)
-  return (
-    <div className="msg msg-assistant">
-      <div className="msg-head">
-        <div className="msg-label">assistant</div>
-        {message.content && (
-          // The button copies the raw Markdown source, not the rendered
-          // HTML. Disabled while the message is still streaming so the
-          // user can't grab a partial reply.
-          <CopyButton
-            content={message.content}
-            disabled={message.streaming}
-          />
-        )}
-      </div>
-      {message.reasoning_content && (
-        // While reasoning is streaming, force the block open so the tokens
-        // are visible as they arrive; once the run settles the `open` prop
-        // is removed and the details stay in whatever state the user left.
-        <details className="reasoning" open={message.streaming || undefined}>
-          <summary>reasoning</summary>
-          <pre>{message.reasoning_content}</pre>
-        </details>
-      )}
-      {message.content && (
-        <div className="msg-content markdown">
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>
-            {message.content}
-          </ReactMarkdown>
-        </div>
-      )}
-      {message.streaming && (
-        <span className="stream-cursor" aria-hidden="true" />
-      )}
-    </div>
-  )
-}
-
-function ToolBlockRow({ block, now }: { block: ToolBlock; now: number }) {
-  const elapsedSecs =
-    block.startedAt !== undefined
-      ? Math.max(0, Math.floor((now - block.startedAt) / 1000))
-      : 0
-  // While output is streaming, force the block open so the user sees it
-  // fill in live; once the result lands the `open` prop is removed and the
-  // details become uncontrolled again, staying open until the user
-  // collapses it.
-  return (
-    <details
-      className={`tool-block ${block.ok === false ? 'tool-failed' : ''}`}
-      open={block.streaming || undefined}
-    >
-      <summary>
-        <span className="tool-name">{block.name}</span>
-        <code className="tool-args">{block.arguments}</code>
-        {block.streaming && (
-          <span className="tool-status running">
-            running{elapsedSecs > 0 ? ` ${elapsedSecs}s` : ''}
-          </span>
-        )}
-        {block.streaming && !block.output && elapsedSecs >= 5 && (
-          <span className="tool-status muted">no output yet</span>
-        )}
-        {block.ok !== undefined && (
-          <span className={`tool-status ${block.ok ? 'ok' : 'err'}`}>
-            {block.ok ? 'ok' : 'error'}
-          </span>
-        )}
-      </summary>
-      {block.output !== undefined && (
-        <pre className="tool-output">{block.output}</pre>
-      )}
-    </details>
   )
 }

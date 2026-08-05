@@ -67,7 +67,8 @@ template; the essentials:
 port = 3031                    # gateway HTTP port (default 3031)
 # data_dir = "./data"          # runtime data (default ./data)
 # agents_dir = "~/.agents"     # global agents dir (default $HOME/.agents)
-# subagent_depth = 0           # worker subagent depth (default 0, cap 3)
+# subagent_depth = 0           # worker subagent depth (default 0, hard cap 1:
+                              # subagents can never spawn further subagents)
 
 # At least one model is required. The first one is the default model used
 # to launch jobs and generate session titles; it is pre-selected in the
@@ -201,6 +202,30 @@ picks up where it left off with the new write sandbox. **Reject**
 model — and the composer unfreezes. Subagents cannot use the tool (their
 journal has no UI); they must report the need to their parent agent.
 
+## Subagents
+
+The `spawn_subagent` tool runs a nested agent session (same working
+directory) and waits for its final answer. Subagents are **leaves**: the
+depth hard limit is 1, so a subagent can never spawn further subagents —
+the `subagent_depth` config key still controls the value granted to root
+sessions, but the parent-id rule is what enforces the limit.
+
+Subagent sessions are hidden from the session list (only root sessions
+appear in the sidebar). They are reached through their parent: every
+`spawn_subagent` call that actually spawns a child journals a
+`subagent_started` event (carrying the child session id, the tool-call id
+and the child's mode) in the parent's journal, and the matching tool block
+shows a **view subagent →** button. Clicking it opens a read-only modal
+that lists the subagent's messages live over SSE — there is no composer
+(subagents never receive user input directly; their task is seeded into
+their journal as the first user message). The child's DB title is
+`Subagent for <parent session title>` rather than the task text.
+
+Stopping or deleting a session stops/removes its subagents too: subagent
+workers inherit the parent worker's process group, so the gateway's
+process-group kill reaches them, and their rows are marked `cancelled` (or
+deleted with the parent) at the same time.
+
 ## Streaming
 
 The UI renders responses token-by-token. While the worker consumes the LLM
@@ -244,7 +269,7 @@ kept for existing setups; new deployments should use the config file:
 | `MO_MODEL_BASE_URL` | worker (required) | — |
 | `MO_MODEL_NAME` | worker (required) | — |
 | `MO_AUTH_TOKEN` | worker | unset |
-| `MO_SUBAGENT_DEPTH` | worker | `0` (hard cap `3`) |
+| `MO_SUBAGENT_DEPTH` | worker | `0` (hard cap `1` — subagents can never spawn further subagents) |
 | `MO_WORKER_BIN` | gateway | sibling of `mo_gateway` exe named `mo_worker` |
 | `MO_PORT` | gateway | `3031` |
 
@@ -279,7 +304,7 @@ $HOME/.agents/
 | `GET /api/models` | configured models from `mo.toml` (`[{nickname, name, base_url, default}]`; first one is `default`) |
 | `GET /api/modes` | built-in session modes: `[{name, label, description, tools, writable}]` (`build`, `plan`, `explore`) |
 | `POST /api/sessions` `{workdir, prompt, model?, mode?}` | create session + spawn worker (`model` = model name from `/api/models`, default when absent; `mode` = mode name from `/api/modes`, `build` when absent) |
-| `GET /api/sessions` | list (newest first) |
+| `GET /api/sessions` | list root sessions (newest first; subagent sessions are hidden — they are reached through their parent's tool blocks) |
 | `GET /api/sessions/:id` | detail; liveness check flips dead workers to `failed` |
 | `GET /api/sessions/:id/history?after_seq=N` | journal events after `N` |
 | `GET /api/sessions/:id/events` | SSE tail: new events + synthesized status changes |
@@ -301,7 +326,9 @@ last run — or by `POST .../mode/approve` to continue a run after a
 `request_mode_change` tool, to switch the session's mode, with the model's
 message for the user), `mode_change_request_declined` (the user rejected
 the request), `context_usage` (context length in tokens after each LLM
-call, from the API's `usage.prompt_tokens`), plus the streaming previews
+call, from the API's `usage.prompt_tokens`), `subagent_started` (a parent
+worker spawned a subagent: child session id + the `spawn_subagent`
+tool-call id + the child's mode), plus the streaming previews
 `message_delta` (token-by-token assistant text and reasoning) and
 `tool_output_delta` (live bash output) — JSONL, `seq` + `ts` per line.
 

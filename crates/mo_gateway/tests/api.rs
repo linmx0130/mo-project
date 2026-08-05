@@ -696,6 +696,126 @@ async fn delete_unknown_session_returns_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// Insert a subagent session row (parent set) directly, for the cancel /
+/// delete cascade tests.
+fn insert_child_session(
+    data_dir: &Path,
+    id: &str,
+    parent_id: &str,
+    status: SessionStatus,
+) -> Session {
+    let now = chrono::Utc::now().to_rfc3339();
+    let session = Session {
+        id: id.to_string(),
+        parent_id: Some(parent_id.to_string()),
+        workdir: "/tmp".to_string(),
+        prompt: format!("Subagent for {parent_id}"),
+        model: "default-model".to_string(),
+        status,
+        mode: Mode::Build,
+        pid: None,
+        journal_path: data_dir
+            .join("sessions")
+            .join(id)
+            .join("journal.jsonl")
+            .display()
+            .to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        heartbeat_at: None,
+        error: None,
+    };
+    let conn = open_db(&data_dir.join("mo.db")).unwrap();
+    db::create_session(&conn, &session).unwrap();
+    drop(conn);
+    session
+}
+
+/// Cancelling a session must also mark every subagent session it spawned
+/// `cancelled` (their workers die with the parent's process group, so the
+/// rows must not stay `running` with a dead pid).
+#[tokio::test]
+async fn cancel_parent_marks_subagents_cancelled() {
+    let (_dir, app) = setup(true); // stub worker sleeps
+    let workdir = _dir.path().join("work");
+    let data_dir = _dir.path().join("data");
+
+    let (_, session) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({ "workdir": workdir.display().to_string(), "prompt": "run & cancel" })),
+    )
+    .await;
+    let id = session["id"].as_str().unwrap().to_string();
+    let pid = session["pid"].as_u64().unwrap() as u32;
+    assert!(process_is_alive(pid), "stub worker should be running");
+    insert_child_session(&data_dir, "child-cancel", &id, SessionStatus::Running);
+
+    let (status, cancelled) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{id}/cancel"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cancelled["status"], "cancelled");
+
+    // The child row is marked cancelled too.
+    let conn = open_db(&data_dir.join("mo.db")).unwrap();
+    let row = db::get_session(&conn, "child-cancel").unwrap().unwrap();
+    assert_eq!(row.status, SessionStatus::Cancelled);
+}
+
+/// Deleting a session must also remove every subagent session it spawned:
+/// their rows and per-session directories are deleted with the parent (they
+/// are hidden from the session list, so the user could not otherwise reach
+/// them).
+#[tokio::test]
+async fn delete_parent_removes_subagent_rows_and_dirs() {
+    let (_dir, app) = setup(false); // stub exits immediately
+    let workdir = _dir.path().join("work");
+    let data_dir = _dir.path().join("data");
+
+    let (_, session) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({ "workdir": workdir.display().to_string(), "prompt": "parent" })),
+    )
+    .await;
+    let id = session["id"].as_str().unwrap().to_string();
+
+    // The stub exits immediately; wait for the liveness check to mark the
+    // parent terminal so the delete path skips the worker kill.
+    let mut terminal = false;
+    for _ in 0..50 {
+        let (_, detail) = request(&app, Method::GET, &format!("/api/sessions/{id}"), None).await;
+        if detail["status"] == "failed" {
+            terminal = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(terminal, "parent was never marked terminal");
+
+    // A child row plus its session dir on disk.
+    insert_child_session(&data_dir, "child-del", &id, SessionStatus::Running);
+    let child_dir = data_dir.join("sessions").join("child-del");
+    std::fs::create_dir_all(&child_dir).unwrap();
+    std::fs::write(child_dir.join("journal.jsonl"), "{}\n").unwrap();
+
+    let (status, _) = request(&app, Method::DELETE, &format!("/api/sessions/{id}"), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // The child's row and directory are gone with the parent.
+    let conn = open_db(&data_dir.join("mo.db")).unwrap();
+    assert!(db::get_session(&conn, "child-del").unwrap().is_none());
+    drop(conn);
+    assert!(!child_dir.exists(), "child dir should be removed");
+}
+
 #[tokio::test]
 async fn models_endpoint_lists_models_first_is_default() {
     let (_dir, app) = setup(false);
