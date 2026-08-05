@@ -402,6 +402,15 @@ function EventRow({ event }: { event: JournalEvent }) {
           {kind.error && <span className="muted">{kind.error}</span>}
         </div>
       )
+    case 'mode_change':
+      // The gateway injected a mode-change notice before a followup user
+      // message; render it as a subtle notice row, not a chat bubble.
+      return (
+        <div className="mode-change">
+          <span className={`badge mode-${kind.mode}`}>→ mode: {kind.mode}</span>
+          <span className="muted">{kind.content}</span>
+        </div>
+      )
     default:
       // message / tool events are folded into dedicated items by
       // buildTimeline; anything else is not rendered.

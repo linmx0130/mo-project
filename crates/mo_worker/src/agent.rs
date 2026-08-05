@@ -74,6 +74,7 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
             );
             journal.append(JournalEventKind::SystemPrompt {
                 content: prompt.clone(),
+                mode: config.session.mode,
             })?;
             prompt
         }
@@ -194,10 +195,24 @@ fn history_from_journal(journal_path: &Path) -> Result<(Option<String>, Vec<Chat
     let mut messages = Vec::new();
     for event in events {
         match event.kind {
-            JournalEventKind::SystemPrompt { content } => {
+            JournalEventKind::SystemPrompt { content, .. } => {
                 // Session metadata, not a chat message; the caller prepends
                 // it as the system message.
                 system_prompt = Some(content);
+            }
+            JournalEventKind::ModeChange { content, .. } => {
+                // The mode-change notice injected by the gateway right
+                // before a followup user message. It is passed through as a
+                // user-role message (safe across providers), so the model
+                // sees it directly before the real user message and does not
+                // keep the stale framing of the journaled system prompt.
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: ChatMessageContentValue::Text(content),
+                    reasoning_content: None,
+                    tool_call_id: None,
+                    tool_calls: None,
+                });
             }
             JournalEventKind::Message(m) => messages.push(ChatMessage {
                 role: m.role,
@@ -752,7 +767,7 @@ mod tests {
         // The system prompt is journaled once, on the first run, with the
         // session's mode framing.
         assert!(
-            matches!(kinds[1], JournalEventKind::SystemPrompt { content } if content.contains("Build mode") && content.contains("Global rule: answer in lowercase.")),
+            matches!(kinds[1], JournalEventKind::SystemPrompt { content, mode: Mode::Build } if content.contains("Build mode") && content.contains("Global rule: answer in lowercase.")),
             "expected journaled Build-mode system prompt, got: {:?}",
             kinds[1]
         );
@@ -846,6 +861,7 @@ mod tests {
         journal
             .append(JournalEventKind::SystemPrompt {
                 content: prompt.to_string(),
+                mode: Mode::Build,
             })
             .unwrap();
         journal
@@ -865,6 +881,81 @@ mod tests {
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[1].role, "assistant");
         // The system prompt is session metadata: it never appears inline.
+        assert!(
+            !messages.iter().any(|m| m.role == "system"),
+            "journaled system prompt must not appear as a chat message"
+        );
+    }
+
+    /// A `ModeChange` event injected by the gateway before a followup user
+    /// message must appear in the rebuilt context as a user-role message
+    /// directly before that user message — the model reads the mode notice
+    /// before the real user message.
+    #[test]
+    fn history_places_mode_change_before_followup_user_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let mut journal = JournalWriter::open(&path).unwrap();
+        journal
+            .append(JournalEventKind::Message(JournalMessage {
+                role: "user".to_string(),
+                content: "first message".to_string(),
+                reasoning_content: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }))
+            .unwrap();
+        journal
+            .append(JournalEventKind::SystemPrompt {
+                content: "You are in Build mode.".to_string(),
+                mode: Mode::Build,
+            })
+            .unwrap();
+        journal
+            .append(JournalEventKind::Message(JournalMessage {
+                role: "assistant".to_string(),
+                content: "done".to_string(),
+                reasoning_content: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }))
+            .unwrap();
+        // The gateway appended the mode-change notice, then the followup.
+        journal
+            .append(JournalEventKind::ModeChange {
+                mode: Mode::Plan,
+                content: "[Session mode changed to plan]\n\nYou are now in Plan mode.".to_string(),
+            })
+            .unwrap();
+        journal
+            .append(JournalEventKind::Message(JournalMessage {
+                role: "user".to_string(),
+                content: "followup".to_string(),
+                reasoning_content: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }))
+            .unwrap();
+        drop(journal);
+
+        let (system, messages) = history_from_journal(&path).unwrap();
+        assert_eq!(system.as_deref(), Some("You are in Build mode."));
+        assert_eq!(messages.len(), 4, "messages: {messages:#?}");
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content.to_string(), "first message");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].content.to_string(), "done");
+        // The mode change is a user-role message sitting directly before the
+        // followup user message.
+        assert_eq!(messages[2].role, "user");
+        assert_eq!(
+            messages[2].content.to_string(),
+            "[Session mode changed to plan]\n\nYou are now in Plan mode."
+        );
+        assert_eq!(messages[3].role, "user");
+        assert_eq!(messages[3].content.to_string(), "followup");
+        // The journaled system prompt is still session metadata, not a chat
+        // message.
         assert!(
             !messages.iter().any(|m| m.role == "system"),
             "journaled system prompt must not appear as a chat message"

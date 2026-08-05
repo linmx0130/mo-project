@@ -306,4 +306,63 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn system_prompt_event_round_trips_with_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let mut writer = JournalWriter::open(&path).unwrap();
+        writer
+            .append(JournalEventKind::SystemPrompt {
+                content: "You are in Explore mode.".to_string(),
+                mode: crate::types::Mode::Explore,
+            })
+            .unwrap();
+        let events = read_events(&path).unwrap();
+        assert_eq!(
+            events[0].kind,
+            JournalEventKind::SystemPrompt {
+                content: "You are in Explore mode.".to_string(),
+                mode: crate::types::Mode::Explore,
+            }
+        );
+    }
+
+    #[test]
+    fn mode_change_event_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let mut writer = JournalWriter::open(&path).unwrap();
+        writer
+            .append(JournalEventKind::ModeChange {
+                mode: crate::types::Mode::Plan,
+                content: "[Session mode changed to plan] …".to_string(),
+            })
+            .unwrap();
+        let events = read_events(&path).unwrap();
+        assert_eq!(
+            events[0].kind,
+            JournalEventKind::ModeChange {
+                mode: crate::types::Mode::Plan,
+                content: "[Session mode changed to plan] …".to_string(),
+            }
+        );
+    }
+
+    /// A journal line written before `SystemPrompt` carried a mode must
+    /// still parse: the missing field defaults to `build`, so journals
+    /// created by older versions keep working (and the mode-marker scan
+    /// treats them as a build-mode run).
+    #[test]
+    fn legacy_system_prompt_without_mode_defaults_to_build() {
+        let line = r#"{"seq":0,"ts":"2026-01-01T00:00:00Z","kind":{"kind":"system_prompt","content":"legacy prompt"}}"#;
+        let event: JournalEvent = serde_json::from_str(line).unwrap();
+        match event.kind {
+            JournalEventKind::SystemPrompt { content, mode } => {
+                assert_eq!(content, "legacy prompt");
+                assert_eq!(mode, crate::types::Mode::Build);
+            }
+            other => panic!("expected system_prompt, got: {other:?}"),
+        }
+    }
 }

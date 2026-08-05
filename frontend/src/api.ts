@@ -80,8 +80,17 @@ export type JournalEventKind =
   | { kind: 'status_change'; status: SessionStatus; error?: string | null }
   /** The session's system prompt, journaled by the worker on the first run
    *  and reused verbatim on every later run. Rendered as session metadata
-   *  (never as a chat message). */
-  | { kind: 'system_prompt'; content: string }
+   *  (never as a chat message). `mode` is the mode the session ran under
+   *  when the prompt was journaled — together with `mode_change` events it
+   *  is the journal's mode marker (legacy events without it default to
+   *  `build`). */
+  | { kind: 'system_prompt'; content: string; mode: Mode }
+  /** A notice that the session's mode changed since the last run, injected
+   *  by the gateway right before a followup user message when the mode
+   *  differs from the mode of the last run (at most one per followup).
+   *  `mode` is the new mode; `content` is the full notice text. Rendered
+   *  as a subtle notice row, not a chat bubble. */
+  | { kind: 'mode_change'; mode: Mode; content: string }
   /** Streamed assistant text/reasoning chunk; the following `message` event
    *  carries the assembled content and replaces the delta-built preview. */
   | { kind: 'message_delta'; content: string; reasoning_content?: string | null }

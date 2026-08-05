@@ -901,6 +901,37 @@ p {
   padding: 2px 0;
 }
 
+/* Mode-change notice row: the gateway injects a mode-change event right
+   before a followup user message when the session's mode changed since the
+   last run. Rendered as a subtle notice (like status_change), never as a
+   chat bubble. */
+.mode-change {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 2px 0;
+}
+
+.mode-change .muted {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* The mode-change badge is colored like the mode picker select; `mode-plan`
+   and `mode-explore` already set their color above (mode-select section). */
+.badge.mode-build {
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+
+.badge.mode-plan {
+  border: 1px solid var(--status-running);
+}
+
+.badge.mode-explore {
+  border: 1px solid var(--status-completed);
+}
+
 /* ---------- streaming ---------- */
 
 /* Blinking caret shown while an assistant message is still being assembled

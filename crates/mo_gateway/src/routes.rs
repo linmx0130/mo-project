@@ -259,10 +259,15 @@ async fn send_message(
     if payload.content.trim().is_empty() {
         return Err(ApiError::bad_request("message must not be empty"));
     }
-    let (status, pid, journal_path) = {
+    let (status, pid, journal_path, mode) = {
         let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
         match db::get_session(&conn, &id).map_err(ApiError::internal)? {
-            Some(session) => (session.status, session.pid, session.journal_path),
+            Some(session) => (
+                session.status,
+                session.pid,
+                session.journal_path,
+                session.mode,
+            ),
             None => return Err(ApiError::not_found("session not found")),
         }
     };
@@ -277,9 +282,46 @@ async fn send_message(
 
     // Journal the user message; the worker's context is rebuilt from the
     // journal, so this is what continues the conversation.
+    //
+    // The session's mode may have been switched since the last run. The
+    // system prompt is journaled once and never rebuilt, so the model would
+    // otherwise keep the old mode's framing. When the mode differs from the
+    // mode of the last run, inject a single mode-change message right before
+    // the followup. "Mode of the last run" is the last *mode marker* in the
+    // journal — the journaled `SystemPrompt` (mode of the first run) or a
+    // previously injected `ModeChange` (every run after one happened under
+    // its mode), scanned from the end. Consequences:
+    //   - multiple switches before one followup → one message, describing
+    //     the current mode (intermediate switches never affected a run);
+    //   - switching back to the mode of the last run → no message;
+    //   - a session that never ran has no marker → no message (the upcoming
+    //     first run builds its system prompt from the current mode).
     {
         let mut journal =
             JournalWriter::open(Path::new(&journal_path)).map_err(ApiError::internal)?;
+        let last_mode = mo_core::read_events(Path::new(&journal_path))
+            .map_err(ApiError::internal)?
+            .iter()
+            .rev()
+            .find_map(|e| match &e.kind {
+                JournalEventKind::SystemPrompt { mode, .. } => Some(*mode),
+                JournalEventKind::ModeChange { mode, .. } => Some(*mode),
+                _ => None,
+            });
+        if last_mode.is_some_and(|last| last != mode) {
+            // The session scratch dir (`<data_dir>/sessions/<id>/tmp`, the
+            // same deterministic path the worker creates and canonicalizes
+            // on the first run) — embedded in the message text so the model
+            // is told where it *may* write.
+            let scratch = state.data_dir.join("sessions").join(&id).join("tmp");
+            let scratch = scratch.canonicalize().unwrap_or(scratch);
+            journal
+                .append(JournalEventKind::ModeChange {
+                    mode,
+                    content: mo_core::mode_change_message(mode, &scratch),
+                })
+                .map_err(ApiError::internal)?;
+        }
         journal
             .append(JournalEventKind::Message(JournalMessage {
                 role: "user".to_string(),
@@ -484,5 +526,362 @@ async fn cancel(
     match session {
         Some(session) => Ok(Json(session)),
         None => Err(ApiError::not_found("session not found")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    /// A gateway under test: real AppState + DB in a tempdir, with a
+    /// no-op worker binary so `send_message`'s respawn completes without
+    /// running an agent.
+    struct TestApp {
+        state: Arc<AppState>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn test_app() -> TestApp {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let conn = mo_core::open_db(&data_dir.join("mo.db")).unwrap();
+        let state = Arc::new(AppState {
+            data_dir,
+            db: Mutex::new(conn),
+            worker_bin: PathBuf::from("/bin/true"),
+            cwd: dir.path().to_path_buf(),
+            agents_dir: dir.path().join("agents"),
+            subagent_depth: 0,
+            models: Vec::new(),
+        });
+        TestApp { state, _dir: dir }
+    }
+
+    /// Insert a terminal session row (as if created and completed) with the
+    /// given mode.
+    fn insert_session(state: &AppState, id: &str, mode: Mode) -> Session {
+        let now = chrono::Utc::now().to_rfc3339();
+        let session = Session {
+            id: id.to_string(),
+            parent_id: None,
+            workdir: state.cwd.display().to_string(),
+            prompt: "test session".to_string(),
+            model: "mock-model".to_string(),
+            status: SessionStatus::Completed,
+            mode,
+            pid: None,
+            journal_path: state
+                .data_dir
+                .join("sessions")
+                .join(id)
+                .join("journal.jsonl")
+                .display()
+                .to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            heartbeat_at: None,
+            error: None,
+        };
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::create_session(&conn, &session).unwrap();
+        session
+    }
+
+    fn append_kinds(journal_path: &str, kinds: &[JournalEventKind]) {
+        let mut journal = JournalWriter::open(Path::new(journal_path)).unwrap();
+        for kind in kinds {
+            journal.append(kind.clone()).unwrap();
+        }
+    }
+
+    fn read_kinds(app: &TestApp, id: &str) -> Vec<JournalEventKind> {
+        mo_core::read_events(
+            &app.state
+                .data_dir
+                .join("sessions")
+                .join(id)
+                .join("journal.jsonl"),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|e| e.kind)
+        .collect()
+    }
+
+    fn user_msg(content: &str) -> JournalEventKind {
+        JournalEventKind::Message(JournalMessage {
+            role: "user".to_string(),
+            content: content.to_string(),
+            reasoning_content: None,
+            tool_call_id: None,
+            tool_calls: None,
+        })
+    }
+
+    fn assistant_msg(content: &str) -> JournalEventKind {
+        JournalEventKind::Message(JournalMessage {
+            role: "assistant".to_string(),
+            content: content.to_string(),
+            reasoning_content: None,
+            tool_call_id: None,
+            tool_calls: None,
+        })
+    }
+
+    fn system_prompt(mode: Mode) -> JournalEventKind {
+        JournalEventKind::SystemPrompt {
+            content: format!("You are in {:?} mode.", mode).to_lowercase(),
+            mode,
+        }
+    }
+
+    async fn send_followup(app: &Arc<AppState>, id: &str, content: &str) -> StatusCode {
+        let router = create_router(app.clone());
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/sessions/{id}/messages"))
+            .header("content-type", "application/json")
+            .body(Body::from(format!(r#"{{"content":"{content}"}}"#)))
+            .unwrap();
+        router.oneshot(request).await.unwrap().status()
+    }
+
+    /// The happy path of the followup journal: a mode-change notice
+    /// immediately before the user message, in the session's current mode.
+    #[tokio::test]
+    async fn send_message_injects_mode_change_when_switched() {
+        let app = test_app();
+        let session = insert_session(&app.state, "s1", Mode::Plan);
+        // The journal records a completed run under Build mode.
+        append_kinds(
+            &session.journal_path,
+            &[
+                user_msg("plan the thing"),
+                system_prompt(Mode::Build),
+                assistant_msg("done"),
+            ],
+        );
+
+        let status = send_followup(&app.state, "s1", "continue").await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let kinds = read_kinds(&app, "s1");
+        assert_eq!(kinds.len(), 5, "kinds: {kinds:#?}");
+        // Exactly one ModeChange (Plan — the session's current mode),
+        // immediately before the followup user message.
+        match &kinds[3] {
+            JournalEventKind::ModeChange { mode, content } => {
+                assert_eq!(*mode, Mode::Plan);
+                assert!(
+                    content.contains("[Session mode changed to plan]"),
+                    "mode-change content must carry the bracket prefix: {content}"
+                );
+                assert!(
+                    content.contains("/sessions/s1/tmp"),
+                    "mode-change content must mention the scratch dir: {content}"
+                );
+            }
+            other => panic!("expected mode_change at seq 3, got: {other:?}"),
+        }
+        match &kinds[4] {
+            JournalEventKind::Message(m) if m.role == "user" && m.content == "continue" => {}
+            other => panic!("expected the followup user message at seq 4, got: {other:?}"),
+        }
+    }
+
+    /// Multiple switches before a single followup collapse into one
+    /// ModeChange describing the *final* mode (intermediate switches never
+    /// affected a run).
+    #[tokio::test]
+    async fn multiple_switches_before_one_followup_produce_one_mode_change() {
+        let app = test_app();
+        let session = insert_session(&app.state, "s1", Mode::Explore);
+        append_kinds(
+            &session.journal_path,
+            &[
+                user_msg("hi"),
+                system_prompt(Mode::Build),
+                assistant_msg("done"),
+            ],
+        );
+        // Simulate the switches: Build (last run) → Plan → Explore.
+        {
+            let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+            db::update_mode(&conn, "s1", Mode::Plan).unwrap();
+            db::update_mode(&conn, "s1", Mode::Explore).unwrap();
+        }
+
+        let status = send_followup(&app.state, "s1", "continue").await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let kinds = read_kinds(&app, "s1");
+        assert_eq!(kinds.len(), 5, "kinds: {kinds:#?}");
+        let mode_changes: Vec<&JournalEventKind> = kinds
+            .iter()
+            .filter(|k| matches!(k, JournalEventKind::ModeChange { .. }))
+            .collect();
+        assert_eq!(mode_changes.len(), 1, "kinds: {kinds:#?}");
+        match mode_changes[0] {
+            JournalEventKind::ModeChange { mode, .. } => {
+                assert_eq!(
+                    *mode,
+                    Mode::Explore,
+                    "the single notice must describe the final mode"
+                );
+            }
+            _ => unreachable!(),
+        }
+        // And it sits directly before the followup user message.
+        assert_eq!(kinds[4], user_msg("continue"));
+    }
+
+    /// No switch: the last-run mode equals the session mode, so no
+    /// ModeChange is journaled.
+    #[tokio::test]
+    async fn no_switch_injects_nothing() {
+        let app = test_app();
+        let session = insert_session(&app.state, "s1", Mode::Build);
+        append_kinds(
+            &session.journal_path,
+            &[
+                user_msg("hi"),
+                system_prompt(Mode::Build),
+                assistant_msg("done"),
+            ],
+        );
+
+        let status = send_followup(&app.state, "s1", "continue").await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let kinds = read_kinds(&app, "s1");
+        assert_eq!(kinds.len(), 4, "kinds: {kinds:#?}");
+        assert!(
+            !kinds
+                .iter()
+                .any(|k| matches!(k, JournalEventKind::ModeChange { .. })),
+            "no mode change expected: {kinds:#?}"
+        );
+        assert_eq!(kinds[3], user_msg("continue"));
+    }
+
+    /// Switching back to the mode of the last run: the journaled system
+    /// prompt's framing is accurate again, so no notice is needed.
+    #[tokio::test]
+    async fn switch_back_to_last_run_mode_injects_nothing() {
+        let app = test_app();
+        let session = insert_session(&app.state, "s1", Mode::Build);
+        append_kinds(
+            &session.journal_path,
+            &[
+                user_msg("hi"),
+                system_prompt(Mode::Build),
+                assistant_msg("done"),
+            ],
+        );
+        {
+            let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+            db::update_mode(&conn, "s1", Mode::Plan).unwrap();
+            db::update_mode(&conn, "s1", Mode::Build).unwrap();
+        }
+
+        let status = send_followup(&app.state, "s1", "continue").await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let kinds = read_kinds(&app, "s1");
+        assert_eq!(kinds.len(), 4, "kinds: {kinds:#?}");
+        assert!(
+            !kinds
+                .iter()
+                .any(|k| matches!(k, JournalEventKind::ModeChange { .. })),
+            "no mode change expected when switching back: {kinds:#?}"
+        );
+    }
+
+    /// A session that never ran has no mode marker: the upcoming first run
+    /// builds its system prompt from the current mode, so no notice.
+    #[tokio::test]
+    async fn never_ran_session_switched_injects_nothing() {
+        let app = test_app();
+        let session = insert_session(&app.state, "s1", Mode::Explore);
+        // Only the gateway's initial user message is journaled — the first
+        // worker died before journaling the system prompt.
+        append_kinds(&session.journal_path, &[user_msg("first message")]);
+
+        let status = send_followup(&app.state, "s1", "continue").await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let kinds = read_kinds(&app, "s1");
+        assert_eq!(kinds.len(), 2, "kinds: {kinds:#?}");
+        assert!(
+            !kinds
+                .iter()
+                .any(|k| matches!(k, JournalEventKind::ModeChange { .. })),
+            "no mode change expected for a never-ran session: {kinds:#?}"
+        );
+        assert_eq!(kinds[1], user_msg("continue"));
+    }
+
+    /// A previously injected ModeChange doubles as the mode marker: after a
+    /// Plan run (following a Build first run), switching to Explore and
+    /// following up injects one Explore notice — the Build system prompt is
+    /// not scanned past the Plan marker.
+    #[tokio::test]
+    async fn previous_mode_change_acts_as_marker() {
+        let app = test_app();
+        let session = insert_session(&app.state, "s1", Mode::Plan);
+        append_kinds(
+            &session.journal_path,
+            &[
+                user_msg("hi"),
+                system_prompt(Mode::Build),
+                assistant_msg("done"),
+            ],
+        );
+        // Run 1: switched to Plan, followup -> one Plan notice + user msg.
+        let status = send_followup(&app.state, "s1", "plan followup").await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        {
+            let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+            db::clear_pid(&conn, "s1").unwrap();
+            db::update_status(&conn, "s1", SessionStatus::Completed, None).unwrap();
+        }
+        // Simulate run 2 completing under Plan (the worker answered).
+        append_kinds(&session.journal_path, &[assistant_msg("plan done")]);
+        // Run 3: switch to Explore, followup.
+        {
+            let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+            db::update_mode(&conn, "s1", Mode::Explore).unwrap();
+        }
+        let status = send_followup(&app.state, "s1", "explore followup").await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let kinds = read_kinds(&app, "s1");
+        let mode_changes: Vec<&JournalEventKind> = kinds
+            .iter()
+            .filter(|k| matches!(k, JournalEventKind::ModeChange { .. }))
+            .collect();
+        // One notice for the Plan run, one for the Explore run — the Build
+        // marker was never re-scanned.
+        assert_eq!(mode_changes.len(), 2, "kinds: {kinds:#?}");
+        let modes: Vec<Mode> = mode_changes
+            .iter()
+            .map(|k| match k {
+                JournalEventKind::ModeChange { mode, .. } => *mode,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(modes, vec![Mode::Plan, Mode::Explore]);
+        // The last two events are the Explore notice + the followup.
+        match &kinds[kinds.len() - 2] {
+            JournalEventKind::ModeChange { mode, .. } => assert_eq!(*mode, Mode::Explore),
+            other => panic!("expected the Explore notice, got: {other:?}"),
+        }
+        assert_eq!(kinds[kinds.len() - 1], user_msg("explore followup"));
     }
 }

@@ -111,6 +111,14 @@ impl std::fmt::Display for Mode {
     }
 }
 
+/// `build` is the default mode: for new sessions, and the fallback when
+/// deserializing rows/journal lines written before modes were recorded.
+impl Default for Mode {
+    fn default() -> Self {
+        Mode::Build
+    }
+}
+
 /// A session row. Timestamps are RFC3339 strings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Session {
@@ -182,7 +190,36 @@ pub enum JournalEventKind {
     /// sent to the LLM on every run, which is prompt-cache friendly).
     /// Readers (the worker's history rebuild and the frontend timeline)
     /// treat it as session metadata, not as a chat message.
+    ///
+    /// `mode` is the mode the session ran under when this prompt was
+    /// journaled (the mode of the first run). Together with `ModeChange`
+    /// events it is the journal's *mode marker*: the gateway scans for the
+    /// last one when a followup arrives to decide whether the session's
+    /// mode changed since the last run. `#[serde(default)]` (→ `build`)
+    /// keeps journals written before the field existed parseable.
     SystemPrompt {
+        content: String,
+        #[serde(default)]
+        mode: Mode,
+    },
+    /// A notice that the session's mode changed since the last run. The
+    /// gateway injects it into the journal *immediately before* a followup
+    /// user message when the session's mode differs from the mode of the
+    /// last run — and only then (at most one per followup; switching modes
+    /// multiple times before a single followup collapses into one message
+    /// describing the final mode, and switching back to the last-run mode
+    /// injects nothing).
+    ///
+    /// `content` is the full message text (from
+    /// `mo_core::modes::mode_change_message`), embedded at injection time so
+    /// the worker passes it through verbatim and the frontend renders it
+    /// without regenerating. `mode` is the *new* mode — because a
+    /// `ModeChange` is only ever injected right before a user message, it
+    /// doubles as a mode marker: every run after it happened under its mode.
+    /// The worker maps the event to a user-role chat message, so the model
+    /// sees it directly before the real user message.
+    ModeChange {
+        mode: Mode,
         content: String,
     },
     /// A streamed chunk of an assistant message (token-by-token preview).

@@ -168,7 +168,21 @@ paths. `bash` remains available everywhere — a documented soft restriction
 **Switching modes.** A terminal session's mode can be switched from the
 status-bar picker (`POST /api/sessions/:id/mode`; rejected while the
 session is running). Switching changes only the write-sandbox policy of
-subsequent runs — the journaled system prompt never changes.
+subsequent runs — the journaled system prompt never changes — so before
+the next user message the gateway injects a single **mode-change
+message** (journaled as a `mode_change` event, shown in the timeline as a
+notice row) when the switched-to mode differs from the mode the
+conversation last ran under. At most one message is injected per followup:
+
+- several switches before a single followup collapse into **one** message
+  describing the *current* mode (intermediate switches never affected a run);
+- switching back to the mode of the last run injects **nothing** (the
+  journaled system prompt's framing is accurate again);
+- a session that never ran injects **nothing** either (its first run builds
+  the system prompt from the current mode).
+
+The worker passes the notice to the model as a user-role message, so the
+model sees the new mode's framing directly before the real user message.
 
 ## Streaming
 
@@ -252,19 +266,21 @@ $HOME/.agents/
 | `GET /api/sessions/:id` | detail; liveness check flips dead workers to `failed` |
 | `GET /api/sessions/:id/history?after_seq=N` | journal events after `N` |
 | `GET /api/sessions/:id/events` | SSE tail: new events + synthesized status changes |
-| `POST /api/sessions/:id/messages` `{content}` | continue a terminal session: journal the user message, reset to `pending`, respawn the worker |
-| `POST /api/sessions/:id/mode` `{mode}` | switch a terminal session's mode (409 while running): changes only the write sandbox of subsequent runs — the journaled system prompt never changes |
+| `POST /api/sessions/:id/messages` `{content}` | continue a terminal session: journal the user message (preceded by a `mode_change` notice when the mode was switched since the last run), reset to `pending`, respawn the worker |
+| `POST /api/sessions/:id/mode` `{mode}` | switch a terminal session's mode (409 while running): changes only the write sandbox of subsequent runs — the journaled system prompt never changes; the switch surfaces as a `mode_change` notice before the next user message |
 | `POST /api/sessions/:id/cancel` | mark cancelled, then SIGTERM → SIGKILL the worker process group |
 | `DELETE /api/sessions/:id` | permanently delete a session: stop a running worker, remove the session dir (journal, worker log, ...) from disk, drop the DB row (`204` on success) |
 
 Session status: `pending | running | completed | failed | cancelled`.
 Journal events: `message`, `tool_call_start`, `tool_result`, `status_change`,
 `system_prompt` (the system prompt, journaled once on the first run and
-reused verbatim on every later run), `context_usage` (context length in
-tokens after each LLM call, from the API's `usage.prompt_tokens`), plus the
-streaming previews `message_delta` (token-by-token assistant text and
-reasoning) and `tool_output_delta` (live bash output) — JSONL, `seq` +
-`ts` per line.
+reused verbatim on every later run, carrying the mode it was built for),
+`mode_change` (a mode-change notice injected by the gateway right before a
+followup user message when the session's mode differs from the mode of the
+last run), `context_usage` (context length in tokens after each LLM call,
+from the API's `usage.prompt_tokens`), plus the streaming previews
+`message_delta` (token-by-token assistant text and reasoning) and
+`tool_output_delta` (live bash output) — JSONL, `seq` + `ts` per line.
 
 ### Session titles
 
