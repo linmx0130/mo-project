@@ -45,6 +45,17 @@ type TimelineItem =
   | { type: 'tool'; block: ToolBlock }
   | { type: 'event'; event: JournalEvent }
 
+/** True when the message deserves its own timeline row. An assistant
+ *  message with no text and no reasoning that only wraps tool calls is
+ *  fully represented by the tool blocks that follow it, so the empty
+ *  "assistant" bubble is skipped. */
+function isRenderableMessage(msg: JournalMessage): boolean {
+  if (msg.role !== 'assistant') return true
+  const hasText = (msg.content ?? '').trim().length > 0
+  const hasReasoning = (msg.reasoning_content ?? '').trim().length > 0
+  return hasText || hasReasoning || (msg.tool_calls?.length ?? 0) === 0
+}
+
 /** Fold the journal event stream into renderable items.
  *
  * - `message_delta` events append to the assistant message currently being
@@ -56,11 +67,20 @@ type TimelineItem =
  *   id (bash output streaming); the following `tool_result` event replaces
  *   the preview with the complete, capped output.
  * - `tool_call_start`/`tool_result` are paired into one block as before.
+ * - An assistant `message` with no text and no reasoning that only wraps
+ *   tool calls is skipped — the tool blocks that follow it carry the
+ *   action (the journal keeps the message; the worker needs it to rebuild
+ *   the chat context on followups).
  */
 function buildTimeline(events: JournalEvent[]): TimelineItem[] {
   const items: TimelineItem[] = []
   const pending = new Map<string, ToolBlock>()
   let openMessage: MessageBlock | null = null
+  // Index in `items` of the block `openMessage` references, so it can be
+  // removed when the final message turns out to be a bare tool-call wrapper
+  // (no text, no reasoning). `items.pop()` would be unsafe here because
+  // `context_usage` events land between the deltas and the final message.
+  let openIdx = -1
 
   for (const ev of events) {
     const kind = ev.kind
@@ -81,6 +101,7 @@ function buildTimeline(events: JournalEvent[]): TimelineItem[] {
             streaming: true,
           }
           openMessage = block
+          openIdx = items.length
           items.push({ type: 'message', message: block })
         }
         break
@@ -93,8 +114,13 @@ function buildTimeline(events: JournalEvent[]): TimelineItem[] {
           openMessage.tool_call_id = kind.tool_call_id ?? null
           openMessage.tool_calls = kind.tool_calls ?? null
           openMessage.streaming = false
+          if (!isRenderableMessage(openMessage)) {
+            // A bare tool-call turn (no text, no reasoning): the streamed
+            // preview is dropped and the tool blocks carry the action.
+            items.splice(openIdx, 1)
+          }
           openMessage = null
-        } else {
+        } else if (isRenderableMessage(kind)) {
           items.push({
             type: 'message',
             message: {
