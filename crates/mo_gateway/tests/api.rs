@@ -63,7 +63,6 @@ fn setup(sleep: bool) -> (tempfile::TempDir, Router) {
         worker_bin,
         cwd: std::env::current_dir().unwrap(),
         agents_dir: dir.path().join("agents"),
-        subagent_depth: 0,
         models: test_models(),
     });
     (dir, create_router(state))
@@ -898,7 +897,6 @@ async fn spawn_worker_passes_context_window_env() {
         worker_bin,
         cwd: std::env::current_dir().unwrap(),
         agents_dir: dir.path().join("agents"),
-        subagent_depth: 0,
         models: test_models(),
     });
     let app = create_router(state);
@@ -929,6 +927,12 @@ async fn spawn_worker_passes_context_window_env() {
     assert!(
         env.contains("MO_MODEL_NAME=default-model"),
         "model env missing: {env}"
+    );
+    // Root sessions are depth 0: the worker must not be told it sits at a
+    // subagent depth (which would frame it as "you are a subagent").
+    assert!(
+        env.contains("MO_SUBAGENT_DEPTH=0"),
+        "MO_SUBAGENT_DEPTH must be 0 for root workers: {env}"
     );
 }
 

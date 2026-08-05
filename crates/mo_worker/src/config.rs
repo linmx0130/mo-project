@@ -12,8 +12,9 @@
 //! * `MO_AUTH_TOKEN` — optional Bearer token / API key.
 //! * `MO_CONTEXT_WINDOW` — optional model context window in tokens (unset =
 //!   unlimited); embedded in `context_usage` journal events for the status bar.
-//! * `MO_SUBAGENT_DEPTH` — subagent nesting depth (default 0, hard cap 1:
-//!   subagents can never spawn further subagents).
+//! * `MO_SUBAGENT_DEPTH` — the session's own subagent depth (0 for root
+//!   sessions, which are never framed as subagents; worker-spawned
+//!   subagents inherit parent depth + 1, hard-capped at 1).
 //! * `MO_AGENTS_DIR` — global agents dir (default `$HOME/.agents`); holds the
 //!   global `AGENTS.md` and global skills (`<dir>/<skill>/SKILL.md` or
 //!   `<dir>/skills/<skill>/SKILL.md`). Skill name + description are injected
@@ -75,10 +76,18 @@ pub fn parse_config() -> Result<WorkerConfig, ConfigError> {
         .map(PathBuf::from)
         .or_else(|_| file_cfg.as_ref().map(|c| c.agents_dir.clone()).ok_or(()))
         .unwrap_or_else(|_| mo_core::config::default_agents_dir());
-    let subagent_depth = match env::var("MO_SUBAGENT_DEPTH") {
-        Ok(v) => v.parse::<u32>().map_err(|_| ConfigError::BadDepth(v))?,
-        Err(_) => file_cfg.as_ref().map(|c| c.subagent_depth).unwrap_or(0),
-    };
+    // The session's own subagent depth. Root sessions are depth 0 by
+    // definition; the gateway spawns them with MO_SUBAGENT_DEPTH=0 and
+    // worker-spawned subagents inherit parent depth + 1 (clamped to the
+    // hard cap). When the env is unset (standalone run) the session is a
+    // root session, so the depth is 0 — the config file's `subagent_depth`
+    // value is *not* used as the session's own depth: a root session must
+    // never be framed as a subagent.
+    let subagent_depth = env::var("MO_SUBAGENT_DEPTH")
+        .ok()
+        .map(|v| v.parse::<u32>().map_err(|_| ConfigError::BadDepth(v)))
+        .transpose()?
+        .unwrap_or(0);
     // Context window: env first (the gateway passes the per-session model's
     // window), then the default model from the config file. Unset = unlimited.
     let context_window = match env::var("MO_CONTEXT_WINDOW") {

@@ -18,8 +18,10 @@
 # Gateway HTTP port (default 3031).
 # port = 3031
 
-# Subagent nesting depth granted to root sessions (default 0, hard cap 1:
-# subagents can never spawn further subagents).
+# Accepted for backward compatibility (its value no longer changes
+# behavior): root sessions are always depth 0 — never framed as subagents —
+# and subagent nesting is hard-capped at 1 (a subagent can never spawn
+# further subagents).
 # subagent_depth = 0
 
 # Worker binary (default: sibling of the mo_gateway executable named

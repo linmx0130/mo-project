@@ -42,7 +42,8 @@ pub fn is_heartbeat_stale(heartbeat_at: &Option<String>) -> bool {
 ///
 /// The worker's configuration travels through the environment: the session's
 /// model (resolved from the config file by name; the default model is the
-/// fallback), plus the data dir, global agents dir and subagent depth.
+/// fallback), plus the data dir and global agents dir. The subagent depth
+/// is fixed at 0 here — root sessions are never subagents.
 pub fn spawn_worker(state: &AppState, session: &Session) -> std::io::Result<u32> {
     let session_dir = state.data_dir.join("sessions").join(&session.id);
     std::fs::create_dir_all(&session_dir)?;
@@ -54,7 +55,12 @@ pub fn spawn_worker(state: &AppState, session: &Session) -> std::io::Result<u32>
         .arg(&session.id)
         .env("MO_DATA_DIR", &state.data_dir)
         .env("MO_AGENTS_DIR", &state.agents_dir)
-        .env("MO_SUBAGENT_DEPTH", state.subagent_depth.to_string())
+        // Root sessions are depth 0 by definition: the gateway only ever
+        // spawns root workers (create / followup / mode-approve), and the
+        // system prompt frames any depth > 0 as "you are a subagent".
+        // Subagents are spawned by workers themselves (which pass their own
+        // depth + 1), so this value never applies to them.
+        .env("MO_SUBAGENT_DEPTH", "0")
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_err))
         .process_group(0)

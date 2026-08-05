@@ -83,7 +83,6 @@ async fn main() {
         worker_bin,
         cwd,
         agents_dir: config.agents_dir,
-        subagent_depth: config.subagent_depth,
         models: config.models,
     });
     let app = create_router(state);

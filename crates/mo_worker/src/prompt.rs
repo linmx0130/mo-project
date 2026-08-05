@@ -206,6 +206,37 @@ mod tests {
         assert!(prompt.contains("subagent (nesting depth 2)"));
     }
 
+    /// The subagent framing is keyed on depth: depth 0 (a root session)
+    /// must never be told "you are a subagent", while a depth > 0 session
+    /// is framed as a subagent of that nesting depth.
+    #[test]
+    fn depth_zero_is_not_framed_as_subagent() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = tempfile::tempdir().unwrap();
+        let prompt = build_system_prompt(dir.path(), agents.path(), 0, Mode::Build, &scratch(&dir));
+        assert!(
+            !prompt.contains("spawned by another agent"),
+            "a root session must not be framed as a subagent: {prompt}"
+        );
+        assert!(!prompt.contains("nesting depth"), "got: {prompt}");
+        assert!(
+            !prompt.contains("return a concise summary"),
+            "got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn depth_one_is_framed_as_subagent() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = tempfile::tempdir().unwrap();
+        let prompt = build_system_prompt(dir.path(), agents.path(), 1, Mode::Build, &scratch(&dir));
+        assert!(
+            prompt.contains("You are a subagent (nesting depth 1) spawned by another agent."),
+            "got: {prompt}"
+        );
+        assert!(prompt.contains("return a concise summary"), "got: {prompt}");
+    }
+
     #[test]
     fn includes_global_agents_md() {
         let dir = tempfile::tempdir().unwrap();

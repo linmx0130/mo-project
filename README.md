@@ -67,8 +67,10 @@ template; the essentials:
 port = 3031                    # gateway HTTP port (default 3031)
 # data_dir = "./data"          # runtime data (default ./data)
 # agents_dir = "~/.agents"     # global agents dir (default $HOME/.agents)
-# subagent_depth = 0           # worker subagent depth (default 0, hard cap 1:
-                              # subagents can never spawn further subagents)
+# subagent_depth = 0           # accepted for backward compatibility (no longer
+                              # changes behavior): root sessions are always
+                              # depth 0 (never framed as subagents); nesting is
+                              # hard-capped at 1
 
 # At least one model is required. The first one is the default model used
 # to launch jobs and generate session titles; it is pre-selected in the
@@ -206,9 +208,10 @@ journal has no UI); they must report the need to their parent agent.
 
 The `spawn_subagent` tool runs a nested agent session (same working
 directory) and waits for its final answer. Subagents are **leaves**: the
-depth hard limit is 1, so a subagent can never spawn further subagents —
-the `subagent_depth` config key still controls the value granted to root
-sessions, but the parent-id rule is what enforces the limit.
+depth hard limit is 1, so a subagent can never spawn further subagents.
+Root sessions are depth 0 — they are never framed as subagents (the
+`subagent_depth` config key is accepted for backward compatibility but no
+longer changes behavior; the parent-id rule enforces the limit).
 
 Subagent sessions are hidden from the session list (only root sessions
 appear in the sidebar). They are reached through their parent: every
@@ -269,7 +272,7 @@ kept for existing setups; new deployments should use the config file:
 | `MO_MODEL_BASE_URL` | worker (required) | — |
 | `MO_MODEL_NAME` | worker (required) | — |
 | `MO_AUTH_TOKEN` | worker | unset |
-| `MO_SUBAGENT_DEPTH` | worker | `0` (hard cap `1` — subagents can never spawn further subagents) |
+| `MO_SUBAGENT_DEPTH` | worker | `0` for root sessions (subagents inherit parent depth + 1; nesting is hard-capped at 1 — a subagent can never spawn further subagents) |
 | `MO_WORKER_BIN` | gateway | sibling of `mo_gateway` exe named `mo_worker` |
 | `MO_PORT` | gateway | `3031` |
 

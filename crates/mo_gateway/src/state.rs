@@ -16,8 +16,6 @@ pub struct AppState {
     /// Global agents dir passed to every worker (`$HOME/.agents` by
     /// default; see `mo_core::config::default_agents_dir`).
     pub agents_dir: PathBuf,
-    /// Subagent nesting depth granted to root sessions.
-    pub subagent_depth: u32,
     /// All configured models (from `mo.toml`); the first is the default.
     pub models: Vec<ModelConfig>,
 }

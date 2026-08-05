@@ -746,7 +746,6 @@ mod tests {
             worker_bin,
             cwd: dir.path().to_path_buf(),
             agents_dir: dir.path().join("agents"),
-            subagent_depth: 0,
             models: Vec::new(),
         });
         TestApp { state, _dir: dir }
