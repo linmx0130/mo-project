@@ -43,16 +43,15 @@ export default function StatusBar({
   return (
     <footer className="status-bar">
       <label className="mode-switch" title="Session mode — switching changes only the write sandbox of subsequent runs; the system prompt stays as journaled at the first run">
-        <span className="context-label">mode</span>
         <select
           className={`mode-select mode-${mode}`}
           value={mode}
           onChange={(e) => onSwitchMode(e.target.value as Mode)}
           disabled={!modeEnabled}
         >
-          <option value="build">build</option>
-          <option value="plan">plan</option>
-          <option value="explore">explore</option>
+          <option value="build">Build</option>
+          <option value="plan">Plan</option>
+          <option value="explore">Explore</option>
         </select>
       </label>
       <span className={`badge badge-${status}`}>{status}</span>
