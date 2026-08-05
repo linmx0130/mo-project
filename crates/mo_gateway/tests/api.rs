@@ -8,7 +8,9 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use mo_core::{JournalEventKind, JournalWriter, ModelConfig, Session, SessionStatus, db, open_db};
+use mo_core::{
+    JournalEventKind, JournalWriter, Mode, ModelConfig, Session, SessionStatus, db, open_db,
+};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -200,6 +202,7 @@ fn insert_stalled_session(data_dir: &Path, id: &str) {
         prompt: "stalled".to_string(),
         model: "default-model".to_string(),
         status: SessionStatus::Running,
+        mode: Mode::Build,
         pid: Some(std::process::id()),
         journal_path: data_dir
             .join("sessions")
@@ -271,6 +274,7 @@ async fn fresh_heartbeat_is_not_flagged_stalled() {
         prompt: "healthy".to_string(),
         model: "default-model".to_string(),
         status: SessionStatus::Running,
+        mode: Mode::Build,
         pid: Some(std::process::id()),
         journal_path: _dir
             .path()
@@ -806,6 +810,135 @@ async fn spawn_worker_passes_context_window_env() {
         env.contains("MO_MODEL_NAME=default-model"),
         "model env missing: {env}"
     );
+}
+
+#[tokio::test]
+async fn modes_endpoint_lists_the_three_modes() {
+    let (_dir, app) = setup(false);
+    let (status, modes) = request(&app, Method::GET, "/api/modes", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let modes = modes.as_array().unwrap();
+    assert_eq!(modes.len(), 3);
+    let names: Vec<&str> = modes.iter().map(|m| m["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["build", "plan", "explore"]);
+    // The UI picker shows a description and the tool set.
+    for m in modes {
+        assert!(!m["label"].as_str().unwrap().is_empty());
+        assert!(!m["description"].as_str().unwrap().is_empty());
+        assert!(m["tools"].as_array().unwrap().len() == 7);
+    }
+}
+
+#[tokio::test]
+async fn create_session_accepts_and_defaults_mode() {
+    let (_dir, app) = setup(false);
+    let workdir = _dir.path().join("work");
+
+    // No mode -> build (the default and the legacy behavior).
+    let (status, session) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({ "workdir": workdir.display().to_string(), "prompt": "hi" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(session["mode"], "build");
+
+    // Explicit mode -> stored on the session.
+    let (status, session) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({
+            "workdir": workdir.display().to_string(),
+            "prompt": "plan it",
+            "mode": "plan",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(session["mode"], "plan");
+
+    // Unknown mode -> 400.
+    let (status, _) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({
+            "workdir": workdir.display().to_string(),
+            "prompt": "hi",
+            "mode": "nope",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn switch_mode_updates_terminal_session_and_rejects_running() {
+    let (_dir, app) = setup(true);
+    let workdir = _dir.path().join("work");
+
+    let (_, session) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({ "workdir": workdir.display().to_string(), "prompt": "first" })),
+    )
+    .await;
+    let id = session["id"].as_str().unwrap().to_string();
+
+    // While running (the stub sleeps), switching is rejected.
+    let (status, _) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{id}/mode"),
+        Some(json!({ "mode": "plan" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Stop it, then switch: the mode updates and the session is returned.
+    let (_, stopped) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{id}/cancel"),
+        None,
+    )
+    .await;
+    assert_eq!(stopped["status"], "cancelled");
+    let (status, switched) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{id}/mode"),
+        Some(json!({ "mode": "explore" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(switched["mode"], "explore");
+
+    // The new mode persists on the row (list + detail see it).
+    let (_, detail) = request(&app, Method::GET, &format!("/api/sessions/{id}"), None).await;
+    assert_eq!(detail["mode"], "explore");
+
+    // Unknown mode -> 400; unknown session -> 404.
+    let (status, _) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{id}/mode"),
+        Some(json!({ "mode": "nope" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = request(
+        &app,
+        Method::POST,
+        "/api/sessions/nope/mode",
+        Some(json!({ "mode": "plan" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 fn process_is_alive(pid: u32) -> bool {

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
-import type { ModelInfo, Session } from '../api'
-import { createSession, getModels } from '../api'
+import type { Mode, ModeInfo, ModelInfo, Session } from '../api'
+import { createSession, getModels, getModes } from '../api'
 import Composer from './Composer'
 
 interface Props {
@@ -10,17 +10,20 @@ interface Props {
 }
 
 /** Placeholder session shown after clicking "New session": a workdir field,
- *  a model picker plus the chat composer. The backend session is only
- *  created on Send. */
+ *  a model picker, a mode picker plus the chat composer. The backend session
+ *  is only created on Send. */
 export default function DraftSession({ defaultWorkdir, onCreated }: Props) {
   const [workdir, setWorkdir] = useState(defaultWorkdir)
   const [models, setModels] = useState<ModelInfo[]>([])
   const [model, setModel] = useState('')
+  const [modes, setModes] = useState<ModeInfo[]>([])
+  const [mode, setMode] = useState<Mode>('build')
   const [sending, setSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   // Load the configured models; the first one is the default and is
-  // pre-selected so "just type and send" uses the default model.
+  // pre-selected so "just type and send" uses the default model. The modes
+  // are static (build is the default) but fetched for their descriptions.
   useEffect(() => {
     let cancelled = false
     getModels()
@@ -32,10 +35,22 @@ export default function DraftSession({ defaultWorkdir, onCreated }: Props) {
       .catch(() => {
         // Gateway unreachable; sending will surface the error.
       })
+    getModes()
+      .then((list) => {
+        if (cancelled) return
+        setModes(list)
+        const build = list.find((m) => m.name === 'build')
+        if (build) setMode(build.name)
+      })
+      .catch(() => {
+        // Gateway unreachable; build stays selected.
+      })
     return () => {
       cancelled = true
     }
   }, [])
+
+  const selectedMode = modes.find((m) => m.name === mode)
 
   const handleSend = async (text: string): Promise<boolean> => {
     if (!workdir.trim()) {
@@ -45,7 +60,7 @@ export default function DraftSession({ defaultWorkdir, onCreated }: Props) {
     setSending(true)
     setError(null)
     try {
-      const session = await createSession(workdir.trim(), text, model || undefined)
+      const session = await createSession(workdir.trim(), text, model || undefined, mode)
       onCreated(session)
       return true
     } catch (err) {
@@ -61,7 +76,7 @@ export default function DraftSession({ defaultWorkdir, onCreated }: Props) {
         <div>
           <h2>New session</h2>
           <p className="muted">
-            Set the working directory and model, then send your first message.
+            Set the working directory, model and mode, then send your first message.
           </p>
         </div>
       </header>
@@ -94,6 +109,32 @@ export default function DraftSession({ defaultWorkdir, onCreated }: Props) {
               ))
             )}
           </select>
+        </label>
+        <label className="field">
+          <span className="field-label">Mode</span>
+          <select
+            value={mode}
+            onChange={(e) => setMode(e.target.value as Mode)}
+            disabled={sending}
+          >
+            {modes.length === 0 ? (
+              <option value="build">build</option>
+            ) : (
+              modes.map((m) => (
+                <option key={m.name} value={m.name}>
+                  {m.label}
+                </option>
+              ))
+            )}
+          </select>
+          {selectedMode && (
+            <span className="mode-hint">
+              {selectedMode.description}
+              {selectedMode.writable === 'scratch only'
+                ? ' Codebase stays read-only.'
+                : ''}
+            </span>
+          )}
         </label>
         {error && <p className="form-error">{error}</p>}
       </div>

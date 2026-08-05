@@ -1,34 +1,42 @@
-//! System prompt construction: a fixed harness preamble, the global
-//! instructions + skills from the global agents dir (`MO_AGENTS_DIR`,
+//! System prompt construction: a fixed harness preamble (mode-aware), the
+//! global instructions + skills from the global agents dir (`MO_AGENTS_DIR`,
 //! default `$HOME/.agents`), and the contents of `<workdir>/AGENTS.md`.
+//!
+//! The caller journals the returned prompt as a `SystemPrompt` event on the
+//! session's first run; every later run reuses the journaled text verbatim,
+//! so this function runs once per session (mode changes and `AGENTS.md`
+//! edits mid-session never alter the system prompt).
 
 use std::path::Path;
 
-pub fn build_system_prompt(workdir: &Path, agents_dir: &Path, subagent_depth: u32) -> String {
+use mo_core::Mode;
+
+/// Build the system prompt for a session's first run.
+///
+/// `mode` frames the agent's job (Build = full access, Plan = plan only,
+/// Explore = investigate only) and `scratch` is the session scratch dir
+/// (`<data_dir>/sessions/<id>/tmp`) where non-Build modes may create/edit/
+/// remove files — the codebase stays read-only for them.
+pub fn build_system_prompt(
+    workdir: &Path,
+    agents_dir: &Path,
+    subagent_depth: u32,
+    mode: Mode,
+    scratch: &Path,
+) -> String {
     let mut prompt = String::new();
     prompt.push_str(
         "You are an autonomous coding agent running inside the mo harness. \
          You complete tasks by reasoning and by calling the provided tools.\n\n",
     );
+    prompt.push_str(&mode_framing(mode, workdir, scratch));
     prompt.push_str(&format!("Working directory: {}\n", workdir.display()));
     prompt.push_str(
         "You may read and write files only inside the working directory, except that \
          read_file may also read global skill folders (see \"Global skills\" below). \
          Never attempt to access files or run commands that escape it.\n\n",
     );
-    prompt.push_str(
-        "Tool usage rules:\n\
-         - When you need information, read files first.\n\
-         - Create new files with create_file (the parent directory must already\n\
-           exist and the file must not exist); modify existing files with\n\
-           edit_file.\n\
-         - Make precise edits: provide a unique old_string that appears exactly once\n\
-           (use replace_all only when every occurrence should change).\n\
-         - Use bash for anything outside the file tools: builds, tests, git, etc.\n\
-         - After making changes, verify them with read_file or bash before finishing.\n\
-         - Report your final answer as a plain text message when no more tool calls\n\
-           are needed.\n\n",
-    );
+    prompt.push_str(&tool_usage_rules(mode, scratch));
     if subagent_depth > 0 {
         prompt.push_str(&format!(
             "You are a subagent (nesting depth {}) spawned by another agent.\n\
@@ -94,16 +102,92 @@ pub fn build_system_prompt(workdir: &Path, agents_dir: &Path, subagent_depth: u3
     prompt
 }
 
+/// The mode-specific framing paragraph, right after the harness intro.
+fn mode_framing(mode: Mode, workdir: &Path, scratch: &Path) -> String {
+    match mode {
+        Mode::Build => "You are in Build mode: you can modify the codebase (create/edit/remove \
+             files), run commands, and use subagents and skills to get the job done.\n\n"
+            .to_string(),
+        Mode::Plan => format!(
+            "You are in Plan mode. Your job is to produce a clear, actionable \
+             implementation plan — do not implement anything yet.\n\
+             The codebase ({}) is READ-ONLY: create/edit/remove are denied there.\n\
+             You may create, edit and remove temporary files under the session scratch \
+             directory {} (use absolute paths).\n\
+             bash is available but treat it as read-only (a soft restriction): use it to \
+             gather facts (builds, tests, greps), not to change anything.\n\
+             Finish with the plan as your final answer.\n\n",
+            workdir.display(),
+            scratch.display()
+        ),
+        Mode::Explore => format!(
+            "You are in Explore mode. Investigate the codebase to answer the user's \
+             question or gather facts for a parent agent.\n\
+             The codebase ({}) is READ-ONLY: create/edit/remove are denied there.\n\
+             You may create, edit and remove temporary files under the session scratch \
+             directory {} (use absolute paths).\n\
+             Prefer read_file; run read-only bash commands when helpful.\n\
+             Report concise findings as your final answer.\n\n",
+            workdir.display(),
+            scratch.display()
+        ),
+    }
+}
+
+/// The tool-usage rules paragraph. Non-Build modes drop the create/edit
+/// bullets in favour of the scratch-dir rule, so the model is never told to
+/// do something the sandbox denies.
+fn tool_usage_rules(mode: Mode, scratch: &Path) -> String {
+    match mode {
+        Mode::Build => "Tool usage rules:\n\
+             - When you need information, read files first.\n\
+             - Create new files with create_file (the parent directory must already\n\
+               exist and the file must not exist); modify existing files with\n\
+               edit_file.\n\
+             - Make precise edits: provide a unique old_string that appears exactly once\n\
+               (use replace_all only when every occurrence should change).\n\
+             - Use bash for anything outside the file tools: builds, tests, git, etc.\n\
+             - After making changes, verify them with read_file or bash before finishing.\n\
+             - Report your final answer as a plain text message when no more tool calls\n\
+               are needed.\n\n"
+            .to_string(),
+        _ => format!(
+            "Tool usage rules:\n\
+             - When you need information, read files first.\n\
+             - create_file / edit_file / remove_file are allowed ONLY under the session\n\
+               scratch directory {} (absolute paths); the codebase is read-only and\n\
+               modifications there are denied.\n\
+             - Use bash for anything outside the file tools (builds, tests, git, ...),\n\
+               keeping it read-only.\n\
+             - Report your final answer as a plain text message when no more tool calls\n\
+               are needed.\n\n",
+            scratch.display()
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mo_core::Mode;
+
+    /// A scratch dir under the tempdir, as the worker creates it per session.
+    fn scratch(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let path = dir.path().join("data/sessions/s1/tmp");
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn prompt_for(mode: Mode, dir: &tempfile::TempDir, agents: &tempfile::TempDir) -> String {
+        build_system_prompt(dir.path(), agents.path(), 0, mode, &scratch(dir))
+    }
 
     #[test]
     fn includes_workdir_and_agents_md() {
         let dir = tempfile::tempdir().unwrap();
         let agents = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), "Use uv for Python.\n").unwrap();
-        let prompt = build_system_prompt(dir.path(), agents.path(), 0);
+        let prompt = prompt_for(Mode::Build, &dir, &agents);
         assert!(prompt.contains(&dir.path().display().to_string()));
         assert!(prompt.contains("Use uv for Python."));
         assert!(prompt.contains("only inside the working directory"));
@@ -113,7 +197,7 @@ mod tests {
     fn no_agents_md_is_fine() {
         let dir = tempfile::tempdir().unwrap();
         let agents = tempfile::tempdir().unwrap();
-        let prompt = build_system_prompt(dir.path(), agents.path(), 2);
+        let prompt = build_system_prompt(dir.path(), agents.path(), 2, Mode::Build, &scratch(&dir));
         assert!(prompt.contains("subagent (nesting depth 2)"));
     }
 
@@ -122,7 +206,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let agents = tempfile::tempdir().unwrap();
         std::fs::write(agents.path().join("AGENTS.md"), "Never commit to main.\n").unwrap();
-        let prompt = build_system_prompt(dir.path(), agents.path(), 0);
+        let prompt = prompt_for(Mode::Build, &dir, &agents);
         assert!(prompt.contains("Global instructions from"));
         assert!(prompt.contains("Never commit to main."));
         // Global instructions come before project instructions.
@@ -154,7 +238,7 @@ mod tests {
             "---\nname: nested-skill\ndescription: \"A nested skill.\"\n---\n# Nested skill body\n",
         )
         .unwrap();
-        let prompt = build_system_prompt(dir.path(), agents.path(), 0);
+        let prompt = prompt_for(Mode::Build, &dir, &agents);
         assert!(prompt.contains("Global skills available from"));
         assert!(prompt.contains("### top-skill"));
         assert!(prompt.contains("Description: A top-level skill."));
@@ -175,10 +259,47 @@ mod tests {
         let skill = agents.path().join("plain-skill");
         std::fs::create_dir_all(&skill).unwrap();
         std::fs::write(skill.join("SKILL.md"), "# Just instructions\n").unwrap();
-        let prompt = build_system_prompt(dir.path(), agents.path(), 0);
+        let prompt = prompt_for(Mode::Build, &dir, &agents);
         assert!(prompt.contains("### plain-skill"));
         assert!(prompt.contains("Description: (no description)"));
         // The body is not inlined into the system prompt.
         assert!(!prompt.contains("# Just instructions"));
+    }
+
+    #[test]
+    fn build_mode_mentions_full_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = tempfile::tempdir().unwrap();
+        let prompt = prompt_for(Mode::Build, &dir, &agents);
+        assert!(prompt.contains("Build mode"));
+        // Build keeps the create/edit instructions.
+        assert!(prompt.contains("modify existing files"));
+        assert!(prompt.contains("edit_file"));
+    }
+
+    #[test]
+    fn plan_mode_frames_plan_only_and_readonly_codebase() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = tempfile::tempdir().unwrap();
+        let prompt = prompt_for(Mode::Plan, &dir, &agents);
+        let scratch = scratch(&dir);
+        assert!(prompt.contains("Plan mode"));
+        assert!(prompt.contains("implementation plan"));
+        assert!(prompt.contains("READ-ONLY"));
+        assert!(prompt.contains(&scratch.display().to_string()));
+        assert!(prompt.contains("absolute paths"));
+        // The create/edit instructions are replaced by the scratch rule.
+        assert!(!prompt.contains("modify existing files with edit_file"));
+    }
+
+    #[test]
+    fn explore_mode_frames_investigation_and_readonly_codebase() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = tempfile::tempdir().unwrap();
+        let prompt = prompt_for(Mode::Explore, &dir, &agents);
+        assert!(prompt.contains("Explore mode"));
+        assert!(prompt.contains("READ-ONLY"));
+        assert!(prompt.contains("Prefer read_file"));
+        assert!(prompt.contains(&scratch(&dir).display().to_string()));
     }
 }

@@ -1,4 +1,4 @@
-import type { SessionStatus } from '../api'
+import type { Mode, SessionStatus } from '../api'
 
 interface Props {
   status: SessionStatus
@@ -8,18 +8,32 @@ interface Props {
   /** The model's configured context window at session time; null =
    *  unlimited (only the current length is shown). */
   contextWindow: number | null
+  /** The session's current mode (build / plan / explore). */
+  mode: Mode
+  /** True when the mode picker may be used (the session is not running);
+   *  switching only changes the write sandbox of subsequent runs — the
+   *  journaled system prompt never changes. */
+  modeEnabled: boolean
+  onSwitchMode: (mode: Mode) => void
 }
 
 const nf = new Intl.NumberFormat('en-US')
 
 /** The session status bar pinned to the bottom of the session view.
  *
- *  Currently shows the session status badge plus the context length in
- *  tokens (from the LLM API's `usage.prompt_tokens`, journaled by the
- *  worker as `context_usage` events). When a context window is configured
- *  the length is rendered against it with a thin progress bar; additional
- *  status items (model, elapsed time, ...) can be appended as siblings. */
-export default function StatusBar({ status, tokens, contextWindow }: Props) {
+ *  Shows the mode picker (badge + switcher), the session status badge, and
+ *  the context length in tokens (from the LLM API's `usage.prompt_tokens`,
+ *  journaled by the worker as `context_usage` events). When a context
+ *  window is configured the length is rendered against it with a thin
+ *  progress bar; additional status items can be appended as siblings. */
+export default function StatusBar({
+  status,
+  tokens,
+  contextWindow,
+  mode,
+  modeEnabled,
+  onSwitchMode,
+}: Props) {
   const pct =
     tokens !== null && contextWindow !== null && contextWindow > 0
       ? Math.min(100, Math.round((tokens / contextWindow) * 100))
@@ -28,6 +42,19 @@ export default function StatusBar({ status, tokens, contextWindow }: Props) {
 
   return (
     <footer className="status-bar">
+      <label className="mode-switch" title="Session mode — switching changes only the write sandbox of subsequent runs; the system prompt stays as journaled at the first run">
+        <span className="context-label">mode</span>
+        <select
+          className={`mode-select mode-${mode}`}
+          value={mode}
+          onChange={(e) => onSwitchMode(e.target.value as Mode)}
+          disabled={!modeEnabled}
+        >
+          <option value="build">build</option>
+          <option value="plan">plan</option>
+          <option value="explore">explore</option>
+        </select>
+      </label>
       <span className={`badge badge-${status}`}>{status}</span>
       <span className="context-usage" title="Context length reported by the LLM API (prompt tokens)">
         {tokens === null ? (

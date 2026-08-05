@@ -4,6 +4,7 @@
 pub mod config;
 pub mod db;
 pub mod journal;
+pub mod modes;
 pub mod types;
 
 pub use config::{
@@ -11,6 +12,7 @@ pub use config::{
 };
 pub use db::{DbError, open as open_db};
 pub use journal::{JournalError, JournalWriter, read_events, read_events_after};
+pub use modes::{MODES, ModeInfo, TOOL_NAMES};
 pub use types::{
-    JournalEvent, JournalEventKind, JournalMessage, Session, SessionStatus, ToolCallInfo,
+    JournalEvent, JournalEventKind, JournalMessage, Mode, Session, SessionStatus, ToolCallInfo,
 };

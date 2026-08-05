@@ -38,29 +38,63 @@ pub struct AgentConfig {
 /// The caller is responsible for DB status transitions.
 pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Result<()> {
     let chat_client = ChatClient::init(config.model_base_url.clone(), config.auth_token.clone());
-    let system_prompt =
-        build_system_prompt(&config.workdir, &config.agents_dir, config.subagent_depth);
+
+    // The session scratch dir: non-Build modes may create/edit/remove files
+    // here while the codebase stays read-only. Created up front so its path
+    // is real when the system prompt (which mentions it) is journaled.
+    let scratch = config
+        .data_dir
+        .join("sessions")
+        .join(&config.session.id)
+        .join("tmp");
+    std::fs::create_dir_all(&scratch).context("failed to create session scratch dir")?;
+    let scratch = scratch
+        .canonicalize()
+        .context("failed to resolve session scratch dir")?;
+
     // The conversation context is the journal history: user messages are
     // journaled by the gateway before the worker is spawned, and assistant /
-    // tool messages by previous runs of this session. Rebuilding the context
-    // from the journal makes every run — the first message and any followups
-    // on a completed session — a natural continuation of the same thread.
-    let mut messages = vec![ChatMessage {
-        role: "system".to_string(),
-        content: ChatMessageContentValue::Text(system_prompt),
-        reasoning_content: None,
-        tool_call_id: None,
-        tool_calls: None,
-    }];
-    messages.extend(history_from_journal(Path::new(
-        &config.session.journal_path,
-    ))?);
+    // tool messages by previous runs of this session. The system prompt is
+    // journaled on the first run (as a `SystemPrompt` event) and reused
+    // verbatim on every later run — never rebuilt, so mid-session changes
+    // to `AGENTS.md`, skills or the mode never invalidate it (and the same
+    // system text is sent to the LLM on every run, which is prompt-cache
+    // friendly).
+    let (journaled_system, mut messages) =
+        history_from_journal(Path::new(&config.session.journal_path))?;
+    let system_prompt = match journaled_system {
+        Some(prompt) => prompt,
+        None => {
+            let prompt = build_system_prompt(
+                &config.workdir,
+                &config.agents_dir,
+                config.subagent_depth,
+                config.session.mode,
+                &scratch,
+            );
+            journal.append(JournalEventKind::SystemPrompt {
+                content: prompt.clone(),
+            })?;
+            prompt
+        }
+    };
+    messages.insert(
+        0,
+        ChatMessage {
+            role: "system".to_string(),
+            content: ChatMessageContentValue::Text(system_prompt),
+            reasoning_content: None,
+            tool_call_id: None,
+            tool_calls: None,
+        },
+    );
     let tools = tools::tool_definitions();
     let tool_ctx = ToolContext {
         workdir: config.workdir.clone(),
         data_dir: config.data_dir.clone(),
         agents_dir: config.agents_dir.clone(),
         session: config.session.clone(),
+        scratch,
         subagent_depth: config.subagent_depth,
         model_base_url: config.model_base_url.clone(),
         model_name: config.model_name.clone(),
@@ -139,11 +173,14 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
     }
 }
 
-/// Rebuild the chat context from a session journal. `message` events map
-/// directly to user/assistant messages (tool calls included); `tool_result`
-/// events become the `tool`-role messages that must follow an assistant tool
-/// call. The journal interleaves them in the correct order, so a completed
-/// session can be resumed exactly where it left off.
+/// Rebuild the chat context from a session journal, returning the journaled
+/// system prompt (if any) separately from the chat messages.
+///
+/// `message` events map directly to user/assistant messages (tool calls
+/// included); `tool_result` events become the `tool`-role messages that must
+/// follow an assistant tool call. The journal interleaves them in the
+/// correct order, so a completed session can be resumed exactly where it
+/// left off.
 ///
 /// A worker that died or was stopped mid-tool leaves the journal ending
 /// with an assistant `tool_calls` message that no `tool_result` ever
@@ -151,11 +188,17 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
 /// results that followed it), because the model API rejects `tool_calls`
 /// without matching tool messages — a followup on a killed session would
 /// otherwise fail with "insufficient tool messages following tool_calls".
-fn history_from_journal(journal_path: &Path) -> Result<Vec<ChatMessage>> {
+fn history_from_journal(journal_path: &Path) -> Result<(Option<String>, Vec<ChatMessage>)> {
     let events = mo_core::read_events(journal_path).context("failed to read session journal")?;
+    let mut system_prompt: Option<String> = None;
     let mut messages = Vec::new();
     for event in events {
         match event.kind {
+            JournalEventKind::SystemPrompt { content } => {
+                // Session metadata, not a chat message; the caller prepends
+                // it as the system message.
+                system_prompt = Some(content);
+            }
             JournalEventKind::Message(m) => messages.push(ChatMessage {
                 role: m.role,
                 content: ChatMessageContentValue::Text(m.content),
@@ -201,7 +244,7 @@ fn history_from_journal(journal_path: &Path) -> Result<Vec<ChatMessage>> {
         cleaned.push(messages[i].clone());
         i += 1;
     }
-    Ok(cleaned)
+    Ok((system_prompt, cleaned))
 }
 
 /// True when the assistant message at `idx` had every tool call answered by
@@ -361,7 +404,7 @@ mod tests {
     };
 
     use axum::{Router, routing::post};
-    use mo_core::{SessionStatus, db, open_db};
+    use mo_core::{Mode, SessionStatus, db, open_db};
     use serde_json::{Value, json};
 
     fn delta_role(role: &str) -> Value {
@@ -426,6 +469,7 @@ mod tests {
             prompt: "Read notes.txt and tell me what it says.".to_string(),
             model: "mock-model".to_string(),
             status: SessionStatus::Pending,
+            mode: Mode::Build,
             pid: None,
             journal_path: journal_path.display().to_string(),
             created_at: now.clone(),
@@ -489,7 +533,8 @@ mod tests {
             .unwrap();
         drop(journal);
 
-        let messages = history_from_journal(&path).unwrap();
+        let (system, messages) = history_from_journal(&path).unwrap();
+        assert!(system.is_none(), "no system prompt journaled here");
         assert_eq!(messages.len(), 2, "messages: {messages:#?}");
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content.to_string(), "first message");
@@ -552,7 +597,8 @@ mod tests {
             .unwrap();
         drop(journal);
 
-        let messages = history_from_journal(&path).unwrap();
+        let (system, messages) = history_from_journal(&path).unwrap();
+        assert!(system.is_none(), "no system prompt journaled here");
         assert_eq!(messages.len(), 4, "messages: {messages:#?}");
         assert_eq!(messages[1].role, "assistant");
         assert!(
@@ -692,81 +738,136 @@ mod tests {
             .unwrap();
         run_agent(agent_cfg, &mut journal).await.unwrap();
 
-        // Journal sequence: user message, context_usage (request 1),
-        // assistant(tool call), tool_call_start, tool_result, then the final
-        // answer streamed as reasoning deltas followed by content deltas,
-        // context_usage (request 2), then the assembled assistant message.
+        // Journal sequence: user message, the journaled system prompt, then
+        // context_usage (request 1), assistant(tool call), tool_call_start,
+        // tool_result, the final answer streamed as reasoning deltas
+        // followed by content deltas, context_usage (request 2), and the
+        // assembled assistant message.
         let events = mo_core::read_events(std::path::Path::new(&session.journal_path)).unwrap();
-        assert_eq!(events.len(), 12, "events: {events:#?}");
+        assert_eq!(events.len(), 13, "events: {events:#?}");
         let kinds: Vec<&JournalEventKind> = events.iter().map(|e| &e.kind).collect();
         assert!(
             matches!(kinds[0], JournalEventKind::Message(m) if m.role == "user" && m.content.contains("Read notes.txt"))
+        );
+        // The system prompt is journaled once, on the first run, with the
+        // session's mode framing.
+        assert!(
+            matches!(kinds[1], JournalEventKind::SystemPrompt { content } if content.contains("Build mode") && content.contains("Global rule: answer in lowercase.")),
+            "expected journaled Build-mode system prompt, got: {:?}",
+            kinds[1]
         );
         // Each LLM call journals the API-reported context length against the
         // configured window; the first call's count is smaller than the
         // second's (the tool round-trip grew the context).
         assert_eq!(
-            kinds[1],
+            kinds[2],
             &JournalEventKind::ContextUsage {
                 tokens: 30,
                 context_window: Some(4096),
             }
         );
         assert!(
-            matches!(kinds[2], JournalEventKind::Message(m) if m.role == "assistant" && m.tool_calls.as_ref().is_some_and(|t| t.len() == 1))
+            matches!(kinds[3], JournalEventKind::Message(m) if m.role == "assistant" && m.tool_calls.as_ref().is_some_and(|t| t.len() == 1))
         );
         assert!(
-            matches!(kinds[3], JournalEventKind::ToolCallStart { name, .. } if name == "read_file")
+            matches!(kinds[4], JournalEventKind::ToolCallStart { name, .. } if name == "read_file")
         );
         assert!(
-            matches!(kinds[4], JournalEventKind::ToolResult { ok: true, output, .. } if output.contains("hello world from notes"))
+            matches!(kinds[5], JournalEventKind::ToolResult { ok: true, output, .. } if output.contains("hello world from notes"))
         );
         // Token-by-token preview: reasoning deltas first (empty content),
         // then the content deltas assembling the final answer.
         assert_eq!(
-            kinds[5],
+            kinds[6],
             &JournalEventKind::MessageDelta {
                 content: String::new(),
                 reasoning_content: Some("Let me recall: ".to_string()),
             }
         );
         assert_eq!(
-            kinds[6],
+            kinds[7],
             &JournalEventKind::MessageDelta {
                 content: String::new(),
                 reasoning_content: Some("notes say hello.".to_string()),
             }
         );
         assert_eq!(
-            kinds[7],
+            kinds[8],
             &JournalEventKind::MessageDelta {
                 content: "The file says: ".to_string(),
                 reasoning_content: None,
             }
         );
         assert_eq!(
-            kinds[8],
+            kinds[9],
             &JournalEventKind::MessageDelta {
                 content: "hello world ".to_string(),
                 reasoning_content: None,
             }
         );
         assert_eq!(
-            kinds[9],
+            kinds[10],
             &JournalEventKind::MessageDelta {
                 content: "from notes.\n".to_string(),
                 reasoning_content: None,
             }
         );
         assert_eq!(
-            kinds[10],
+            kinds[11],
             &JournalEventKind::ContextUsage {
                 tokens: 48,
                 context_window: Some(4096),
             }
         );
         assert!(
-            matches!(kinds[11], JournalEventKind::Message(m) if m.role == "assistant" && m.content.contains("hello world from notes") && m.reasoning_content.as_deref() == Some("Let me recall: notes say hello."))
+            matches!(kinds[12], JournalEventKind::Message(m) if m.role == "assistant" && m.content.contains("hello world from notes") && m.reasoning_content.as_deref() == Some("Let me recall: notes say hello."))
+        );
+    }
+
+    /// A second run on the same journal must reuse the journaled system
+    /// prompt verbatim (never rebuild or re-journal it) and must send it as
+    /// the first message, so the LLM sees the exact same system text on
+    /// every run (prompt-cache friendly).
+    #[test]
+    fn history_reuses_journaled_system_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let mut journal = JournalWriter::open(&path).unwrap();
+        journal
+            .append(JournalEventKind::Message(JournalMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+                reasoning_content: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }))
+            .unwrap();
+        let prompt = "You are in Build mode. [stale copy that must survive]";
+        journal
+            .append(JournalEventKind::SystemPrompt {
+                content: prompt.to_string(),
+            })
+            .unwrap();
+        journal
+            .append(JournalEventKind::Message(JournalMessage {
+                role: "assistant".to_string(),
+                content: "done".to_string(),
+                reasoning_content: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }))
+            .unwrap();
+        drop(journal);
+
+        let (system, messages) = history_from_journal(&path).unwrap();
+        assert_eq!(system.as_deref(), Some(prompt));
+        assert_eq!(messages.len(), 2, "messages: {messages:#?}");
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[1].role, "assistant");
+        // The system prompt is session metadata: it never appears inline.
+        assert!(
+            !messages.iter().any(|m| m.role == "system"),
+            "journaled system prompt must not appear as a chat message"
         );
     }
 }

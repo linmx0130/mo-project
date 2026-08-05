@@ -11,7 +11,7 @@ use axum::{
     routing::{get, post},
 };
 use mo_core::{
-    JournalEvent, JournalEventKind, JournalMessage, JournalWriter, Session, SessionStatus, db,
+    JournalEvent, JournalEventKind, JournalMessage, JournalWriter, Mode, Session, SessionStatus, db,
 };
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
@@ -29,6 +29,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/", get(root))
         .route("/api/meta", get(meta))
         .route("/api/models", get(list_models))
+        .route("/api/modes", get(list_modes))
         .route("/api/sessions", post(create_session).get(list_sessions))
         .route(
             "/api/sessions/{id}",
@@ -37,6 +38,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/history", get(history))
         .route("/api/sessions/{id}/events", get(sse::events))
         .route("/api/sessions/{id}/messages", post(send_message))
+        .route("/api/sessions/{id}/mode", post(switch_mode))
         .route("/api/sessions/{id}/cancel", post(cancel))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -93,6 +95,13 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<Vec<ModelInfo>>
     )
 }
 
+/// GET /api/modes — the built-in session modes (name, label, description,
+/// tool set, write policy) for the new-session picker and the status-bar
+/// switcher.
+async fn list_modes() -> Json<Vec<mo_core::ModeInfo>> {
+    Json(mo_core::MODES.to_vec())
+}
+
 #[derive(Deserialize)]
 struct CreateSessionRequest {
     workdir: String,
@@ -100,6 +109,10 @@ struct CreateSessionRequest {
     /// Model name from `GET /api/models`; empty/absent picks the default
     /// (first) model.
     model: Option<String>,
+    /// Session mode from `GET /api/modes`; empty/absent picks `build`.
+    /// The mode frames the system prompt journaled on the first run and
+    /// the write sandbox of every run.
+    mode: Option<String>,
 }
 
 /// POST /api/sessions — validate workdir, insert the session row, spawn the
@@ -121,6 +134,14 @@ async fn create_session(
     let workdir = workdir
         .canonicalize()
         .map_err(|e| ApiError::bad_request(format!("cannot resolve workdir: {e}")))?;
+    // Resolve the mode: the client picks one by name from /api/modes;
+    // absent/empty means `build` (the default, and the legacy behavior).
+    let mode = match &payload.mode {
+        Some(raw) if !raw.trim().is_empty() => {
+            raw.parse::<Mode>().map_err(ApiError::bad_request)?
+        }
+        _ => Mode::Build,
+    };
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
@@ -154,6 +175,7 @@ async fn create_session(
         prompt: crate::title::placeholder_title(),
         model: model.name.clone(),
         status: SessionStatus::Pending,
+        mode,
         pid: None,
         journal_path: journal_path.display().to_string(),
         created_at: now.clone(),
@@ -289,6 +311,48 @@ async fn send_message(
     spawn_and_patch(&state, &mut session);
 
     Ok((StatusCode::ACCEPTED, Json(session)))
+}
+
+#[derive(Deserialize)]
+struct SwitchModeRequest {
+    mode: String,
+}
+
+/// POST /api/sessions/:id/mode — switch the session's mode once it is
+/// terminal. The system prompt is journaled at the first run and is never
+/// rebuilt, so switching only changes the write-sandbox policy of
+/// subsequent runs (Build = codebase writable; Plan/Explore = codebase
+/// read-only, writes go to the session scratch dir).
+async fn switch_mode(
+    State(state): State<Arc<AppState>>,
+    PathParam(id): PathParam<String>,
+    Json(payload): Json<SwitchModeRequest>,
+) -> ApiResult<Json<Session>> {
+    let mode = payload
+        .mode
+        .parse::<Mode>()
+        .map_err(ApiError::bad_request)?;
+    let status = {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        match db::get_session(&conn, &id).map_err(ApiError::internal)? {
+            Some(session) => session.status,
+            None => return Err(ApiError::not_found("session not found")),
+        }
+    };
+    if status == SessionStatus::Running || status == SessionStatus::Pending {
+        return Err(ApiError::conflict(
+            "cannot switch mode while the session is running",
+        ));
+    }
+    {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::update_mode(&conn, &id, mode).map_err(ApiError::internal)?;
+    }
+    let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+    let session = db::get_session(&conn, &id)
+        .map_err(ApiError::internal)?
+        .expect("session row exists");
+    Ok(Json(session))
 }
 
 /// GET /api/sessions — newest first.

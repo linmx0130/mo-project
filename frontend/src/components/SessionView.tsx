@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import type { JournalEvent, JournalMessage, Session, SessionStatus } from '../api'
-import { cancelSession, getHistory, getSession, postMessage } from '../api'
+import type { JournalEvent, JournalMessage, Mode, Session, SessionStatus } from '../api'
+import { cancelSession, getHistory, getSession, postMessage, switchMode } from '../api'
 import Composer from './Composer'
 import CopyButton from './CopyButton'
 import StatusBar from './StatusBar'
@@ -137,6 +137,10 @@ function buildTimeline(events: JournalEvent[]): TimelineItem[] {
         }
         break
       }
+      case 'system_prompt':
+        // Session metadata (the system prompt journaled on the first run);
+        // never rendered as a chat message.
+        break
       default:
         items.push({ type: 'event', event: ev })
     }
@@ -150,6 +154,17 @@ export default function SessionView({ session, onStatusChange }: Props) {
   const [error, setError] = useState<string | null>(null)
   const [cancelling, setCancelling] = useState(false)
   const [sending, setSending] = useState(false)
+  // The current mode, as shown/switched in the status bar. Switching only
+  // changes the write sandbox of subsequent runs — the journaled system
+  // prompt never changes. Local state is the source of truth while the
+  // switcher is used; when the prop reports a different mode (e.g. the
+  // sidebar refresh after a switch lands), adjust state during render.
+  const [mode, setMode] = useState<Mode>(session.mode)
+  const [prevMode, setPrevMode] = useState<Mode>(session.mode)
+  if (prevMode !== session.mode) {
+    setPrevMode(session.mode)
+    setMode(session.mode)
+  }
   // Bumped on every send: a terminal session's SSE stream is closed, so a
   // followup must re-arm it to watch the new run.
   const [runId, setRunId] = useState(0)
@@ -250,6 +265,20 @@ export default function SessionView({ session, onStatusChange }: Props) {
       return false
     } finally {
       setSending(false)
+    }
+  }
+
+  /** Switch the session's mode (status-bar picker, terminal sessions only).
+   *  Only the write sandbox of subsequent runs changes — the journaled
+   *  system prompt never does. */
+  const handleModeSwitch = async (next: Mode) => {
+    if (next === mode || running) return
+    try {
+      const updated = await switchMode(session.id, next)
+      setMode(updated.mode)
+      onStatusChange()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
     }
   }
 
@@ -355,6 +384,9 @@ export default function SessionView({ session, onStatusChange }: Props) {
         status={status}
         tokens={contextUsage?.tokens ?? null}
         contextWindow={contextUsage?.context_window ?? null}
+        mode={mode}
+        modeEnabled={!running}
+        onSwitchMode={(next) => void handleModeSwitch(next)}
       />
     </div>
   )

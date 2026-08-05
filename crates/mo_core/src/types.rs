@@ -66,6 +66,51 @@ impl std::fmt::Display for SessionStatus {
     }
 }
 
+/// The session mode: a different system prompt (journaled once at the first
+/// run) and a different write sandbox. `Build` may modify the codebase;
+/// `Plan` and `Explore` treat the codebase as read-only and may only
+/// create/edit/remove files inside the session scratch dir. All modes share
+/// the same tool set — the restriction is *where* writes land, not whether
+/// the tools exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    Build,
+    Plan,
+    Explore,
+}
+
+impl Mode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Mode::Build => "build",
+            Mode::Plan => "plan",
+            Mode::Explore => "explore",
+        }
+    }
+}
+
+impl FromStr for Mode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "build" => Ok(Mode::Build),
+            "plan" => Ok(Mode::Plan),
+            "explore" => Ok(Mode::Explore),
+            other => Err(format!(
+                "unknown mode: {other} (expected build, plan or explore)"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A session row. Timestamps are RFC3339 strings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Session {
@@ -75,6 +120,11 @@ pub struct Session {
     pub prompt: String,
     pub model: String,
     pub status: SessionStatus,
+    /// The session mode (see `Mode`): drives the system prompt journaled on
+    /// the first run and the write-sandbox policy of every run. Mutable via
+    /// `POST /api/sessions/:id/mode` — switching it changes only the write
+    /// sandbox; the journaled system prompt never changes.
+    pub mode: Mode,
     pub pid: Option<u32>,
     pub journal_path: String,
     pub created_at: String,
@@ -124,6 +174,16 @@ pub enum JournalEventKind {
         status: SessionStatus,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+    /// The session's system prompt, journaled by the worker on the first
+    /// run (before the first LLM call) and reused verbatim on every later
+    /// run — it is never rebuilt, so mid-session changes to `AGENTS.md`,
+    /// skills or the mode never invalidate it (and the same system text is
+    /// sent to the LLM on every run, which is prompt-cache friendly).
+    /// Readers (the worker's history rebuild and the frontend timeline)
+    /// treat it as session metadata, not as a chat message.
+    SystemPrompt {
+        content: String,
     },
     /// A streamed chunk of an assistant message (token-by-token preview).
     ///

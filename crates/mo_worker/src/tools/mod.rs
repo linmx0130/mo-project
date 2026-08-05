@@ -8,7 +8,7 @@ pub mod subagent;
 
 use std::path::PathBuf;
 
-use mo_core::{JournalEventKind, Session};
+use mo_core::{JournalEventKind, Mode, Session};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -23,13 +23,15 @@ pub const TOOL_LOAD_SKILL: &str = "load_skill";
 /// Everything a tool needs to run: the sandboxed workdir, the shared data
 /// dir (for subagent sessions), the global agents dir (passed down so
 /// subagents inject the same global instructions/skills), this worker's
-/// session row, and model config.
+/// session row, model config, and the session scratch dir (`<data_dir>/
+/// sessions/<id>/tmp`) where non-Build modes may create/edit/remove files.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub workdir: PathBuf,
     pub data_dir: PathBuf,
     pub agents_dir: PathBuf,
     pub session: Session,
+    pub scratch: PathBuf,
     pub subagent_depth: u32,
     pub model_base_url: String,
     pub model_name: String,
@@ -122,11 +124,12 @@ pub fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": TOOL_SPAWN_SUBAGENT,
-                "description": "Spawn a subagent (a nested agent session with the same working directory) to work on a self-contained subtask, and wait for its final answer. Depth is capped at 3.",
+                "description": "Spawn a subagent (a nested agent session with the same working directory) to work on a self-contained subtask, and wait for its final answer. Depth is capped at 3. The subagent runs in the given mode (default: this session's current mode) — build has full access; plan and explore keep the codebase read-only (writes go to the subagent's own scratch dir).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "prompt": { "type": "string", "description": "Self-contained instructions for the subagent." }
+                        "prompt": { "type": "string", "description": "Self-contained instructions for the subagent." },
+                        "mode": { "type": "string", "enum": ["build", "plan", "explore"], "description": "Mode for the subagent: build (default, full access), plan (plan-only, codebase read-only), explore (investigate, codebase read-only). Defaults to this session's current mode." }
                     },
                     "required": ["prompt"],
                     "additionalProperties": false
@@ -184,11 +187,32 @@ struct BashArgs {
 #[derive(Deserialize)]
 struct SpawnSubagentArgs {
     prompt: String,
+    /// Optional mode for the subagent (`build` | `plan` | `explore`);
+    /// defaults to this session's current mode.
+    mode: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct LoadSkillArgs {
     name: String,
+}
+
+/// The root a file-mutation tool may write under: the workdir in Build
+/// mode, the session scratch dir otherwise. In non-Build modes a path that
+/// resolves inside the codebase is denied up front with a mode-aware
+/// message (scratch writes use absolute paths under the scratch dir).
+fn write_root_for(ctx: &ToolContext, raw: &str) -> Result<PathBuf, String> {
+    if ctx.session.mode == Mode::Build {
+        return Ok(ctx.workdir.clone());
+    }
+    if fs::resolve_path(&ctx.workdir, raw).is_ok() {
+        return Err(format!(
+            "{} mode: the codebase is read-only; create/edit/remove is only allowed under {} (use an absolute path)",
+            ctx.session.mode.as_str(),
+            ctx.scratch.display()
+        ));
+    }
+    Ok(ctx.scratch.clone())
 }
 
 /// Execute one tool call. Returns the tool output (Ok) or a tool error
@@ -209,19 +233,21 @@ pub async fn execute_tool(
         TOOL_READ_FILE => {
             let args: ReadFileArgs = serde_json::from_str(arguments)
                 .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
-            // `read_file` may also read global skill folders, so pass the
-            // discovered skill folder paths as extra allowed roots.
-            let skill_roots: Vec<PathBuf> = crate::skills::discover_skills(&ctx.agents_dir)
+            // `read_file` may also read global skill folders (and the
+            // scratch dir), so pass those roots as extra allowed roots.
+            let mut roots: Vec<PathBuf> = crate::skills::discover_skills(&ctx.agents_dir)
                 .into_iter()
                 .map(|s| s.path)
                 .collect();
-            fs::read_file(&ctx.workdir, &args.path, &skill_roots)
+            roots.push(ctx.scratch.clone());
+            fs::read_file(&ctx.workdir, &args.path, &roots)
         }
         TOOL_EDIT_FILE => {
             let args: EditFileArgs = serde_json::from_str(arguments)
                 .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
+            let root = write_root_for(ctx, &args.path)?;
             fs::edit_file(
-                &ctx.workdir,
+                &root,
                 &args.path,
                 &args.old_string,
                 &args.new_string,
@@ -231,12 +257,14 @@ pub async fn execute_tool(
         TOOL_CREATE_FILE => {
             let args: CreateFileArgs = serde_json::from_str(arguments)
                 .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
-            fs::create_file(&ctx.workdir, &args.path, &args.content)
+            let root = write_root_for(ctx, &args.path)?;
+            fs::create_file(&root, &args.path, &args.content)
         }
         TOOL_REMOVE_FILE => {
             let args: RemoveFileArgs = serde_json::from_str(arguments)
                 .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
-            fs::remove_file(&ctx.workdir, &args.path)
+            let root = write_root_for(ctx, &args.path)?;
+            fs::remove_file(&root, &args.path)
         }
         TOOL_BASH => {
             let args: BashArgs = serde_json::from_str(arguments)
@@ -253,7 +281,13 @@ pub async fn execute_tool(
         TOOL_SPAWN_SUBAGENT => {
             let args: SpawnSubagentArgs = serde_json::from_str(arguments)
                 .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
-            subagent::spawn_subagent(ctx, &args.prompt).await
+            let mode = match args.mode {
+                Some(raw) => raw
+                    .parse::<Mode>()
+                    .map_err(|e| format!("invalid arguments for {name}: {e}"))?,
+                None => ctx.session.mode,
+            };
+            subagent::spawn_subagent(ctx, &args.prompt, mode).await
         }
         TOOL_LOAD_SKILL => {
             let args: LoadSkillArgs = serde_json::from_str(arguments)
@@ -267,8 +301,11 @@ pub async fn execute_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mo_core::Mode;
 
     fn test_ctx(agents_dir: PathBuf) -> ToolContext {
+        let scratch = PathBuf::from("/tmp/data/sessions/s/tmp");
+        std::fs::create_dir_all(&scratch).unwrap();
         ToolContext {
             workdir: PathBuf::from("/tmp"),
             data_dir: PathBuf::from("/tmp/data"),
@@ -280,6 +317,7 @@ mod tests {
                 prompt: "p".into(),
                 model: "m".into(),
                 status: mo_core::SessionStatus::Running,
+                mode: Mode::Build,
                 pid: None,
                 journal_path: "/tmp/j.jsonl".into(),
                 created_at: "now".into(),
@@ -287,6 +325,7 @@ mod tests {
                 heartbeat_at: None,
                 error: None,
             },
+            scratch,
             subagent_depth: 0,
             model_base_url: "http://localhost:1".into(),
             model_name: "m".into(),
@@ -359,5 +398,165 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("skill not found"), "got: {err}");
+    }
+
+    /// A plan/explore-mode context whose workdir is a real temp dir.
+    fn plan_ctx(dir: &tempfile::TempDir, mode: Mode) -> ToolContext {
+        let workdir = dir.path().join("work");
+        std::fs::create_dir_all(&workdir).unwrap();
+        std::fs::write(workdir.join("notes.txt"), "codebase\n").unwrap();
+        // Canonicalized, like `run_agent` resolves it in production (the
+        // read roots compare canonical paths).
+        let scratch = dir.path().join("data/sessions/s/tmp");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let scratch = scratch.canonicalize().unwrap();
+        ToolContext {
+            workdir,
+            data_dir: dir.path().join("data"),
+            agents_dir: dir.path().join("agents"),
+            session: Session {
+                id: "s".into(),
+                parent_id: None,
+                workdir: dir.path().join("work").display().to_string(),
+                prompt: "p".into(),
+                model: "m".into(),
+                status: mo_core::SessionStatus::Running,
+                mode,
+                pid: None,
+                journal_path: "/tmp/j.jsonl".into(),
+                created_at: "now".into(),
+                updated_at: "now".into(),
+                heartbeat_at: None,
+                error: None,
+            },
+            scratch,
+            subagent_depth: 0,
+            model_base_url: "http://localhost:1".into(),
+            model_name: "m".into(),
+            auth_token: None,
+        }
+    }
+
+    /// Non-Build modes deny codebase mutations but allow them in scratch.
+    #[tokio::test]
+    async fn plan_mode_denies_codebase_writes_and_allows_scratch() {
+        for mode in [Mode::Plan, Mode::Explore] {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = plan_ctx(&dir, mode);
+            let mut no_delta = |_: JournalEventKind| {};
+
+            // Writing into the codebase (relative or absolute) is denied
+            // with a mode-aware message.
+            for args in [
+                r#"{"path":"new.txt","content":"x"}"#.to_string(),
+                format!(
+                    r#"{{"path":"{}","content":"x"}}"#,
+                    ctx.workdir.join("new.txt").display()
+                ),
+            ] {
+                let err = execute_tool(&ctx, TOOL_CREATE_FILE, &args, "c1", &mut no_delta)
+                    .await
+                    .unwrap_err();
+                assert!(err.contains("read-only"), "got: {err}");
+                assert!(
+                    err.contains(&ctx.scratch.display().to_string()),
+                    "got: {err}"
+                );
+            }
+            // Editing an existing codebase file is denied too.
+            let err = execute_tool(
+                &ctx,
+                TOOL_EDIT_FILE,
+                r#"{"path":"notes.txt","old_string":"codebase","new_string":"hacked"}"#,
+                "c2",
+                &mut no_delta,
+            )
+            .await
+            .unwrap_err();
+            assert!(err.contains("read-only"), "got: {err}");
+            // Removing a codebase file is denied.
+            let err = execute_tool(
+                &ctx,
+                TOOL_REMOVE_FILE,
+                r#"{"path":"notes.txt"}"#,
+                "c3",
+                &mut no_delta,
+            )
+            .await
+            .unwrap_err();
+            assert!(err.contains("read-only"), "got: {err}");
+
+            // Absolute paths under the scratch dir work: create, read,
+            // edit, remove.
+            let scratch_file = ctx.scratch.join("draft.md");
+            let create_args = format!(
+                r#"{{"path":"{}","content":"draft"}}"#,
+                scratch_file.display()
+            );
+            execute_tool(&ctx, TOOL_CREATE_FILE, &create_args, "c4", &mut no_delta)
+                .await
+                .unwrap();
+            let read_args = format!(r#"{{"path":"{}"}}"#, scratch_file.display());
+            let out = execute_tool(&ctx, TOOL_READ_FILE, &read_args, "c5", &mut no_delta)
+                .await
+                .unwrap();
+            assert!(out.contains("draft"), "got: {out}");
+            let edit_args = format!(
+                r#"{{"path":"{}","old_string":"draft","new_string":"plan"}}"#,
+                scratch_file.display()
+            );
+            execute_tool(&ctx, TOOL_EDIT_FILE, &edit_args, "c6", &mut no_delta)
+                .await
+                .unwrap();
+            let remove_args = format!(r#"{{"path":"{}"}}"#, scratch_file.display());
+            execute_tool(&ctx, TOOL_REMOVE_FILE, &remove_args, "c7", &mut no_delta)
+                .await
+                .unwrap();
+            assert!(!scratch_file.exists());
+            // The codebase file is untouched.
+            assert_eq!(
+                std::fs::read_to_string(ctx.workdir.join("notes.txt")).unwrap(),
+                "codebase\n"
+            );
+        }
+    }
+
+    /// Build mode keeps writing to the codebase (and stays the default).
+    #[tokio::test]
+    async fn build_mode_writes_to_workdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = plan_ctx(&dir, Mode::Build);
+        let mut no_delta = |_: JournalEventKind| {};
+        execute_tool(
+            &ctx,
+            TOOL_CREATE_FILE,
+            r#"{"path":"new.txt","content":"built"}"#,
+            "c1",
+            &mut no_delta,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ctx.workdir.join("new.txt")).unwrap(),
+            "built"
+        );
+    }
+
+    /// The subagent tool validates its `mode` argument.
+    #[tokio::test]
+    async fn spawn_subagent_rejects_unknown_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = plan_ctx(&dir, Mode::Build);
+        let mut no_delta = |_: JournalEventKind| {};
+        let err = execute_tool(
+            &ctx,
+            TOOL_SPAWN_SUBAGENT,
+            r#"{"prompt":"do it","mode":"nope"}"#,
+            "c1",
+            &mut no_delta,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("invalid arguments"), "got: {err}");
     }
 }

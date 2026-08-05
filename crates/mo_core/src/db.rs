@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::types::{Session, SessionStatus};
+use crate::types::{Mode, Session, SessionStatus};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -50,13 +50,29 @@ fn migrate(conn: &Connection) -> Result<()> {
             error        TEXT NULL
         );",
     )?;
+    // Sessions created before modes existed have no `mode` column; add it
+    // (default `build`) so every row round-trips through `Session`.
+    let columns = table_columns(conn, "sessions")?;
+    if !columns.iter().any(|c| c == "mode") {
+        conn.execute_batch("ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'build';")?;
+    }
     Ok(())
+}
+
+/// The column names of a table (`PRAGMA table_info`), used by migrations to
+/// add new columns idempotently to databases created by older versions.
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(columns)
 }
 
 pub fn create_session(conn: &Connection, session: &Session) -> Result<()> {
     conn.execute(
-        "INSERT INTO sessions (id, parent_id, workdir, prompt, model, status, pid, journal_path, created_at, updated_at, heartbeat_at, error)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        "INSERT INTO sessions (id, parent_id, workdir, prompt, model, status, mode, pid, journal_path, created_at, updated_at, heartbeat_at, error)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             session.id,
             session.parent_id,
@@ -64,6 +80,7 @@ pub fn create_session(conn: &Connection, session: &Session) -> Result<()> {
             session.prompt,
             session.model,
             session.status.as_str(),
+            session.mode.as_str(),
             session.pid.map(|p| p as i64),
             session.journal_path,
             session.created_at,
@@ -78,7 +95,7 @@ pub fn create_session(conn: &Connection, session: &Session) -> Result<()> {
 pub fn get_session(conn: &Connection, id: &str) -> Result<Option<Session>> {
     let row = conn
         .query_row(
-            "SELECT id, parent_id, workdir, prompt, model, status, pid, journal_path, created_at, updated_at, heartbeat_at, error
+            "SELECT id, parent_id, workdir, prompt, model, status, mode, pid, journal_path, created_at, updated_at, heartbeat_at, error
              FROM sessions WHERE id = ?1",
             params![id],
             row_to_session,
@@ -89,7 +106,7 @@ pub fn get_session(conn: &Connection, id: &str) -> Result<Option<Session>> {
 
 pub fn list_sessions(conn: &Connection) -> Result<Vec<Session>> {
     let mut stmt = conn.prepare(
-        "SELECT id, parent_id, workdir, prompt, model, status, pid, journal_path, created_at, updated_at, heartbeat_at, error
+        "SELECT id, parent_id, workdir, prompt, model, status, mode, pid, journal_path, created_at, updated_at, heartbeat_at, error
          FROM sessions ORDER BY created_at DESC",
     )?;
     let rows = stmt
@@ -161,12 +178,27 @@ pub fn set_prompt(conn: &Connection, id: &str, prompt: &str) -> Result<()> {
     Ok(())
 }
 
+/// Switch the session's mode. Only the write-sandbox policy of subsequent
+/// runs is affected: the system prompt is journaled at the first run and is
+/// never rebuilt, so switching modes never changes it.
+pub fn update_mode(conn: &Connection, id: &str, mode: Mode) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET mode = ?1, updated_at = ?2 WHERE id = ?3",
+        params![mode.as_str(), chrono::Utc::now().to_rfc3339(), id],
+    )?;
+    Ok(())
+}
+
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     let status_str: String = row.get(5)?;
     let status = SessionStatus::from_str(&status_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, e.into())
     })?;
-    let pid: Option<i64> = row.get(6)?;
+    let mode_str: String = row.get(6)?;
+    let mode = Mode::from_str(&mode_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, e.into())
+    })?;
+    let pid: Option<i64> = row.get(7)?;
     Ok(Session {
         id: row.get(0)?,
         parent_id: row.get(1)?,
@@ -174,19 +206,20 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         prompt: row.get(3)?,
         model: row.get(4)?,
         status,
+        mode,
         pid: pid.map(|p| p as u32),
-        journal_path: row.get(7)?,
-        created_at: row.get(8)?,
-        updated_at: row.get(9)?,
-        heartbeat_at: row.get(10)?,
-        error: row.get(11)?,
+        journal_path: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+        heartbeat_at: row.get(11)?,
+        error: row.get(12)?,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::SessionStatus;
+    use crate::types::{Mode, SessionStatus};
 
     fn sample_session(id: &str) -> Session {
         let now = chrono::Utc::now().to_rfc3339();
@@ -197,6 +230,7 @@ mod tests {
             prompt: "do the thing".to_string(),
             model: "test-model".to_string(),
             status: SessionStatus::Pending,
+            mode: Mode::Build,
             pid: None,
             journal_path: format!("/tmp/work/{id}/journal.jsonl"),
             created_at: now.clone(),
@@ -297,5 +331,57 @@ mod tests {
         }
         let conn = open(&path).unwrap();
         assert!(get_session(&conn, "s1").unwrap().is_some());
+    }
+
+    #[test]
+    fn update_mode_switches_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("mo.db")).unwrap();
+        create_session(&conn, &sample_session("s1")).unwrap();
+
+        update_mode(&conn, "s1", Mode::Plan).unwrap();
+        let fetched = get_session(&conn, "s1").unwrap().unwrap();
+        assert_eq!(fetched.mode, Mode::Plan);
+        assert!(fetched.updated_at >= fetched.created_at);
+
+        // Unknown session is a no-op (no rows updated).
+        update_mode(&conn, "missing", Mode::Explore).unwrap();
+        assert!(get_session(&conn, "missing").unwrap().is_none());
+    }
+
+    /// A database created before modes existed (no `mode` column) must be
+    /// migrated in place: the column is added and existing rows default to
+    /// `build`, so old sessions keep working.
+    #[test]
+    fn migration_adds_mode_column_to_legacy_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mo.db");
+        // Create a legacy-schema DB by hand (no mode column) with one row.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY, parent_id TEXT NULL, workdir TEXT NOT NULL,
+                    prompt TEXT NOT NULL, model TEXT NOT NULL, status TEXT NOT NULL,
+                    pid INTEGER NULL, journal_path TEXT NOT NULL,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    heartbeat_at TEXT NULL, error TEXT NULL
+                );
+                INSERT INTO sessions (id, workdir, prompt, model, status, journal_path, created_at, updated_at)
+                VALUES ('legacy', '/tmp', 'old session', 'm', 'completed', '/tmp/j.jsonl', 't', 't');",
+            )
+            .unwrap();
+        }
+        // Opening through `open` migrates it.
+        let conn = open(&path).unwrap();
+        let fetched = get_session(&conn, "legacy").unwrap().unwrap();
+        assert_eq!(fetched.mode, Mode::Build, "legacy rows default to build");
+        assert_eq!(fetched.status, SessionStatus::Completed);
+
+        // Re-opening is idempotent (no duplicate column error).
+        drop(conn);
+        let conn = open(&path).unwrap();
+        let fetched = get_session(&conn, "legacy").unwrap().unwrap();
+        assert_eq!(fetched.mode, Mode::Build);
     }
 }

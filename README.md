@@ -25,9 +25,9 @@ Frontend  <->  Gateway Service  <->  Agent worker(s)
 
 | Piece | Role |
 | --- | --- |
-| `mo_core` | Shared types, JSONL journal I/O, SQLite metadata DB (WAL), TOML config |
-| `mo_gateway` | axum HTTP service: sessions CRUD, history, SSE live updates, worker spawn/kill (port 3031) |
-| `mo_worker` | One process per session: runs the LLM agent loop (via `nah_chat`) with tools `read_file`, `edit_file`, `create_file`, `remove_file`, `bash`, `spawn_subagent`, `load_skill` |
+| `mo_core` | Shared types, JSONL journal I/O, SQLite metadata DB (WAL), TOML config, the session-mode registry (`build` / `plan` / `explore`) |
+| `mo_gateway` | axum HTTP service: sessions CRUD, history, SSE live updates, worker spawn/kill, mode switching (port 3031) |
+| `mo_worker` | One process per session: runs the LLM agent loop (via `nah_chat`) with tools `read_file`, `edit_file`, `create_file`, `remove_file`, `bash`, `spawn_subagent`, `load_skill`; journals the system prompt once and reuses it verbatim on every run |
 | `frontend` | React 19 + Vite + TS UI (Vite dev server on 3030, proxy `/api → :3031`) |
 
 Workers append chat/tool events to a per-session `journal.jsonl` and update
@@ -134,6 +134,42 @@ The mock responds based on the prompt: prompts containing `subagent` exercise
 answers are replayed as multiple content chunks, so the token-by-token
 streaming path is exercised in smoke tests too.
 
+## Modes
+
+Every session runs in one of three **modes** — `build` (the default),
+`plan` or `explore` — chosen in the "New session" form (and, for
+subagents, via `spawn_subagent`'s `mode` argument, defaulting to the
+parent's current mode). The mode shapes two things:
+
+**System prompt.** The worker builds the system prompt from the session's
+mode on the *first* run and **journals it as a `system_prompt` event**.
+Every later run (followups, resumed sessions) reuses that journaled text
+verbatim — it is never rebuilt, so mid-session changes to `AGENTS.md`,
+skills or the mode never invalidate it, and the same system text is sent to
+the LLM on every run (prompt-cache friendly). A session never picks up
+`AGENTS.md`/skills edits mid-flight; create a new session for that.
+
+**Write sandbox.** All modes expose the same tool set; what differs is
+*where* `create_file` / `edit_file` / `remove_file` may land:
+
+| Mode | Framing | Write sandbox |
+| --- | --- | --- |
+| `build` | Full coding-agent instructions: modify the codebase, run commands, use subagents and skills. | The codebase (workdir) |
+| `plan` | Produce a clear, actionable implementation plan — do not implement yet. Codebase is **read-only**; use the scratch dir for drafts. `bash` is available but should be treated as read-only (a soft restriction). | The session scratch dir only |
+| `explore` | Investigate the codebase to answer questions / gather facts for a parent agent. Codebase is **read-only**; prefer `read_file`. | The session scratch dir only |
+
+The session scratch dir is `<data_dir>/sessions/<id>/tmp/` (created by the
+worker, removed with the session). In `plan`/`explore` mode a mutation that
+would land inside the codebase is denied with an explicit error telling the
+model where it *may* write; writes inside the scratch dir use absolute
+paths. `bash` remains available everywhere — a documented soft restriction
+(it can mutate state), not a hard one.
+
+**Switching modes.** A terminal session's mode can be switched from the
+status-bar picker (`POST /api/sessions/:id/mode`; rejected while the
+session is running). Switching changes only the write-sandbox policy of
+subsequent runs — the journaled system prompt never changes.
+
 ## Streaming
 
 The UI renders responses token-by-token. While the worker consumes the LLM
@@ -151,8 +187,10 @@ clean.
 
 ## Status bar
 
-The session view has a status bar pinned to the bottom showing the session
-status badge and the current context length in tokens. The length comes
+The session view has a status bar pinned to the bottom showing a mode
+picker (`build` / `plan` / `explore` — switching a terminal session's mode
+changes only the write sandbox of subsequent runs), the session status
+badge and the current context length in tokens. The length comes
 from the LLM API — the worker requests `stream_options.include_usage` and
 journals the reported `usage.prompt_tokens` after every LLM call as a
 `context_usage` event, so the bar live-updates as the conversation grows
@@ -208,21 +246,25 @@ $HOME/.agents/
 | --- | --- |
 | `GET /api/meta` | static gateway metadata: `{cwd}` (gateway startup dir, used as the default session workdir) |
 | `GET /api/models` | configured models from `mo.toml` (`[{nickname, name, base_url, default}]`; first one is `default`) |
-| `POST /api/sessions` `{workdir, prompt, model?}` | create session + spawn worker (`model` = model name from `/api/models`; default when absent) |
+| `GET /api/modes` | built-in session modes: `[{name, label, description, tools, writable}]` (`build`, `plan`, `explore`) |
+| `POST /api/sessions` `{workdir, prompt, model?, mode?}` | create session + spawn worker (`model` = model name from `/api/models`, default when absent; `mode` = mode name from `/api/modes`, `build` when absent) |
 | `GET /api/sessions` | list (newest first) |
 | `GET /api/sessions/:id` | detail; liveness check flips dead workers to `failed` |
 | `GET /api/sessions/:id/history?after_seq=N` | journal events after `N` |
 | `GET /api/sessions/:id/events` | SSE tail: new events + synthesized status changes |
 | `POST /api/sessions/:id/messages` `{content}` | continue a terminal session: journal the user message, reset to `pending`, respawn the worker |
+| `POST /api/sessions/:id/mode` `{mode}` | switch a terminal session's mode (409 while running): changes only the write sandbox of subsequent runs — the journaled system prompt never changes |
 | `POST /api/sessions/:id/cancel` | mark cancelled, then SIGTERM → SIGKILL the worker process group |
 | `DELETE /api/sessions/:id` | permanently delete a session: stop a running worker, remove the session dir (journal, worker log, ...) from disk, drop the DB row (`204` on success) |
 
 Session status: `pending | running | completed | failed | cancelled`.
 Journal events: `message`, `tool_call_start`, `tool_result`, `status_change`,
-`context_usage` (context length in tokens after each LLM call, from the
-API's `usage.prompt_tokens`), plus the streaming previews `message_delta`
-(token-by-token assistant text and reasoning) and `tool_output_delta` (live
-bash output) — JSONL, `seq` + `ts` per line.
+`system_prompt` (the system prompt, journaled once on the first run and
+reused verbatim on every later run), `context_usage` (context length in
+tokens after each LLM call, from the API's `usage.prompt_tokens`), plus the
+streaming previews `message_delta` (token-by-token assistant text and
+reasoning) and `tool_output_delta` (live bash output) — JSONL, `seq` +
+`ts` per line.
 
 ### Session titles
 

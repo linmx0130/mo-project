@@ -8,6 +8,10 @@ export type SessionStatus =
   | 'failed'
   | 'cancelled'
 
+/** Session modes (GET /api/modes): build (full access), plan and explore
+ *  (codebase read-only, writes go to the session scratch dir). */
+export type Mode = 'build' | 'plan' | 'explore'
+
 export interface Session {
   id: string
   parent_id: string | null
@@ -15,6 +19,10 @@ export interface Session {
   prompt: string
   model: string
   status: SessionStatus
+  /** The session mode: frames the journaled system prompt (first run) and
+   *  the write sandbox of every run. Switchable via POST /:id/mode when the
+   *  session is terminal — switching changes the sandbox, never the prompt. */
+  mode: Mode
   pid: number | null
   journal_path: string
   created_at: string
@@ -40,6 +48,17 @@ export interface ModelInfo {
   default: boolean
 }
 
+/** One built-in session mode (GET /api/modes). */
+export interface ModeInfo {
+  name: Mode
+  label: string
+  description: string
+  /** Tool names available in this mode. */
+  tools: string[]
+  /** Where file mutations land: 'codebase' or 'scratch only'. */
+  writable: string
+}
+
 export interface ToolCallInfo {
   id: string
   name: string
@@ -59,6 +78,10 @@ export type JournalEventKind =
   | { kind: 'tool_call_start'; id: string; name: string; arguments: string }
   | { kind: 'tool_result'; id: string; name: string; ok: boolean; output: string }
   | { kind: 'status_change'; status: SessionStatus; error?: string | null }
+  /** The session's system prompt, journaled by the worker on the first run
+   *  and reused verbatim on every later run. Rendered as session metadata
+   *  (never as a chat message). */
+  | { kind: 'system_prompt'; content: string }
   /** Streamed assistant text/reasoning chunk; the following `message` event
    *  carries the assembled content and replaces the delta-built preview. */
   | { kind: 'message_delta'; content: string; reasoning_content?: string | null }
@@ -108,6 +131,11 @@ export function getModels(): Promise<ModelInfo[]> {
   return http('/api/models')
 }
 
+/** The built-in session modes (build / plan / explore). */
+export function getModes(): Promise<ModeInfo[]> {
+  return http('/api/modes')
+}
+
 export function getSession(id: string): Promise<Session> {
   return http(`/api/sessions/${id}`)
 }
@@ -116,11 +144,25 @@ export function createSession(
   workdir: string,
   prompt: string,
   model?: string,
+  mode?: Mode,
 ): Promise<Session> {
+  const body: Record<string, string> = { workdir, prompt }
+  if (model) body.model = model
+  if (mode) body.mode = mode
   return http('/api/sessions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(model ? { workdir, prompt, model } : { workdir, prompt }),
+    body: JSON.stringify(body),
+  })
+}
+
+/** Switch a terminal session's mode. The journaled system prompt never
+ *  changes; only the write-sandbox policy of subsequent runs does. */
+export function switchMode(id: string, mode: Mode): Promise<Session> {
+  return http(`/api/sessions/${id}/mode`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode }),
   })
 }
 

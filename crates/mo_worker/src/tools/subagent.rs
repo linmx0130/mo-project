@@ -1,11 +1,16 @@
 //! `spawn_subagent` tool: spawn a child `mo_worker` process for a nested
 //! session, wait for it to finish, and return its final assistant message.
+//!
+//! The parent picks the subagent's mode: `build` (full access), or
+//! `plan`/`explore` (codebase read-only, writes go to the subagent's own
+//! scratch dir). The child journals its own system prompt on its first run,
+//! built from the chosen mode.
 
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use mo_core::{JournalEventKind, Session, SessionStatus, db, open_db};
+use mo_core::{JournalEventKind, Mode, Session, SessionStatus, db, open_db};
 use uuid::Uuid;
 
 use crate::config::MAX_SUBAGENT_DEPTH;
@@ -14,7 +19,7 @@ use crate::tools::ToolContext;
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_WAIT: Duration = Duration::from_secs(20 * 60);
 
-pub async fn spawn_subagent(ctx: &ToolContext, prompt: &str) -> Result<String, String> {
+pub async fn spawn_subagent(ctx: &ToolContext, prompt: &str, mode: Mode) -> Result<String, String> {
     if ctx.subagent_depth >= MAX_SUBAGENT_DEPTH {
         return Err(format!(
             "subagent depth cap ({MAX_SUBAGENT_DEPTH}) reached; cannot spawn further subagents"
@@ -24,7 +29,9 @@ pub async fn spawn_subagent(ctx: &ToolContext, prompt: &str) -> Result<String, S
         return Err("prompt must not be empty".to_string());
     }
 
-    // 1. Insert the child session row (same workdir, parent = self).
+    // 1. Insert the child session row (same workdir, parent = self, mode as
+    // chosen by the parent — the child's own first run builds and journals
+    // its system prompt from this mode).
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     let session_dir = ctx.data_dir.join("sessions").join(&id);
@@ -36,6 +43,7 @@ pub async fn spawn_subagent(ctx: &ToolContext, prompt: &str) -> Result<String, S
         prompt: prompt.to_string(),
         model: ctx.model_name.clone(),
         status: SessionStatus::Pending,
+        mode,
         pid: None,
         journal_path: journal_path.display().to_string(),
         created_at: now.clone(),
@@ -136,6 +144,7 @@ mod tests {
                 prompt: "p".into(),
                 model: "m".into(),
                 status: SessionStatus::Running,
+                mode: Mode::Build,
                 pid: None,
                 journal_path: "/tmp/j.jsonl".into(),
                 created_at: "now".into(),
@@ -143,13 +152,16 @@ mod tests {
                 heartbeat_at: None,
                 error: None,
             },
+            scratch: std::path::PathBuf::from("/tmp/data/sessions/s/tmp"),
             subagent_depth: MAX_SUBAGENT_DEPTH,
             model_base_url: "http://localhost:1".into(),
             model_name: "m".into(),
             auth_token: None,
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let err = rt.block_on(spawn_subagent(&ctx, "do it")).unwrap_err();
+        let err = rt
+            .block_on(spawn_subagent(&ctx, "do it", Mode::Explore))
+            .unwrap_err();
         assert!(err.contains("depth cap"), "got: {err}");
     }
 }
