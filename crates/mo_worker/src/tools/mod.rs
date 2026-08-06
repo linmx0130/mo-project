@@ -162,7 +162,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": TOOL_REQUEST_MODE_CHANGE,
-                "description": "Request the user (in the UI) to switch this session's mode. Use this when the task needs a mode you do not have — e.g. you are in plan/explore mode and need to modify the codebase, or you are in build mode and only need to plan/explore. The user approves or rejects the request in the UI; on approval the session switches mode and continues the run, so you can then do the work. Root sessions only: subagents must ask their parent agent instead. Write `message` in the user's language (the language the user writes in).",
+                "description": "Request the user (in the UI) to switch this session's mode. Use this when the task needs a mode you do not have — e.g. you are in plan/explore mode and need to modify the codebase, or you are in build mode and only need to plan/explore. In plan mode, call this once the plan is ready and has no open questions the user must answer; if the plan has must-answer questions, list them and wait for the user's answers instead. The user approves or rejects the request in the UI; on approval the session switches mode and continues the run, so you can then do the work. Root sessions only: subagents must ask their parent agent instead. Write `message` in the user's language (the language the user writes in).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -404,6 +404,14 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("user's language")
+        );
+        // The description carries the plan-mode finishing cue: call once the
+        // plan is ready with no must-answer open questions.
+        let description = def["function"]["description"].as_str().unwrap();
+        assert!(description.contains("plan is ready"), "got: {description}");
+        assert!(
+            description.contains("must-answer questions"),
+            "got: {description}"
         );
     }
 

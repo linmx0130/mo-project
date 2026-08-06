@@ -116,10 +116,21 @@ fn mode_framing(mode: Mode, workdir: &Path, scratch: &Path) -> String {
              directory {} (use absolute paths).\n\
              bash is available but treat it as read-only (a soft restriction): use it to \
              gather facts (builds, tests, greps), not to change anything.\n\
-             Finish with the plan as your final answer and call the `request_mode_change` tool \
-             with mode \"build\" to ask them to switch this session to build mode — the user \
-             approves or rejects in the UI, and on approval the session continues in build \
-             mode. Do not try to work around the sandbox or use subagent to bypass.\n\n",
+             Finish with the plan as your final answer, then take exactly one of two exits:\n\
+             - No must-answer open questions: if the plan is complete and has no open \
+             questions the user MUST answer before implementation (no ambiguous \
+             requirements, no missing decisions, no choices only the user can make), call \
+             the `request_mode_change` tool with mode \"build\" — message: a short summary \
+             of the plan and what you will do once approved — and then stop. Do not ask \
+             \"shall I proceed?\" in plain text: the mode-change request IS that question. \
+             The user reviews the plan and approves or rejects in the UI; on approval the \
+             session continues in build mode.\n\
+             - Must-answer open questions: if the plan depends on answers only the user \
+             can give, finish with the plan plus the questions listed, and do NOT call \
+             `request_mode_change` — wait for the user's answers.\n\
+             Decide details you can reasonably assume yourself and state the assumptions \
+             in the plan; only genuinely blocking questions count as must-answer.\n\
+             Do not try to work around the sandbox or use subagent to bypass.\n\n",
             workdir.display(),
             scratch.display()
         ),
@@ -341,6 +352,16 @@ mod tests {
             prompt.contains("work around the sandbox or use subagent to bypass"),
             "got: {prompt}"
         );
+        // The finishing rule is an explicit two-branch decision: call
+        // request_mode_change when the plan is ready and has no must-answer
+        // open questions, otherwise list the questions and wait.
+        assert!(prompt.contains("exactly one of two exits"));
+        assert!(prompt.contains("must-answer"));
+        assert!(prompt.contains("open"));
+        assert!(prompt.contains("mode \"build\""));
+        assert!(prompt.contains("do NOT call"));
+        assert!(prompt.contains("shall I proceed?"));
+        assert!(prompt.contains("wait for the user's answers"));
     }
 
     #[test]

@@ -107,7 +107,10 @@ pub fn mode_change_message(mode: Mode, scratch: &Path) -> String {
              directory {} (use absolute paths).\n\
              bash is available but treat it as read-only (a soft restriction): use it to \
              gather facts (builds, tests, greps), not to change anything.\n\
-             Finish with the plan as your final answer.\n",
+             Finish with the plan as your final answer. Once the plan is ready, if it has \
+             no open questions the user must answer before implementation, call the \
+             `request_mode_change` tool with mode \"build\" to switch to build mode; if it \
+             has must-answer questions, list them and wait for the user's answers instead.\n",
             scratch.display()
         ),
         Mode::Explore => format!(
@@ -233,6 +236,12 @@ mod tests {
         assert!(plan.contains("READ-ONLY"));
         assert!(plan.contains(scratch.to_str().unwrap()));
         assert!(plan.contains("absolute paths"));
+        // The plan message mirrors the system prompt's finishing rule: call
+        // request_mode_change when the plan is ready and no must-answer open
+        // questions remain, otherwise list them and wait.
+        assert!(plan.contains("request_mode_change"));
+        assert!(plan.contains("must-answer"));
+        assert!(plan.contains("wait for the user's answers"));
 
         let explore = mode_change_message(Mode::Explore, scratch);
         assert!(explore.starts_with("[Session mode changed to explore]"));

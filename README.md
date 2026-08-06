@@ -160,7 +160,7 @@ the LLM on every run (prompt-cache friendly). A session never picks up
 | Mode | Framing | Write sandbox |
 | --- | --- | --- |
 | `build` | Full coding-agent instructions: modify the codebase, run commands, use subagents and skills. | The codebase (workdir) |
-| `plan` | Produce a clear, actionable implementation plan — do not implement yet. Codebase is **read-only**; use the scratch dir for drafts. `bash` is available but should be treated as read-only (a soft restriction). | The session scratch dir only |
+| `plan` | Produce a clear, actionable implementation plan — do not implement yet. Codebase is **read-only**; use the scratch dir for drafts. `bash` is available but should be treated as read-only (a soft restriction). Finish with the plan, then request `build` mode when the plan is ready and no must-answer questions remain. | The session scratch dir only |
 | `explore` | Investigate the codebase to answer questions / gather facts for a parent agent. Codebase is **read-only**; prefer `read_file`. | The session scratch dir only |
 
 The session scratch dir is `<data_dir>/sessions/<id>/tmp/` (created by the
@@ -194,9 +194,15 @@ model sees the new mode's framing directly before the real user message.
 `request_mode_change` tool instead of working around the sandbox. The tool
 takes the requested `mode` and a short `message` for the user — written in
 the user's language — journals a `mode_change_request` event, and tells the
-model to stop and wait. The frontend shows an Agree / Reject banner and
-freezes the composer while the request is pending (resolved = a
-`mode_change` or `mode_change_request_declined` event after it). **Agree**
+model to stop and wait. In plan mode the system prompt makes this the
+*default* exit once the plan is ready: finish the plan, and if it has no
+open questions the user must answer before implementation, call the tool
+with mode `build` (the request replaces a plain-text "shall I proceed?" —
+the user reviews the plan when approving); if the plan has must-answer
+questions, the model lists them and waits for the user's answers instead.
+The frontend shows an Agree / Reject banner and freezes the composer while
+the request is pending (resolved = a `mode_change` or
+`mode_change_request_declined` event after it). **Agree**
 (`POST /api/sessions/:id/mode/approve`) switches the session's mode to the
 requested one and continues the run with a single mode-change message (the
 `mode_change` notice plus an "approved — continue" sentence), so the model
