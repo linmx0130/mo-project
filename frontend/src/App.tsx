@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { Session } from './api'
 import { deleteSession, getMeta, listSessions } from './api'
+import { clearDraft, loadDraft, saveDraft, type Draft } from './draft'
 import DraftSession from './components/DraftSession'
 import SessionList from './components/SessionList'
 import SessionView from './components/SessionView'
@@ -29,6 +30,10 @@ function App() {
   const [draftOpen, setDraftOpen] = useState(false)
   const [lastWorkdir, setLastWorkdir] = useState('')
   const [theme, setTheme] = useState<Theme>(initialTheme)
+  // The "New session" form, in one place so it survives navigating between
+  // sessions (DraftSession unmounts); mirrored to localStorage so it also
+  // survives reloads. Only a successful session creation clears it.
+  const [draft, setDraft] = useState<Draft | null>(loadDraft)
   // Session currently being deleted (delete button shows a spinner and the
   // button is disabled while the request is in flight).
   const [deletingId, setDeletingId] = useState<string | null>(null)
@@ -41,7 +46,33 @@ function App() {
     applyTheme(theme)
   }, [theme])
 
+  // Mirror the draft to localStorage on every change; removing it (session
+  // created) drops the stored copy too.
+  useEffect(() => {
+    if (draft) saveDraft(draft)
+    else clearDraft()
+  }, [draft])
+
   const toggleTheme = () => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))
+
+  /** Single source of truth for the new-session form. Patches are merged
+   *  into the current draft (materializing one from defaults on the first
+   *  interaction), so typing a message never clobbers an edited workdir,
+   *  model or mode and vice versa. */
+  const updateDraft = useCallback(
+    (patch: Partial<Draft>) => {
+      setDraft((prev) => {
+        const base: Draft = prev ?? {
+          workdir: lastWorkdir,
+          model: '',
+          mode: 'build',
+          text: '',
+        }
+        return { ...base, ...patch }
+      })
+    },
+    [lastWorkdir],
+  )
 
   const refresh = useCallback(async () => {
     try {
@@ -91,6 +122,10 @@ function App() {
 
   const handleCreated = (s: Session) => {
     setLastWorkdir(s.workdir)
+    // The draft is only cleared here: the session was actually created, so
+    // the next "New session" starts fresh (workdir pre-filled from
+    // `lastWorkdir`).
+    setDraft(null)
     selectSession(s.id)
     void refresh()
   }
@@ -158,7 +193,12 @@ function App() {
       </aside>
       <main className="main">
         {draftOpen ? (
-          <DraftSession defaultWorkdir={lastWorkdir} onCreated={handleCreated} />
+          <DraftSession
+            draft={draft}
+            onDraftChange={updateDraft}
+            defaultWorkdir={lastWorkdir}
+            onCreated={handleCreated}
+          />
         ) : selected ? (
           <SessionView
             key={selected.id}

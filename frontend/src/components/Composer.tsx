@@ -8,6 +8,11 @@ interface Props {
   busy?: boolean
   placeholder?: string
   onStop?: () => void
+  /** Controlled text: when set, the textarea shows this value and every edit
+   *  is reported via `onTextChange` (used by the draft view so the typed
+   *  message survives navigation). Omit for fully internal state. */
+  value?: string
+  onTextChange?: (text: string) => void
   /** Resolve `false` to keep the typed text (e.g. validation failed). */
   onSubmit: (text: string) => Promise<boolean | void> | boolean | void
 }
@@ -18,15 +23,25 @@ export default function Composer({
   busy = false,
   placeholder,
   onStop,
+  value,
+  onTextChange,
   onSubmit,
 }: Props) {
   const [text, setText] = useState('')
+  const currentText = value !== undefined ? value : text
+
+  const handleChange = (next: string) => {
+    if (value !== undefined) onTextChange?.(next)
+    else setText(next)
+  }
 
   const send = async () => {
-    const trimmed = text.trim()
+    const trimmed = currentText.trim()
     if (!trimmed || running || busy) return
     const keep = await onSubmit(trimmed)
     if (keep === false) return
+    // No-op in controlled mode: the parent owns the value (the draft view
+    // clears it by dropping the whole draft on session creation).
     setText('')
   }
 
@@ -46,8 +61,8 @@ export default function Composer({
   return (
     <form className="composer" onSubmit={submit}>
       <textarea
-        value={text}
-        onChange={(e) => setText(e.target.value)}
+        value={currentText}
+        onChange={(e) => handleChange(e.target.value)}
         onKeyDown={onKeyDown}
         placeholder={placeholder ?? 'Type a message…'}
         rows={3}
@@ -65,7 +80,11 @@ export default function Composer({
             Stop
           </button>
         ) : (
-          <button type="submit" className="send" disabled={busy || !text.trim()}>
+          <button
+            type="submit"
+            className="send"
+            disabled={busy || !currentText.trim()}
+          >
             {busy ? 'Sending…' : 'Send'}
           </button>
         )}
