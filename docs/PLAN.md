@@ -1,3 +1,6 @@
+This file contains the prompt that generated the MVP.
+
+
 # Plan: Rust Agent Harness MVP (gateway + workers + web UI)
 
 ## Background
