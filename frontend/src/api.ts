@@ -119,6 +119,14 @@ export type JournalEventKind =
    *  status bar shows the latest one. `context_window` is the model's
    *  configured window at session time, or null for unlimited. */
   | { kind: 'context_usage'; tokens: number; context_window?: number | null }
+  /** Context compression: the model's handoff prompt, journaled when the
+   *  session's context length crossed the configured fraction of the
+   *  context window. Everything before this event is no longer sent to the
+   *  model (the handoff text becomes the compressed context's first user
+   *  message), but stays in the journal — and in this timeline — for the
+   *  user to inspect. `mode` is the mode the session ran under when the
+   *  handoff was generated. Rendered as a notice row. */
+  | { kind: 'handoff'; content: string; mode: Mode }
 
 export interface JournalEvent {
   /** null for synthesized SSE status events (not part of the journal) */

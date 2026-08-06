@@ -73,6 +73,12 @@ port = 3031                    # gateway HTTP port (default 3031)
                               # hard-capped at 1
 # max_tool_concurrency = 8     # max tool calls from one assistant message
                               # that run concurrently (default 8, min 1)
+# context_compression_threshold = 0.75
+                              # fraction of the model's context_window at
+                              # which the worker asks the model for a handoff
+                              # prompt and sends only the compressed context
+                              # (default 0.75; only when the model sets a
+                              # context_window; see "Context compression")
 
 # At least one model is required. The first one is the default model used
 # to launch jobs and generate session titles; it is pre-selected in the
@@ -278,6 +284,40 @@ with a thin progress bar and a percentage, turning red at ≥ 90%; without
 one the window is treated as unlimited and only the current length is
 shown.
 
+## Context compression (extremely long tasks)
+
+When the session's context length reaches a fraction of the model's
+`context_window` — `context_compression_threshold` in `mo.toml`, default
+**0.75** — the worker asks the model to summarize the conversation into a
+**handoff prompt** for the next session to start:
+
+1. The original user input,
+2. Facts about the environment (build/test commands, protocols, ports,
+   file layouts, tools, gotchas),
+3. Key decisions made so far and the reasons behind them,
+4. Current progress: what has been done and what is still in the todo
+   list,
+5. The next step to take.
+
+The worker journals the handoff as a `handoff` event, immediately followed
+by a **fresh `system_prompt` event rebuilt from the session's current
+mode** (the compressed context starts a new "session", so it gets the mode
+system prompt). From then on the *handoff event is the compression
+boundary*: the history rebuild drops every event with a `seq` below it from
+the model context and sends the handoff text (wrapped in a `[Context
+compressed …]` marker) as the first user message instead. **The earlier
+events stay in the journal — and in the UI, above the "context compressed"
+notice row — so the full history remains inspectable.** The run continues
+in place; a later followup resumes from the compressed context, and if the
+context grows large again the worker compresses once more (the newest
+handoff wins).
+
+Compression only applies when the session's model sets a `context_window`
+(no window = unlimited = nothing to compress), and the trigger uses the
+API-reported `usage.prompt_tokens`, so sessions whose provider does not
+report usage are never compressed. Subagents compress too (they inherit
+the parent's window and threshold).
+
 ## Legacy env vars
 
 Configuration lives in `mo.toml` (see above). When no config file is found,
@@ -293,6 +333,7 @@ kept for existing setups; new deployments should use the config file:
 | `MO_AUTH_TOKEN` | worker | unset |
 | `MO_SUBAGENT_DEPTH` | worker | `0` for root sessions (subagents inherit parent depth + 1; nesting is hard-capped at 1 — a subagent can never spawn further subagents) |
 | `MO_MAX_TOOL_CONCURRENCY` | worker | `8` (max tool calls from one assistant message that run concurrently; min 1) |
+| `MO_CONTEXT_COMPRESSION_THRESHOLD` | worker | `0.75` (fraction of the model's context window at which the worker asks for a handoff prompt and sends only the compressed context; see "Context compression") |
 | `MO_WORKER_BIN` | gateway | sibling of `mo_gateway` exe named `mo_worker` |
 | `MO_PORT` | gateway | `3031` |
 
@@ -341,19 +382,24 @@ $HOME/.agents/
 Session status: `pending | running | completed | failed | cancelled`.
 Journal events: `message`, `tool_call_start`, `tool_result`, `status_change`,
 `system_prompt` (the system prompt, journaled once on the first run and
-reused verbatim on every later run, carrying the mode it was built for),
-`mode_change` (a mode-change notice injected by the gateway right before a
-followup user message when the session's mode differs from the mode of the
-last run — or by `POST .../mode/approve` to continue a run after a
-`mode_change_request`), `mode_change_request` (the agent's request, via the
-`request_mode_change` tool, to switch the session's mode, with the model's
-message for the user), `mode_change_request_declined` (the user rejected
-the request), `context_usage` (context length in tokens after each LLM
-call, from the API's `usage.prompt_tokens`), `subagent_started` (a parent
-worker spawned a subagent: child session id + the `spawn_subagent`
-tool-call id + the child's mode), plus the streaming previews
-`message_delta` (token-by-token assistant text and reasoning) and
-`tool_output_delta` (live bash output) — JSONL, `seq` + `ts` per line.
+reused verbatim on every later run, carrying the mode it was built for —
+after a context compression the worker journals a *fresh* one rebuilt for
+the current mode), `mode_change` (a mode-change notice injected by the
+gateway right before a followup user message when the session's mode
+differs from the mode of the last run — or by `POST .../mode/approve` to
+continue a run after a `mode_change_request`), `mode_change_request` (the
+agent's request, via the `request_mode_change` tool, to switch the
+session's mode, with the model's message for the user),
+`mode_change_request_declined` (the user rejected the request),
+`context_usage` (context length in tokens after each LLM call, from the
+API's `usage.prompt_tokens`), `subagent_started` (a parent worker spawned a
+subagent: child session id + the `spawn_subagent` tool-call id + the
+child's mode), `handoff` (context compression: the model's handoff prompt,
+with the mode it was generated under — everything with a lower `seq` is no
+longer sent to the model but stays visible in the journal/UI), plus the
+streaming previews `message_delta` (token-by-token assistant text and
+reasoning) and `tool_output_delta` (live bash output) — JSONL, `seq` + `ts`
+per line.
 
 ### Session titles
 

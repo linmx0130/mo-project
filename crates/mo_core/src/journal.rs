@@ -329,6 +329,27 @@ mod tests {
     }
 
     #[test]
+    fn handoff_event_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let mut writer = JournalWriter::open(&path).unwrap();
+        writer
+            .append(JournalEventKind::Handoff {
+                content: "original input … next step".to_string(),
+                mode: crate::types::Mode::Plan,
+            })
+            .unwrap();
+        let events = read_events(&path).unwrap();
+        assert_eq!(
+            events[0].kind,
+            JournalEventKind::Handoff {
+                content: "original input … next step".to_string(),
+                mode: crate::types::Mode::Plan,
+            }
+        );
+    }
+
+    #[test]
     fn mode_change_event_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("journal.jsonl");

@@ -31,6 +31,18 @@
 # separate messages (completion order is not guaranteed).
 # max_tool_concurrency = 8
 
+# Fraction of the model's context_window at which the worker asks the model
+# to generate a *handoff prompt* and starts sending only the compressed
+# context (default 0.75; 0 < value <= 1). Only applies when the session's
+# model sets a context_window — without one the window is unlimited and no
+# compression happens. When the threshold is hit, the worker asks the model
+# to summarize the conversation (original input, environment facts,
+# decisions, progress, next step) into a handoff prompt, journals it as a
+# `handoff` event, rebuilds the system prompt for the current mode, and from
+# then on sends only the handoff (plus anything after it) to the model —
+# the earlier events stay in the journal and stay visible in the UI.
+# context_compression_threshold = 0.75
+
 # Worker binary (default: sibling of the mo_gateway executable named
 # mo_worker).
 # worker_bin = "./target/debug/mo_worker"

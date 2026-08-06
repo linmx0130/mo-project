@@ -71,11 +71,21 @@ pub async fn spawn_subagent(
             "MO_MAX_TOOL_CONCURRENCY",
             ctx.max_tool_concurrency.to_string(),
         )
+        // The parent's resolved model window + compression threshold, so a
+        // subagent compresses against the same settings (the config-file
+        // fallback would only match when the parent uses the default model).
+        .env(
+            "MO_CONTEXT_COMPRESSION_THRESHOLD",
+            ctx.context_compression_threshold.to_string(),
+        )
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(stderr_file))
         .kill_on_drop(true);
     if let Some(token) = &ctx.auth_token {
         cmd.env("MO_AUTH_TOKEN", token);
+    }
+    if let Some(window) = ctx.context_window {
+        cmd.env("MO_CONTEXT_WINDOW", window.to_string());
     }
     let mut child = cmd
         .spawn()
@@ -228,6 +238,8 @@ mod tests {
             model_base_url: "http://localhost:1".into(),
             model_name: "m".into(),
             auth_token: None,
+            context_window: Some(4096),
+            context_compression_threshold: mo_core::config::DEFAULT_CONTEXT_COMPRESSION_THRESHOLD,
         }
     }
 

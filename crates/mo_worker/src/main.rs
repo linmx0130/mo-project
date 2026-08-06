@@ -134,6 +134,7 @@ async fn main() {
         context_window: cfg.context_window,
         subagent_depth: cfg.subagent_depth,
         max_tool_concurrency: cfg.max_tool_concurrency,
+        context_compression_threshold: cfg.context_compression_threshold,
     };
 
     match agent::run_agent(agent_cfg, &mut journal).await {

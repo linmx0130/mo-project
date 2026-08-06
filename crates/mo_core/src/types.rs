@@ -303,6 +303,29 @@ pub enum JournalEventKind {
         tool_call_id: String,
         mode: Mode,
     },
+    /// Context compression: the model's *handoff prompt*, generated when
+    /// the session's context length (the API-reported `usage.prompt_tokens`)
+    /// crossed the configured fraction of the model's context window
+    /// (`mo.toml`'s `context_compression_threshold`, default 0.75). The
+    /// worker asks the model to summarize the conversation so far into a
+    /// handoff prompt (original user input, environment facts, key
+    /// decisions + reasons, progress + todo, next step) and journals it as
+    /// this event — immediately followed by a fresh `SystemPrompt` event
+    /// rebuilt from `mode`, because the compressed context starts a new
+    /// "session" that needs the current mode's system prompt.
+    ///
+    /// Readers (the worker's history rebuild) treat the handoff event's own
+    /// `seq` as the *compression boundary*: every event with `seq` below it
+    /// is dropped from the model context on future runs, and the handoff
+    /// text itself becomes the first user message of the compressed
+    /// context. The earlier events stay in the journal — and in the UI —
+    /// so the full history remains inspectable.
+    Handoff {
+        content: String,
+        /// The mode the session ran under when the handoff was generated;
+        /// the fresh `SystemPrompt` event that follows is built from it.
+        mode: Mode,
+    },
 }
 
 /// One line of a session journal.

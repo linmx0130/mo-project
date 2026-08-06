@@ -43,6 +43,13 @@ pub struct ToolContext {
     pub model_base_url: String,
     pub model_name: String,
     pub auth_token: Option<String>,
+    /// The session's model context window in tokens (`None` = unlimited),
+    /// passed to spawned subagents so they compress against the parent's
+    /// resolved model settings.
+    pub context_window: Option<u64>,
+    /// The context-compression threshold (fraction of the context window),
+    /// passed to spawned subagents so they inherit the same value.
+    pub context_compression_threshold: f64,
 }
 
 /// OpenAI nested tool definitions advertised to the model.
@@ -363,6 +370,8 @@ mod tests {
             model_base_url: "http://localhost:1".into(),
             model_name: "m".into(),
             auth_token: None,
+            context_window: None,
+            context_compression_threshold: mo_core::config::DEFAULT_CONTEXT_COMPRESSION_THRESHOLD,
         }
     }
 
@@ -500,6 +509,8 @@ mod tests {
             model_base_url: "http://localhost:1".into(),
             model_name: "m".into(),
             auth_token: None,
+            context_window: None,
+            context_compression_threshold: mo_core::config::DEFAULT_CONTEXT_COMPRESSION_THRESHOLD,
         }
     }
 

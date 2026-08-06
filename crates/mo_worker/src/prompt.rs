@@ -11,6 +11,36 @@ use std::path::Path;
 
 use mo_core::Mode;
 
+/// The marker prefix the worker's history rebuild wraps a journaled handoff
+/// in when it synthesizes the handoff's user-role message, so the model
+/// understands that the handoff prompt *is* its memory of the task and that
+/// it should continue from the handoff's next step.
+pub const HANDOFF_USER_PREFIX: &str = "[Context compressed: the messages before this point were \
+     summarized into the following handoff prompt and are no longer sent to the model (they \
+     remain in the session journal for you to check). Treat the handoff prompt as your \
+     authoritative memory of the task so far and continue from its next step.]\n\n";
+
+/// The user-role message the worker appends to the context when it asks the
+/// model to generate a handoff prompt (context compression): the model
+/// summarizes the whole conversation so far, and the result is journaled as
+/// a `Handoff` event that future runs use as the compressed context's first
+/// message.
+pub fn handoff_instruction() -> String {
+    "Context compression: the conversation history has reached the context-window \
+     threshold, and the next turns will run from a compressed context that replaces all \
+     earlier messages.\n\n\
+     Write a handoff prompt that captures everything a fresh session needs to continue this \
+     task without the earlier history. It must include:\n\
+     1. The original user input (the task as the user gave it).\n\
+     2. Facts about the environment you have learned: build/test commands, protocols, \
+     ports, file layouts, tools, gotchas.\n\
+     3. Key decisions made so far and the reasons behind them.\n\
+     4. Current progress: what has been done and what is still in the todo list.\n\
+     5. The next step to take.\n\n\
+     Reply with ONLY the handoff prompt as plain text — no preamble, no code fences."
+        .to_string()
+}
+
 /// Build the system prompt for a session's first run.
 ///
 /// `mode` frames the agent's job (Build = full access, Plan = plan only,
@@ -35,6 +65,11 @@ pub fn build_system_prompt(
         "You may read and write files only inside the working directory, except that \
          read_file may also read global skill folders (see \"Global skills\" below). \
          Never attempt to access files or run commands that escape it.\n\n",
+    );
+    prompt.push_str(
+        "The harness may compress the context mid-task when it nears the model's context \
+         window: you will then receive a handoff prompt as a user message summarizing the \
+         earlier conversation. Treat it as your memory of the task and continue.\n\n",
     );
     prompt.push_str(&tool_usage_rules(mode, scratch));
     if subagent_depth > 0 {
@@ -375,5 +410,39 @@ mod tests {
         assert!(prompt.contains(&scratch(&dir).display().to_string()));
         // Explore mode also points at request_mode_change for build tasks.
         assert!(prompt.contains("request_mode_change"));
+    }
+
+    /// Every mode's system prompt mentions context compression, so the
+    /// model understands a handoff user message when one arrives mid-task.
+    #[test]
+    fn all_modes_mention_context_compression() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = tempfile::tempdir().unwrap();
+        for mode in [Mode::Build, Mode::Plan, Mode::Explore] {
+            let prompt = prompt_for(mode, &dir, &agents);
+            assert!(prompt.contains("handoff prompt"), "mode {mode}: {prompt}");
+            assert!(
+                prompt.contains("Treat it as your memory of the task and continue"),
+                "mode {mode}: {prompt}"
+            );
+        }
+    }
+
+    /// The handoff-generation instruction must demand all five sections.
+    #[test]
+    fn handoff_instruction_covers_all_sections() {
+        let instruction = handoff_instruction();
+        assert!(instruction.contains("original user input"));
+        assert!(instruction.contains("environment"));
+        assert!(instruction.contains("build/test commands"));
+        assert!(instruction.contains("Key decisions"));
+        assert!(instruction.contains("Current progress"));
+        assert!(instruction.contains("todo list"));
+        assert!(instruction.contains("next step"));
+        assert!(instruction.contains("ONLY the handoff prompt"));
+        // The prefix is a self-explanatory marker for the synthesized user
+        // message of a compressed context.
+        assert!(HANDOFF_USER_PREFIX.starts_with("[Context compressed:"));
+        assert!(HANDOFF_USER_PREFIX.contains("continue from its next step"));
     }
 }

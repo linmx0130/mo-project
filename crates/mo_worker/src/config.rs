@@ -22,9 +22,16 @@
 //! * `MO_MAX_TOOL_CONCURRENCY` — max number of tool calls from a single
 //!   assistant message that execute at once (default 8, clamped to ≥ 1);
 //!   the gateway passes the `max_tool_concurrency` value from `mo.toml`.
+//! * `MO_CONTEXT_COMPRESSION_THRESHOLD` — the fraction of the model's
+//!   context window at which the worker asks the model to generate a
+//!   handoff prompt and starts sending only the compressed context
+//!   (default 0.75, clamped to `(0, 1]`); the gateway passes the value
+//!   from `mo.toml`.
 
 use std::env;
 use std::path::PathBuf;
+
+use mo_core::config::DEFAULT_CONTEXT_COMPRESSION_THRESHOLD;
 
 /// The hard cap on subagent nesting. Subagents (sessions with a `parent_id`)
 /// can never spawn further subagents — the depth limit is 1: a root session
@@ -48,6 +55,13 @@ pub struct WorkerConfig {
     /// `max_tool_concurrency` value from `mo.toml`; standalone workers fall
     /// back to the config file, then to the default.
     pub max_tool_concurrency: usize,
+    /// Fraction of the model's `context_window` at which the worker asks
+    /// the model to generate a handoff prompt and starts sending only the
+    /// compressed context (clamped to `(0, 1]`; only applies when a
+    /// `context_window` is set). The gateway passes the value from
+    /// `mo.toml`; standalone workers fall back to the config file, then to
+    /// the default (0.75).
+    pub context_compression_threshold: f64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -138,6 +152,16 @@ pub fn parse_config() -> Result<WorkerConfig, ConfigError> {
         .or_else(|| file_cfg.as_ref().map(|c| c.max_tool_concurrency))
         .unwrap_or(mo_core::config::DEFAULT_MAX_TOOL_CONCURRENCY)
         .max(1);
+    // Context-compression threshold: env first (the gateway passes the
+    // resolved value from `mo.toml`), then the config file, then the
+    // default. Clamped to `(0, 1]` so a misconfigured 0 or >1 can never
+    // disable or over-trigger compression silently.
+    let context_compression_threshold = env::var("MO_CONTEXT_COMPRESSION_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .or_else(|| file_cfg.as_ref().map(|c| c.context_compression_threshold))
+        .unwrap_or(DEFAULT_CONTEXT_COMPRESSION_THRESHOLD)
+        .clamp(f64::MIN_POSITIVE, 1.0);
 
     Ok(WorkerConfig {
         session_id,
@@ -149,6 +173,7 @@ pub fn parse_config() -> Result<WorkerConfig, ConfigError> {
         context_window,
         subagent_depth,
         max_tool_concurrency,
+        context_compression_threshold,
     })
 }
 

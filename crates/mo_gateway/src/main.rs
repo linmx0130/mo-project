@@ -84,6 +84,7 @@ async fn main() {
         cwd,
         agents_dir: config.agents_dir,
         max_tool_concurrency: config.max_tool_concurrency,
+        context_compression_threshold: config.context_compression_threshold,
         models: config.models,
     });
     let app = create_router(state);

@@ -20,6 +20,12 @@
 //!                                     # assistant message may run at once (default 8;
 //!                                     # clamped to at least 1). Tool calls in one
 //!                                     # message run concurrently up to this bound.
+//! context_compression_threshold = 0.75 # optional; fraction of the model's
+//!                                     # context_window at which the worker asks the
+//!                                     # model to generate a handoff prompt and starts
+//!                                     # sending only the compressed context (default
+//!                                     # 0.75; 0 < value <= 1; only applies when the
+//!                                     # model sets a context_window).
 //!
 //! [[models]]                          # at least one required; first = default
 //! base_url  = "https://api.deepseek.com"
@@ -44,6 +50,12 @@ pub const DEFAULT_PORT: u16 = 3031;
 /// that execute concurrently (see `MoConfig::max_tool_concurrency`).
 pub const DEFAULT_MAX_TOOL_CONCURRENCY: usize = 8;
 
+/// Default context-compression threshold: the fraction of the model's
+/// `context_window` at which the worker asks the model to generate a
+/// handoff prompt and starts sending only the compressed context (see
+/// `MoConfig::context_compression_threshold`).
+pub const DEFAULT_CONTEXT_COMPRESSION_THRESHOLD: f64 = 0.75;
+
 /// One configured LLM endpoint.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ModelConfig {
@@ -65,7 +77,7 @@ pub struct ModelConfig {
 }
 
 /// Raw TOML file shape (all fields optional so a minimal file works).
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
     #[serde(default)]
@@ -80,6 +92,13 @@ pub struct FileConfig {
     pub worker_bin: Option<PathBuf>,
     #[serde(default)]
     pub max_tool_concurrency: Option<usize>,
+    /// Fraction of the model's `context_window` at which the worker asks
+    /// the model to generate a handoff prompt and starts sending only the
+    /// compressed context (default `DEFAULT_CONTEXT_COMPRESSION_THRESHOLD`;
+    /// must be in `(0, 1]`; only applies when the model sets a
+    /// `context_window`).
+    #[serde(default)]
+    pub context_compression_threshold: Option<f64>,
     #[serde(default)]
     pub models: Vec<ModelConfig>,
 }
@@ -87,7 +106,7 @@ pub struct FileConfig {
 /// The resolved configuration used by the gateway (and, as a fallback, the
 /// worker). Built from a TOML file when one is found, otherwise from `MO_*`
 /// env vars so existing setups keep working.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MoConfig {
     pub data_dir: PathBuf,
     pub agents_dir: PathBuf,
@@ -98,6 +117,11 @@ pub struct MoConfig {
     /// execute concurrently. Clamped to at least 1 by consumers; the
     /// default is `DEFAULT_MAX_TOOL_CONCURRENCY`.
     pub max_tool_concurrency: usize,
+    /// Fraction of the model's `context_window` at which the worker asks
+    /// the model to generate a handoff prompt and starts sending only the
+    /// compressed context. Clamped to `(0, 1]`; the default is
+    /// `DEFAULT_CONTEXT_COMPRESSION_THRESHOLD`.
+    pub context_compression_threshold: f64,
     pub models: Vec<ModelConfig>,
     /// The config file that was loaded; `None` when built from env vars.
     pub source: Option<PathBuf>,
@@ -111,6 +135,11 @@ impl MoConfig {
         match find_config_path(explicit)? {
             Some(path) => {
                 let file = parse_file(&path)?;
+                if let Some(t) = file.context_compression_threshold
+                    && !(t > 0.0 && t <= 1.0)
+                {
+                    return Err(ConfigError::InvalidThreshold { path, value: t });
+                }
                 let config = file.into_config();
                 Ok(config.with_source(Some(path)))
             }
@@ -165,6 +194,10 @@ impl MoConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_MAX_TOOL_CONCURRENCY),
+            context_compression_threshold: env::var("MO_CONTEXT_COMPRESSION_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_CONTEXT_COMPRESSION_THRESHOLD),
             models,
             source: None,
         }
@@ -187,6 +220,9 @@ impl FileConfig {
             max_tool_concurrency: self
                 .max_tool_concurrency
                 .unwrap_or(DEFAULT_MAX_TOOL_CONCURRENCY),
+            context_compression_threshold: self
+                .context_compression_threshold
+                .unwrap_or(DEFAULT_CONTEXT_COMPRESSION_THRESHOLD),
             models: self.models,
             source: None,
         }
@@ -252,6 +288,10 @@ pub enum ConfigError {
         #[source]
         source: toml::de::Error,
     },
+    #[error(
+        "invalid context_compression_threshold in {path}: {value} (expected a fraction in (0, 1])"
+    )]
+    InvalidThreshold { path: PathBuf, value: f64 },
 }
 
 #[cfg(test)]
@@ -278,6 +318,7 @@ mod tests {
             "MO_PORT",
             "MO_DATA_DIR",
             "MO_MAX_TOOL_CONCURRENCY",
+            "MO_CONTEXT_COMPRESSION_THRESHOLD",
         ] {
             unsafe {
                 env::remove_var(key);
@@ -350,6 +391,89 @@ mod tests {
         std::fs::write(&path, "port = 4040\n").unwrap();
         let config = MoConfig::load(Some(&path)).unwrap();
         assert_eq!(config.max_tool_concurrency, DEFAULT_MAX_TOOL_CONCURRENCY);
+    }
+
+    #[test]
+    fn context_compression_threshold_defaults_to_0_75() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mo.toml");
+        std::fs::write(&path, "port = 4040\n").unwrap();
+        let config = MoConfig::load(Some(&path)).unwrap();
+        assert_eq!(
+            config.context_compression_threshold,
+            DEFAULT_CONTEXT_COMPRESSION_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn context_compression_threshold_is_parsed() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mo.toml");
+        std::fs::write(&path, "context_compression_threshold = 0.9\n").unwrap();
+        let config = MoConfig::load(Some(&path)).unwrap();
+        assert_eq!(config.context_compression_threshold, 0.9);
+        // 1.0 is allowed (compress only at the very limit).
+        std::fs::write(&path, "context_compression_threshold = 1.0\n").unwrap();
+        let config = MoConfig::load(Some(&path)).unwrap();
+        assert_eq!(config.context_compression_threshold, 1.0);
+    }
+
+    #[test]
+    fn context_compression_threshold_out_of_range_rejected() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["0", "-0.1", "1.5", "2"] {
+            let path = dir.path().join("mo.toml");
+            std::fs::write(&path, format!("context_compression_threshold = {bad}\n")).unwrap();
+            assert!(
+                matches!(
+                    MoConfig::load(Some(&path)),
+                    Err(ConfigError::InvalidThreshold { .. })
+                ),
+                "threshold {bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn context_compression_threshold_env_fallback() {
+        let _guard = env_lock();
+        clear_legacy_env();
+        let dir = tempfile::tempdir().unwrap();
+        sandboxed_home(&dir);
+        let cwd = env::current_dir().unwrap();
+        env::set_current_dir(dir.path()).unwrap();
+
+        // Unset -> default.
+        let config = MoConfig::load(None).unwrap();
+        assert_eq!(
+            config.context_compression_threshold,
+            DEFAULT_CONTEXT_COMPRESSION_THRESHOLD
+        );
+
+        // Set -> parsed.
+        unsafe {
+            env::set_var("MO_CONTEXT_COMPRESSION_THRESHOLD", "0.5");
+        }
+        let config = MoConfig::load(None).unwrap();
+        assert_eq!(config.context_compression_threshold, 0.5);
+
+        // Unparseable -> default (env fallback is lenient).
+        unsafe {
+            env::set_var("MO_CONTEXT_COMPRESSION_THRESHOLD", "nope");
+        }
+        let config = MoConfig::load(None).unwrap();
+        assert_eq!(
+            config.context_compression_threshold,
+            DEFAULT_CONTEXT_COMPRESSION_THRESHOLD
+        );
+
+        unsafe {
+            env::remove_var("MO_CONTEXT_COMPRESSION_THRESHOLD");
+        }
+        env::set_current_dir(&cwd).unwrap();
     }
 
     #[test]

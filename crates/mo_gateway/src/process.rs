@@ -88,6 +88,12 @@ pub fn spawn_worker(state: &AppState, session: &Session) -> std::io::Result<u32>
         "MO_MAX_TOOL_CONCURRENCY",
         state.max_tool_concurrency.to_string(),
     );
+    // Context-compression threshold from `mo.toml`; the worker falls back
+    // to its default when unset.
+    cmd.env(
+        "MO_CONTEXT_COMPRESSION_THRESHOLD",
+        state.context_compression_threshold.to_string(),
+    );
 
     let mut child = cmd.spawn()?;
     let pid = child

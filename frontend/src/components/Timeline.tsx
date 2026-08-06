@@ -48,6 +48,29 @@ export function EventRow({ event }: { event: JournalEvent }) {
           <span className="muted">The user rejected the mode change request.</span>
         </div>
       )
+    case 'handoff':
+      // Context compression: the model generated a handoff prompt and the
+      // events before it are no longer sent to the model (they stay in the
+      // journal, above this row). Render the handoff text in a collapsible
+      // block so it is inspectable without dominating the timeline.
+      return (
+        <div className="mode-change handoff">
+          <span className={`badge mode-${kind.mode}`}>→ context compressed</span>
+          <details>
+            <summary>
+              <span className="muted">
+                handoff prompt for the next session (earlier events stay
+                visible above; they are no longer sent to the model)
+              </span>
+            </summary>
+            <div className="msg-content markdown handoff-body">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {kind.content}
+              </ReactMarkdown>
+            </div>
+          </details>
+        </div>
+      )
     default:
       // message / tool events are folded into dedicated items by
       // buildTimeline; anything else is not rendered.

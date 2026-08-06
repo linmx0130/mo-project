@@ -747,6 +747,7 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             agents_dir: dir.path().join("agents"),
             max_tool_concurrency: mo_core::config::DEFAULT_MAX_TOOL_CONCURRENCY,
+            context_compression_threshold: mo_core::config::DEFAULT_CONTEXT_COMPRESSION_THRESHOLD,
             models: Vec::new(),
         });
         TestApp { state, _dir: dir }

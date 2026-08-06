@@ -982,6 +982,32 @@ p {
   word-break: break-word;
 }
 
+/* Context-compression notice: the handoff row is collapsible so the long
+   handoff text stays inspectable without dominating the timeline. */
+.mode-change.handoff {
+  flex-direction: column;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin: 4px 0;
+}
+
+.mode-change.handoff details {
+  width: 100%;
+}
+
+.mode-change.handoff summary {
+  cursor: pointer;
+  user-select: none;
+}
+
+.handoff-body {
+  margin-top: 8px;
+  padding: 8px 10px;
+  background: var(--bg-deep, rgba(0, 0, 0, 0.18));
+  border-radius: 6px;
+}
+
 /* The mode-change badge is colored like the mode picker select; `mode-plan`
    and `mode-explore` already set their color above (mode-select section). */
 .badge.mode-build {
