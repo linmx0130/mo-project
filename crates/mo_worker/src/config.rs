@@ -177,12 +177,7 @@ pub fn parse_config() -> Result<WorkerConfig, ConfigError> {
     })
 }
 
+// Unit tests live in `mo_worker/src/tests/config_tests.rs` (see AGENTS.md).
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn depth_cap_is_one() {
-        assert_eq!(MAX_SUBAGENT_DEPTH, 1);
-    }
-}
+#[path = "tests/config_tests.rs"]
+mod tests;

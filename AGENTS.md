@@ -31,6 +31,12 @@ npm run dev                   # dev server on :3030, /api proxied to :3031
 ## Conventions
 
 - Rust: edition 2024, workspace resolver 3; shared deps in `[workspace.dependencies]`.
+- Tests never live inside production source files. Unit tests go in
+  `src/tests/<name>_tests.rs`, wired from the production module with a
+  `#[cfg(test)] #[path = "tests/<name>_tests.rs"] mod tests;` hook at the
+  bottom of the file (this keeps `use super::*` access to private items);
+  integration tests go in `crates/<crate>/tests/`. Keep all new tests to
+  this layout so production code stays readable for LLMs and humans.
 - The gateway and every worker open the same SQLite DB (`data/mo.db`) in WAL
   mode with a busy timeout — never hold the `Mutex<Connection>` across awaits.
 - Workers are the single writers of their session journal; the gateway only
