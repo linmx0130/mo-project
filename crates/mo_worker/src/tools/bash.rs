@@ -294,7 +294,7 @@ fn partial_output(stdout_buf: &[u8], stderr_buf: &[u8], truncated: bool) -> Stri
     out
 }
 
-// Unit tests live in `mo_worker/src/tests/bash_tests.rs` (see AGENTS.md).
+// Unit tests live in `mo_worker/src/tests/tools/bash_tests.rs` (see AGENTS.md).
 #[cfg(test)]
-#[path = "../tests/bash_tests.rs"]
+#[path = "../tests/tools/bash_tests.rs"]
 mod tests;

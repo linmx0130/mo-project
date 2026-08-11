@@ -25,7 +25,7 @@ pub fn load_skill(agents_dir: &Path, name: &str) -> Result<String, String> {
     Ok(format!("Path: {}\n\n{}", skill.path.display(), body))
 }
 
-// Unit tests live in `mo_worker/src/tests/skill_tests.rs` (see AGENTS.md).
+// Unit tests live in `mo_worker/src/tests/tools/skill_tests.rs` (see AGENTS.md).
 #[cfg(test)]
-#[path = "../tests/skill_tests.rs"]
+#[path = "../tests/tools/skill_tests.rs"]
 mod tests;

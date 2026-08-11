@@ -1,5 +1,5 @@
 //! Unit tests for the `tools` module — production code lives in
-//! `mo_worker/src/tools/mod.rs`. Wired from there with `#[cfg(test)] #[path = "../tests/tools_tests.rs"] mod tests;` so the tests keep `use super::*` access
+//! `mo_worker/src/tools/mod.rs`. Wired from there with `#[cfg(test)] #[path = "../tests/tools/mod_tests.rs"] mod tests;` so the tests keep `use super::*` access
 //! to the module's items (private ones included).
 
 use super::*;

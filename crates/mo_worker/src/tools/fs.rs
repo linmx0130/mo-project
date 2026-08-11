@@ -184,7 +184,7 @@ fn cap_output(text: &str) -> String {
     }
 }
 
-// Unit tests live in `mo_worker/src/tests/fs_tests.rs` (see AGENTS.md).
+// Unit tests live in `mo_worker/src/tests/tools/fs_tests.rs` (see AGENTS.md).
 #[cfg(test)]
-#[path = "../tests/fs_tests.rs"]
+#[path = "../tests/tools/fs_tests.rs"]
 mod tests;

@@ -203,7 +203,7 @@ fn last_assistant_message(journal_path: &Path) -> Option<String> {
     })
 }
 
-// Unit tests live in `mo_worker/src/tests/subagent_tests.rs` (see AGENTS.md).
+// Unit tests live in `mo_worker/src/tests/tools/subagent_tests.rs` (see AGENTS.md).
 #[cfg(test)]
-#[path = "../tests/subagent_tests.rs"]
+#[path = "../tests/tools/subagent_tests.rs"]
 mod tests;

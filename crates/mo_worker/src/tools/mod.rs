@@ -337,7 +337,7 @@ pub async fn execute_tool(
     }
 }
 
-// Unit tests live in `mo_worker/src/tests/tools_tests.rs` (see AGENTS.md).
+// Unit tests live in `mo_worker/src/tests/tools/mod_tests.rs` (see AGENTS.md).
 #[cfg(test)]
-#[path = "../tests/tools_tests.rs"]
+#[path = "../tests/tools/mod_tests.rs"]
 mod tests;
