@@ -41,6 +41,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "spawn_subagent",
     "load_skill",
     "request_mode_change",
+    "ask_user",
 ];
 
 /// The built-in modes, in display order. `build` is the default for new

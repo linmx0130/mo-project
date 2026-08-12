@@ -20,6 +20,13 @@ pub const HANDOFF_USER_PREFIX: &str = "[Context compressed: the messages before 
      remain in the session journal for you to check). Treat the handoff prompt as your \
      authoritative memory of the task so far and continue from its next step.]\n\n";
 
+/// The marker prefix the worker's history rebuild wraps a journaled
+/// `AskUserAnswered` event in when it synthesizes the answers' user-role
+/// message, so the model understands that the JSON object that follows is
+/// the user's answer to the clarification question it asked via the
+/// `ask_user` tool (the tool's "return value").
+pub const ASK_USER_ANSWER_PREFIX: &str = "[The user answered your clarification question:]\n\n";
+
 /// The user-role message the worker appends to the context when it asks the
 /// model to generate a handoff prompt (context compression): the model
 /// summarizes the whole conversation so far, and the result is journaled as
@@ -141,7 +148,11 @@ pub fn build_system_prompt(
 fn mode_framing(mode: Mode, workdir: &Path, scratch: &Path) -> String {
     match mode {
         Mode::Build => "You are in Build mode: you can modify the codebase (create/edit/remove \
-             files), run commands, and use subagents and skills to get the job done.\n\n"
+             files), run commands, and use subagents and skills to get the job done.\n\
+             If you need more input from the user to continue — a choice between approaches, \
+             a preference, or a detail only they can decide — ask for it via the `ask_user` \
+             tool: the question appears in the UI with the preset options and a free-text \
+             input box, and the user's answer arrives as a user message.\n\n"
             .to_string(),
         Mode::Plan => format!(
             "You are in Plan mode. Your job is to produce a clear, actionable \
@@ -151,6 +162,10 @@ fn mode_framing(mode: Mode, workdir: &Path, scratch: &Path) -> String {
              directory {} (use absolute paths).\n\
              bash is available but treat it as read-only (a soft restriction): use it to \
              gather facts (builds, tests, greps), not to change anything.\n\
+             If you need more input from the user to continue — a choice between \
+             approaches, a preference, or a detail only they can decide — ask for it via \
+             the `ask_user` tool: the question appears in the UI with the preset options \
+             and a free-text input box, and the user's answer arrives as a user message.\n\
              Finish with the plan as your final answer, then take exactly one of two exits:\n\
              - No must-answer open questions: if the plan is complete and has no open \
              questions the user MUST answer before implementation (no ambiguous \
@@ -176,6 +191,10 @@ fn mode_framing(mode: Mode, workdir: &Path, scratch: &Path) -> String {
              You may create, edit and remove temporary files under the session scratch \
              directory {} (use absolute paths).\n\
              Prefer read_file; run read-only bash commands when helpful.\n\
+             If you need more input from the user to continue — a choice between \
+             approaches, a preference, or a detail only they can decide — ask for it via \
+             the `ask_user` tool: the question appears in the UI with the preset options \
+             and a free-text input box, and the user's answer arrives as a user message.\n\
              If the task turns into modifying the codebase, call the `request_mode_change` \
              tool to ask the user to switch this session to build mode.\n\
              Report concise findings as your final answer.\n\n",

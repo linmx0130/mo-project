@@ -8,6 +8,10 @@ workers each get their own sequence):
 
   * prompt contains "subagent" -> request 1 asks to spawn a subagent,
     request 2 gives the final answer
+  * prompt contains "ask_user"  -> request 1 asks a clarification question
+    via ask_user (the worker stops and the session completes; the smoke
+    test answers it via POST /api/sessions/:id/ask/answer); the resumed
+    connection sees the answer as a user message and gives the final answer
   * prompt contains "slow"     -> request 1 asks for `bash sleep 60`
                                  (use this to test cancel)
   * otherwise                  -> read_file greeting.txt, then
@@ -102,6 +106,46 @@ class Handler(BaseHTTPRequestHandler):
                 {"role": "assistant"},
                 {"content": (prompt[:40] if prompt else "Untitled session")},
             ]
+        elif any(
+            "The user answered your clarification question" in m.get("content", "")
+            for m in user_msgs
+        ):
+            # The resumed run after the user answered an ask_user question:
+            # reply with the final answer right away.
+            deltas = [{"role": "assistant"}] + stream_text(
+                "The user answered my clarification question. "
+                "Everything works."
+            )
+        elif "ask_user" in prompt:
+            if n == 0:
+                deltas = [
+                    {"role": "assistant"},
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_ask",
+                                "type": "function",
+                                "function": {
+                                    "name": "ask_user",
+                                    "arguments": (
+                                        '{"question_title": "Select a programming language", '
+                                        '"question_text": "Choose a language for implementing '
+                                        'the project.", "options": [{"option_title": "C++", '
+                                        '"option_text": "High performance system language."}, '
+                                        '{"option_title": "Python", "option_text": "Popular '
+                                        'and easy to write."}]}'
+                                    ),
+                                },
+                            }
+                        ]
+                    },
+                ]
+            else:
+                deltas = [{"role": "assistant"}] + stream_text(
+                    "I sent the user a clarification question and will "
+                    "continue once they answer."
+                )
         elif "slow" in prompt:
             deltas = [
                 {"role": "assistant"},

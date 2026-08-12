@@ -17,5 +17,6 @@ pub use modes::{
     mode_change_message,
 };
 pub use types::{
-    JournalEvent, JournalEventKind, JournalMessage, Mode, Session, SessionStatus, ToolCallInfo,
+    AskUserMarker, AskUserOption, AskUserQuestion, JournalEvent, JournalEventKind, JournalMessage,
+    Mode, Session, SessionStatus, ToolCallInfo, last_ask_user_marker,
 };

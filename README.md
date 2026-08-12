@@ -35,7 +35,7 @@ Frontend  <->  Gateway Service  <->  Agent worker(s)
 | --- | --- |
 | `mo_core` | Shared types, JSONL journal I/O, SQLite metadata DB (WAL), TOML config, the session-mode registry (`build` / `plan` / `explore`) |
 | `mo_gateway` | axum HTTP service: sessions CRUD, history, SSE live updates, worker spawn/kill, mode switching (port 3031) |
-| `mo_worker` | One process per session: runs the LLM agent loop (via `nah_chat`) with tools `read_file`, `edit_file`, `create_file`, `remove_file`, `bash`, `spawn_subagent`, `load_skill`, `request_mode_change`; journals the system prompt once and reuses it verbatim on every run |
+| `mo_worker` | One process per session: runs the LLM agent loop (via `nah_chat`) with tools `read_file`, `edit_file`, `create_file`, `remove_file`, `bash`, `spawn_subagent`, `load_skill`, `request_mode_change`, `ask_user`; journals the system prompt once and reuses it verbatim on every run |
 | `frontend` | React 19 + Vite + TS UI (Vite dev server on 3030, proxy `/api → :3031`) |
 
 Workers append chat/tool events to a per-session `journal.jsonl` and update
@@ -148,7 +148,9 @@ cargo run -p mo_gateway
 ```
 
 The mock responds based on the prompt: prompts containing `subagent` exercise
-`spawn_subagent`, prompts containing `slow` start a long-running `bash sleep`
+`spawn_subagent`, prompts containing `ask_user` ask a clarification question
+via `ask_user` (answer it with `POST /api/sessions/:id/ask/answer` to see the
+run resume), prompts containing `slow` start a long-running `bash sleep`
 (handy for testing cancel), anything else does `read_file` + `bash`. Final
 answers are replayed as multiple content chunks, so the token-by-token
 streaming path is exercised in smoke tests too.
@@ -225,6 +227,28 @@ picks up where it left off with the new write sandbox. **Reject**
 `mode_change_request_declined` marker — no mode switch, nothing sent to the
 model — and the composer unfreezes. Subagents cannot use the tool (their
 journal has no UI); they must report the need to their parent agent.
+
+**Asking the user questions.** When the model needs more input from the
+user mid-task — a choice between approaches, a preference, or a detail
+only the user can decide — it calls the `ask_user` tool with a single
+question: `question_title` (the precise, concise headline), `question_text`
+(a longer explanation) and `options` (each with a concise `option_title`
+and an explanatory `option_text`; may be empty for a free-text-only
+question). The system prompts for all three modes explicitly tell the model
+to ask for clarification this way. The tool journals an
+`ask_user_request` event (stage 1: one question per call — the model calls
+the tool again for further questions, and a second call is refused while
+one is pending) and tells the model to stop and wait. The frontend shows a
+question card in place of the composer while the request is pending: every
+option as a selectable card plus a final **empty free-text input box** —
+the user answers by picking an option (the answer is that option's title)
+or typing their own text. **Send answer** (`POST /api/sessions/:id/ask/
+answer`, body `{answers: {<question_id>: <answer>}}`) journals an
+`ask_user_answered` event and respawns the worker; the history rebuild maps
+it to a user-role message carrying the answers as a JSON object keyed by
+`question_id` (e.g. `{"q1": "Rust"}`), so the model receives the answer —
+the tool's "return value" — and continues where it left off. Subagents
+cannot use the tool; they must ask their parent agent instead.
 
 ## Subagents
 
@@ -384,6 +408,7 @@ $HOME/.agents/
 | `POST /api/sessions/:id/mode` `{mode}` | switch a terminal session's mode (409 while running): changes only the write sandbox of subsequent runs — the journaled system prompt never changes; the switch surfaces as a `mode_change` notice before the next user message |
 | `POST /api/sessions/:id/mode/approve` | approve a pending `mode_change_request` (the agent called `request_mode_change`): switch the session's mode to the requested one and continue the run with a single `mode_change` notice (409 unless the journal's last mode marker is a pending request) |
 | `POST /api/sessions/:id/mode/reject` | reject a pending `mode_change_request`: journal a `mode_change_request_declined` marker, no mode switch, nothing sent to the model (409 unless a request is pending) |
+| `POST /api/sessions/:id/ask/answer` `{answers}` | the user answered a pending `ask_user_request` (the agent asked a clarification question via `ask_user`): `answers` is a JSON object keyed by `question_id` whose values are the chosen option's title or the user's typed text; journals an `ask_user_answered` event and resumes the run (409 unless a request is pending) |
 | `POST /api/sessions/:id/cancel` | mark cancelled, then SIGTERM → SIGKILL the worker process group |
 | `DELETE /api/sessions/:id` | permanently delete a session: stop a running worker, remove the session dir (journal, worker log, ...) from disk, drop the DB row (`204` on success) |
 
@@ -399,6 +424,12 @@ continue a run after a `mode_change_request`), `mode_change_request` (the
 agent's request, via the `request_mode_change` tool, to switch the
 session's mode, with the model's message for the user),
 `mode_change_request_declined` (the user rejected the request),
+`ask_user_request` (the agent asked a clarification question via the
+`ask_user` tool: the question with its options; the frontend shows a
+question card while it is pending), `ask_user_answered` (the user answered:
+a JSON object keyed by `question_id` whose values are the chosen option's
+title or the user's typed text — the worker maps it to a user message, so
+the model receives the answers),
 `context_usage` (context length in tokens after each LLM call, from the
 API's `usage.prompt_tokens`), `subagent_started` (a parent worker spawned a
 subagent: child session id + the `spawn_subagent` tool-call id + the

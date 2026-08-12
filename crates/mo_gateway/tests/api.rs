@@ -950,17 +950,24 @@ async fn modes_endpoint_lists_the_three_modes() {
     let names: Vec<&str> = modes.iter().map(|m| m["name"].as_str().unwrap()).collect();
     assert_eq!(names, vec!["build", "plan", "explore"]);
     // The UI picker shows a description and the tool set (which now
-    // includes request_mode_change in every mode).
+    // includes request_mode_change and ask_user in every mode).
     for m in modes {
         assert!(!m["label"].as_str().unwrap().is_empty());
         assert!(!m["description"].as_str().unwrap().is_empty());
-        assert!(m["tools"].as_array().unwrap().len() == 8);
+        assert!(m["tools"].as_array().unwrap().len() == 9);
         assert!(
             m["tools"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .any(|t| t == "request_mode_change")
+        );
+        assert!(
+            m["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t == "ask_user")
         );
     }
 }
@@ -1255,6 +1262,111 @@ async fn reject_mode_change_keeps_mode_and_resolves_request() {
         Method::POST,
         &format!("/api/sessions/{id}/mode/reject"),
         None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+/// The user answers a pending clarification question (the agent called
+/// `ask_user`): the gateway journals an `AskUserAnswered` event carrying
+/// the answers as a JSON object keyed by question_id and resumes the run
+/// (session back to pending with a fresh worker).
+#[tokio::test]
+async fn answer_ask_user_continues_run() {
+    let (_dir, app) = setup(true);
+    let workdir = _dir.path().join("work");
+
+    let (_, session) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({ "workdir": workdir.display().to_string(), "prompt": "which language?" })),
+    )
+    .await;
+    let id = session["id"].as_str().unwrap().to_string();
+    let journal_path = session["journal_path"].as_str().unwrap().to_string();
+
+    // Stop the stub worker, then shape the journal: a completed run + the
+    // worker's pending clarification question (what the ask_user tool
+    // journals).
+    let (_, stopped) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{id}/cancel"),
+        None,
+    )
+    .await;
+    assert_eq!(stopped["status"], "cancelled");
+    {
+        let mut journal = JournalWriter::open(Path::new(&journal_path)).unwrap();
+        journal
+            .append(JournalEventKind::SystemPrompt {
+                content: "build framing".to_string(),
+                mode: Mode::Build,
+            })
+            .unwrap();
+        journal
+            .append(JournalEventKind::Message(mo_core::JournalMessage {
+                role: "assistant".to_string(),
+                content: "let me ask the user".to_string(),
+                reasoning_content: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }))
+            .unwrap();
+        journal
+            .append(JournalEventKind::AskUserRequest {
+                question: mo_core::AskUserQuestion {
+                    question_id: "q1".to_string(),
+                    question_title: "Select a language".to_string(),
+                    question_text: "Which one?".to_string(),
+                    options: vec![
+                        mo_core::AskUserOption {
+                            option_title: "C++".to_string(),
+                            option_text: "Fast".to_string(),
+                        },
+                        mo_core::AskUserOption {
+                            option_title: "Python".to_string(),
+                            option_text: "Easy".to_string(),
+                        },
+                    ],
+                },
+            })
+            .unwrap();
+    }
+
+    // Answering (a free-text answer here) returns the session queued as
+    // pending with a fresh worker...
+    let (status, resumed) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{id}/ask/answer"),
+        Some(json!({ "answers": { "q1": "Rust" } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(resumed["status"], "pending");
+    assert!(resumed["pid"].is_number(), "worker should be respawned");
+
+    // ...journals the answers keyed by question_id...
+    let events = mo_core::read_events(Path::new(&journal_path)).unwrap();
+    // seq 0: initial user message (gateway), 1: system prompt, 2: assistant
+    // message, 3: ask_user_request, 4: ask_user_answered.
+    assert_eq!(events.len(), 5, "events: {events:#?}");
+    match &events[4].kind {
+        JournalEventKind::AskUserAnswered { answers } => {
+            assert_eq!(answers.len(), 1, "answers: {answers:?}");
+            assert_eq!(answers.get("q1").map(String::as_str), Some("Rust"));
+        }
+        other => panic!("expected ask_user_answered, got: {other:?}"),
+    }
+
+    // ...and the pending request is resolved: a second answer is a conflict.
+    let (status, _) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{id}/ask/answer"),
+        Some(json!({ "answers": { "q1": "Python" } })),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);

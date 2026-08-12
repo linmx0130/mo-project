@@ -794,6 +794,103 @@ fn history_places_mode_change_before_followup_user_message() {
     );
 }
 
+/// An `AskUserAnswered` event (the user answered a clarification question
+/// the model asked via `ask_user`) must appear in the rebuilt context as a
+/// user-role message carrying the answers as a JSON object keyed by
+/// question_id — the tool's "return value" — while the `AskUserRequest`
+/// itself is flow metadata and never becomes a chat message.
+#[test]
+fn history_synthesizes_answer_message_from_ask_user_answered() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("journal.jsonl");
+    let mut journal = JournalWriter::open(&path).unwrap();
+    journal
+        .append(JournalEventKind::Message(JournalMessage {
+            role: "user".to_string(),
+            content: "which language?".to_string(),
+            reasoning_content: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }))
+        .unwrap();
+    journal
+        .append(JournalEventKind::SystemPrompt {
+            content: "You are in Build mode.".to_string(),
+            mode: Mode::Build,
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::Message(JournalMessage {
+            role: "assistant".to_string(),
+            content: String::new(),
+            reasoning_content: None,
+            tool_call_id: None,
+            tool_calls: Some(vec![ToolCallInfo {
+                id: "call_ask".to_string(),
+                name: "ask_user".to_string(),
+                arguments: r#"{"question_title":"Select a language","question_text":"Which one?","options":[{"option_title":"C++","option_text":"Fast"},{"option_title":"Python","option_text":"Easy"}]}"#.to_string(),
+            }]),
+        }))
+        .unwrap();
+    journal
+        .append(JournalEventKind::ToolResult {
+            id: "call_ask".to_string(),
+            name: "ask_user".to_string(),
+            ok: true,
+            output: "Clarification question sent to the user: ... Stop working now: ..."
+                .to_string(),
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::Message(JournalMessage {
+            role: "assistant".to_string(),
+            content: "I asked the user; waiting for the answer.".to_string(),
+            reasoning_content: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }))
+        .unwrap();
+    // The gateway appended the answer (what the user picked in the UI).
+    let mut answers = std::collections::BTreeMap::new();
+    answers.insert("q1".to_string(), "Rust".to_string());
+    journal
+        .append(JournalEventKind::AskUserAnswered { answers })
+        .unwrap();
+    drop(journal);
+
+    let (system, messages, _) = history_from_journal(&path).unwrap();
+    assert_eq!(system.as_deref(), Some("You are in Build mode."));
+    // user, assistant(tool call), tool(result), assistant(waiting), user(answers)
+    assert_eq!(messages.len(), 5, "messages: {messages:#?}");
+    assert_eq!(messages[0].role, "user");
+    assert_eq!(messages[0].content.to_string(), "which language?");
+    assert_eq!(messages[1].role, "assistant");
+    assert!(
+        messages[1]
+            .tool_calls
+            .as_ref()
+            .is_some_and(|c| c.len() == 1)
+    );
+    assert_eq!(messages[2].role, "tool");
+    assert!(messages[2].content.to_string().contains("Stop working now"));
+    assert_eq!(messages[3].role, "assistant");
+    assert_eq!(
+        messages[3].content.to_string(),
+        "I asked the user; waiting for the answer."
+    );
+    // The last message is the synthesized answer, carrying the JSON object
+    // keyed by question_id (the tool's return value to the model).
+    assert_eq!(messages[4].role, "user");
+    let answer = messages[4].content.to_string();
+    assert!(
+        answer.starts_with("[The user answered your clarification question:]"),
+        "got: {answer}"
+    );
+    assert!(answer.contains("\"q1\": \"Rust\""), "got: {answer}");
+    // The AskUserRequest event never became a chat message on its own.
+    assert_eq!(messages.len(), 5);
+}
+
 fn user_msg(content: &str) -> JournalEventKind {
     JournalEventKind::Message(JournalMessage {
         role: "user".to_string(),

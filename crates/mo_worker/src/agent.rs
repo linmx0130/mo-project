@@ -380,6 +380,26 @@ fn history_from_journal(
                     tool_calls: None,
                 });
             }
+            JournalEventKind::AskUserAnswered { answers } => {
+                // The user answered the clarification question the model
+                // asked via the `ask_user` tool. Synthesized as a user-role
+                // message carrying the answers as a JSON object keyed by
+                // question_id — the tool's "return value" to the model —
+                // exactly like the ModeChange notice above. (`AskUserRequest`
+                // itself is flow metadata and falls into the default skip.)
+                let json = serde_json::to_string_pretty(&answers).unwrap_or_default();
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: ChatMessageContentValue::Text(format!(
+                        "{}{}",
+                        crate::prompt::ASK_USER_ANSWER_PREFIX,
+                        json
+                    )),
+                    reasoning_content: None,
+                    tool_call_id: None,
+                    tool_calls: None,
+                });
+            }
             JournalEventKind::Message(m) => messages.push(ChatMessage {
                 role: m.role,
                 content: ChatMessageContentValue::Text(m.content),

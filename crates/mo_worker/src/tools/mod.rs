@@ -1,6 +1,7 @@
 //! Tool registry: OpenAI nested tool definitions plus argument validation
 //! and dispatch.
 
+pub mod ask_user;
 pub mod bash;
 pub mod fs;
 pub mod request_mode_change;
@@ -21,6 +22,7 @@ pub const TOOL_BASH: &str = "bash";
 pub const TOOL_SPAWN_SUBAGENT: &str = "spawn_subagent";
 pub const TOOL_LOAD_SKILL: &str = "load_skill";
 pub const TOOL_REQUEST_MODE_CHANGE: &str = "request_mode_change";
+pub const TOOL_ASK_USER: &str = "ask_user";
 
 /// Everything a tool needs to run: the sandboxed workdir, the shared data
 /// dir (for subagent sessions), the global agents dir (passed down so
@@ -181,6 +183,35 @@ pub fn tool_definitions() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": TOOL_ASK_USER,
+                "description": "Ask the user (in the UI) a clarification question when you need more input from them — a choice between approaches, a preference, or a detail only the user can decide. The question is shown with every option plus a free-text input box; the user answers by picking an option (the answer is that option's title) or typing their own text. Call this tool once per question (one question per call; call it again for further questions after the user answered). After calling it, stop working and finish your turn: the answer arrives as a user message carrying a JSON object keyed by question_id (e.g. {\"q1\": \"Rust\"}), then continue. Root sessions only: subagents must ask their parent agent instead.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question_title": { "type": "string", "description": "The precise, concise headline of the question, shown to the user." },
+                        "question_text": { "type": "string", "description": "A longer explanation of the question for the user (what you need and why)." },
+                        "options": {
+                            "type": "array",
+                            "description": "Preset choices for the user. Each option has a precise, concise `option_title` (what comes back as the answer when chosen) and an `option_text` that further explains the option. Pass an empty array for a free-text-only question.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "option_title": { "type": "string", "description": "The precise, concise label the user picks (also the answer value)." },
+                                    "option_text": { "type": "string", "description": "A longer explanation of this option for the user." }
+                                },
+                                "required": ["option_title", "option_text"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["question_title", "question_text", "options"],
+                    "additionalProperties": false
+                }
+            }
+        }),
     ]
 }
 
@@ -332,6 +363,11 @@ pub async fn execute_tool(
             let args: request_mode_change::RequestModeChangeArgs = serde_json::from_str(arguments)
                 .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
             request_mode_change::request_mode_change(ctx, &args, on_event)
+        }
+        TOOL_ASK_USER => {
+            let args: ask_user::AskUserArgs = serde_json::from_str(arguments)
+                .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
+            ask_user::ask_user(ctx, &args, on_event)
         }
         other => Err(format!("unknown tool: {other}")),
     }
