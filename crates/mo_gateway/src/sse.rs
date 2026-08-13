@@ -10,7 +10,7 @@ use axum::{
     response::sse::{Event, Sse},
 };
 use futures_util::Stream;
-use mo_core::{JournalEventKind, SessionStatus, db, read_events_after};
+use mo_core::{JournalEventKind, SessionStatus, db};
 use serde::Deserialize;
 use serde_json::json;
 use tracing::warn;
@@ -50,38 +50,43 @@ pub async fn events(
 
     let db_state = state.clone();
     let stream = async_stream::stream! {
-        // Cursor into the journal. `synced` is false until the first poll,
-        // which reads the whole journal: it seeds journal_status (so a
-        // terminal status the client already saw via history is never
-        // re-synthesized) while only emitting events after the cursor.
+        // Cursor into the journal (last `seq` emitted to the client). The
+        // first poll reads the whole file from byte offset 0 — that is how
+        // `journal_status` is seeded (so a terminal status the client already
+        // saw via history is never re-synthesized) — while only events after
+        // the cursor are emitted. Later polls read only the appended bytes,
+        // so the cost stays proportional to the new data instead of growing
+        // with the whole session history.
         let mut cursor: Option<u64> = query.after_seq;
-        let mut synced = false;
         let mut journal_status: Option<SessionStatus> = None;
         let mut idle_polls: u32 = 0;
+        let mut offset: u64 = 0;
+        let mut pending: Vec<u8> = Vec::new();
         let mut interval = tokio::time::interval(POLL_INTERVAL);
+        // Never let a slow poll turn into a busy spin: with the default
+        // `Burst` behavior, once a poll takes longer than the interval every
+        // missed tick fires immediately, pegging a CPU core until the journal
+        // shrinks back below the interval.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             interval.tick().await;
 
-            // 1. Journal tail: emit new events, track last journaled status.
+            // 1. Journal tail: parse only the bytes appended since the last
+            //    poll, emit new events, track the last journaled status.
             let mut any_new = false;
-            let events = if synced {
-                read_events_after(
-                    std::path::Path::new(&journal_path),
-                    cursor.unwrap_or(0),
-                )
-            } else {
-                mo_core::read_events(std::path::Path::new(&journal_path))
-            };
-            match events {
-                Ok(events) => {
+            match mo_core::read_events_tail(
+                std::path::Path::new(&journal_path),
+                offset,
+                &mut pending,
+            ) {
+                Ok((events, new_offset)) => {
+                    offset = new_offset;
                     for event in events {
                         if let JournalEventKind::StatusChange { status, .. } = &event.kind {
                             journal_status = Some(*status);
                         }
-                        if !synced
-                            && cursor.is_some_and(|c| event.seq <= c)
-                        {
+                        if cursor.is_some_and(|c| event.seq <= c) {
                             continue;
                         }
                         cursor = Some(event.seq);
@@ -89,7 +94,6 @@ pub async fn events(
                         let payload = serde_json::to_string(&event).unwrap_or_default();
                         yield Ok(Event::default().data(payload));
                     }
-                    synced = true;
                 }
                 Err(e) => warn!(session = %id, "journal read error: {e}"),
             }
@@ -115,16 +119,12 @@ pub async fn events(
                     };
                     {
                         let conn = db_state.db.lock().unwrap_or_else(|e| e.into_inner());
-                        let _ = db::update_status(&conn, &id, SessionStatus::Failed, Some(error));
+                        let _ = db::update_status(&conn, &id, SessionStatus::Failed, Some(error.clone()));
                     }
-                    // Re-fetch so the synthesized event below carries the
-                    // flipped status rather than the stale `running` one.
-                    if let Some(fresh) = {
-                        let conn = db_state.db.lock().unwrap_or_else(|e| e.into_inner());
-                        db::get_session(&conn, &id).ok().flatten()
-                    } {
-                        row = fresh;
-                    }
+                    // Carry the flipped status on the in-memory row so the
+                    // synthesized event below carries it without re-fetching.
+                    row.status = SessionStatus::Failed;
+                    row.error = Some(error);
                 }
             }
             let should_synthesize = match journal_status {

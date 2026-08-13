@@ -89,6 +89,126 @@ fn missing_file_reads_as_empty() {
 }
 
 #[test]
+fn read_events_tail_reads_only_appended_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("journal.jsonl");
+    let mut writer = JournalWriter::open(&path).unwrap();
+    writer.append(msg_event("user", "a")).unwrap();
+    writer.append(msg_event("assistant", "b")).unwrap();
+    drop(writer);
+
+    let mut pending = Vec::new();
+    let (events, offset) = read_events_tail(&path, 0, &mut pending).unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(offset > 0);
+
+    // Appending one more event must return only that event on the next read.
+    let mut writer = JournalWriter::open(&path).unwrap();
+    writer.append(msg_event("user", "c")).unwrap();
+    drop(writer);
+
+    let (events, offset2) = read_events_tail(&path, offset, &mut pending).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].seq, 2);
+    assert!(offset2 > offset);
+
+    // A re-read from the same offset is a no-op (nothing new appended).
+    let (events, offset3) = read_events_tail(&path, offset2, &mut pending).unwrap();
+    assert!(events.is_empty());
+    assert_eq!(offset3, offset2);
+}
+
+#[test]
+fn read_events_tail_missing_file_is_empty_and_keeps_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pending = Vec::new();
+    let (events, offset) =
+        read_events_tail(&dir.path().join("nope.jsonl"), 0, &mut pending).unwrap();
+    assert!(events.is_empty());
+    assert_eq!(offset, 0);
+}
+
+#[test]
+fn read_events_tail_tolerates_torn_trailing_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("journal.jsonl");
+    let mut writer = JournalWriter::open(&path).unwrap();
+    writer.append(msg_event("user", "a")).unwrap();
+    drop(writer);
+
+    // A line written in two writes (the worker writes the JSON and the
+    // newline separately): the first read sees the line without its tail.
+    let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+    f.write_all(br#"{"seq":1,"ts":"2026-01-01T00:00:00Z","kind":{"kind":"message","role":"user","content":"b"}"#)
+        .unwrap();
+    f.flush().unwrap();
+    drop(f);
+
+    let mut pending = Vec::new();
+    let (events, offset) = read_events_tail(&path, 0, &mut pending).unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(!pending.is_empty(), "torn tail must be retained");
+
+    // Finish the torn line (the retained fragment already closed the `kind`
+    // object; only the outer object's brace is missing); the retained
+    // fragment plus the new bytes form a complete event.
+    let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+    f.write_all(b"}\n").unwrap();
+    f.flush().unwrap();
+    drop(f);
+
+    let (events, _) = read_events_tail(&path, offset, &mut pending).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].seq, 1);
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn read_events_tail_handles_multibyte_split_across_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("journal.jsonl");
+    let mut writer = JournalWriter::open(&path).unwrap();
+    writer.append(msg_event("user", "ok")).unwrap();
+    drop(writer);
+
+    let event = JournalEvent {
+        seq: 1,
+        ts: chrono::Utc::now(),
+        kind: msg_event("user", "héllo"),
+    };
+    let line = serde_json::to_string(&event).unwrap();
+    let bytes = line.as_bytes();
+    // 'é' is 0xC3 0xA9 in UTF-8: split between those two bytes so the first
+    // read ends mid-codepoint.
+    let pos = bytes.iter().position(|&b| b == 0xC3).unwrap();
+    let split = pos + 1;
+
+    let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+    f.write_all(&bytes[..split]).unwrap();
+    f.flush().unwrap();
+    drop(f);
+
+    let mut pending = Vec::new();
+    let (events, offset) = read_events_tail(&path, 0, &mut pending).unwrap();
+    assert_eq!(events.len(), 1); // only the first, complete line
+    assert!(!pending.is_empty());
+
+    let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+    f.write_all(&bytes[split..]).unwrap();
+    f.write_all(b"\n").unwrap();
+    f.flush().unwrap();
+    drop(f);
+
+    let (events, _) = read_events_tail(&path, offset, &mut pending).unwrap();
+    assert_eq!(events.len(), 1);
+    match &events[0].kind {
+        JournalEventKind::Message(m) => assert_eq!(m.content, "héllo"),
+        other => panic!("expected message, got: {other:?}"),
+    }
+    assert!(pending.is_empty());
+}
+
+#[test]
 fn status_change_event_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("journal.jsonl");
