@@ -555,3 +555,183 @@ async fn reject_mode_change_without_pending_request_conflicts() {
     let (status, _) = post_empty_json(&app.state, "s1", "/mode/reject").await;
     assert_eq!(status, StatusCode::CONFLICT);
 }
+
+fn ask_user_request() -> JournalEventKind {
+    JournalEventKind::AskUserRequest {
+        question: mo_core::AskUserQuestion {
+            question_id: "q1".to_string(),
+            question_title: "Select a language".to_string(),
+            question_text: "Which one?".to_string(),
+            options: vec![
+                mo_core::AskUserOption {
+                    option_title: "C++".to_string(),
+                    option_text: "Fast".to_string(),
+                },
+                mo_core::AskUserOption {
+                    option_title: "Python".to_string(),
+                    option_text: "Easy".to_string(),
+                },
+            ],
+        },
+    }
+}
+
+/// POST the user's answer to a pending `ask_user_request` with a JSON body.
+async fn post_ask_answer(
+    app: &Arc<AppState>,
+    id: &str,
+    answers: &str,
+) -> (StatusCode, serde_json::Value) {
+    let router = create_router(app.clone());
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/sessions/{id}/ask/answer"))
+        .header("content-type", "application/json")
+        .body(Body::from(format!(r#"{{"answers":{answers}}}"#)))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
+/// The journal of a terminal session where the agent asked a clarification
+/// question (via ask_user) and the user has not answered yet.
+fn pending_ask_journal(session: &Session) {
+    append_kinds(
+        &session.journal_path,
+        &[
+            user_msg("which language?"),
+            system_prompt(Mode::Build),
+            assistant_msg("let me ask the user"),
+            ask_user_request(),
+        ],
+    );
+}
+
+/// Answering a pending question (option or free text) journals an
+/// `AskUserAnswered` event with the answers as a JSON object keyed by
+/// question_id and respawns the worker (session back to pending).
+#[tokio::test]
+async fn answer_ask_user_journals_answers_and_respawns() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    pending_ask_journal(&session);
+
+    // Option pick: the answer value is the chosen option's title.
+    let (status, body) = post_ask_answer(&app.state, "s1", r#"{"q1":"C++"}"#).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["status"], "pending", "body: {body}");
+    assert!(
+        body["pid"].is_number(),
+        "worker should be respawned: {body}"
+    );
+
+    let kinds = read_kinds(&app, "s1");
+    assert_eq!(kinds.len(), 5, "kinds: {kinds:#?}");
+    match &kinds[4] {
+        JournalEventKind::AskUserAnswered { answers } => {
+            assert_eq!(answers.len(), 1, "answers: {answers:?}");
+            assert_eq!(answers.get("q1").map(String::as_str), Some("C++"));
+        }
+        other => panic!("expected ask_user_answered at seq 4, got: {other:?}"),
+    }
+
+    // A second answer (the request is resolved) is a conflict.
+    let (status, _) = post_ask_answer(&app.state, "s1", r#"{"q1":"Python"}"#).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+/// Free-text answers work too (the user did not pick any option).
+#[tokio::test]
+async fn answer_ask_user_accepts_free_text() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    pending_ask_journal(&session);
+
+    let (status, _) = post_ask_answer(&app.state, "s1", r#"{"q1":"Rust"}"#).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let kinds = read_kinds(&app, "s1");
+    match &kinds[4] {
+        JournalEventKind::AskUserAnswered { answers } => {
+            assert_eq!(answers.get("q1").map(String::as_str), Some("Rust"));
+        }
+        other => panic!("expected ask_user_answered, got: {other:?}"),
+    }
+}
+
+/// Answering with no pending question (or an already-resolved one) is a
+/// conflict; unknown ids, missing answers and empty answers are bad
+/// requests.
+#[tokio::test]
+async fn answer_ask_user_validates_state_and_answers() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+
+    // No request ever made -> conflict.
+    append_kinds(&session.journal_path, &[user_msg("hi")]);
+    let (status, _) = post_ask_answer(&app.state, "s1", r#"{"q1":"Rust"}"#).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // A request that was already answered is not pending -> conflict.
+    append_kinds(
+        &session.journal_path,
+        &[
+            ask_user_request(),
+            JournalEventKind::AskUserAnswered {
+                answers: BTreeMap::from([("q1".to_string(), "Rust".to_string())]),
+            },
+        ],
+    );
+    let (status, _) = post_ask_answer(&app.state, "s1", r#"{"q1":"Rust"}"#).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+/// Answering while the session is running is refused.
+#[tokio::test]
+async fn answer_ask_user_while_running_conflicts() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    pending_ask_journal(&session);
+    {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::update_status(&conn, "s1", SessionStatus::Running, None).unwrap();
+    }
+    let (status, _) = post_ask_answer(&app.state, "s1", r#"{"q1":"Rust"}"#).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+/// Malformed answer payloads are bad requests: unknown question ids,
+/// missing answers, empty answers, and a totally empty answers object.
+#[tokio::test]
+async fn answer_ask_user_rejects_bad_answers() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    pending_ask_journal(&session);
+
+    for (answers, needle) in [
+        (r#"{"q2":"Rust"}"#, "unknown question id"),
+        (r#"{}"#, "missing answer"),
+        (r#"{"q1":"   "}"#, "must not be empty"),
+        (r#"{"q1":"Rust","q2":"Go"}"#, "unknown question id"),
+    ] {
+        let (status, body) = post_ask_answer(&app.state, "s1", answers).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "answers: {answers}");
+        assert!(
+            body.to_string().contains(needle),
+            "answers: {answers}, body: {body}"
+        );
+    }
+    // Nothing was journaled (the pending request is still pending).
+    let kinds = read_kinds(&app, "s1");
+    assert_eq!(kinds.len(), 4, "kinds: {kinds:#?}");
+    assert!(
+        !kinds
+            .iter()
+            .any(|k| matches!(k, JournalEventKind::AskUserAnswered { .. })),
+        "no answer may be journaled: {kinds:#?}"
+    );
+}

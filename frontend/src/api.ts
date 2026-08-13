@@ -65,6 +65,24 @@ export interface ToolCallInfo {
   arguments: string
 }
 
+/** One selectable option of a clarification question (the `ask_user` tool):
+ *  `option_title` is the precise, concise label the user picks (and the
+ *  answer value when chosen); `option_text` further explains the option. */
+export interface AskUserOption {
+  option_title: string
+  option_text: string
+}
+
+/** One clarification question (the `ask_user` tool). Stage 1 supports one
+ *  question per call; `question_id` is assigned by the worker (`q1`) and
+ *  keys the answer in the `ask_user_answered` answers object. */
+export interface AskUserQuestion {
+  question_id: string
+  question_title: string
+  question_text: string
+  options: AskUserOption[]
+}
+
 export interface JournalMessage {
   role: string
   content: string
@@ -103,6 +121,17 @@ export type JournalEventKind =
    *  reject); it resolves the request — no mode switch happens. Rendered
    *  as a passive notice row. */
   | { kind: 'mode_change_request_declined'; mode: Mode }
+  /** The agent asked the user a clarification question (the `ask_user`
+   *  tool). While the latest such request is pending (no
+   *  `ask_user_answered` after it), the frontend freezes the composer and
+   *  shows a question card: every option plus a free-text input box. */
+  | { kind: 'ask_user_request'; question: AskUserQuestion }
+  /** The user answered a pending `ask_user_request` (POST /:id/ask/answer):
+   *  `answers` is a JSON object keyed by question_id whose values are the
+   *  chosen option's title or the user's typed text. It resolves the
+   *  request; the worker respawns and the model receives the answers as a
+   *  user message. Rendered as a passive notice row. */
+  | { kind: 'ask_user_answered'; answers: Record<string, string> }
   /** Streamed assistant text/reasoning chunk; the following `message` event
    *  carries the assembled content and replaces the delta-built preview. */
   | { kind: 'message_delta'; content: string; reasoning_content?: string | null }
@@ -213,6 +242,21 @@ export function approveModeChange(id: string): Promise<Session> {
  *  switching the mode (nothing is sent to the agent). */
 export function rejectModeChange(id: string): Promise<Session> {
   return http(`/api/sessions/${id}/mode/reject`, { method: 'POST' })
+}
+
+/** Answer a pending `ask_user_request` (the agent asked a clarification
+ *  question via the ask_user tool): `answers` maps question_id to the
+ *  chosen option's title or the user's typed text. The backend journals the
+ *  answers and resumes the run. */
+export function answerAskUser(
+  id: string,
+  answers: Record<string, string>,
+): Promise<Session> {
+  return http(`/api/sessions/${id}/ask/answer`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ answers }),
+  })
 }
 
 /** Send a followup message to a terminal session; the worker respawns and

@@ -496,6 +496,123 @@ p {
   cursor: default;
 }
 
+/* ---------- clarification question card ---------- */
+/* Shown in place of the composer while an `ask_user_request` is pending:
+   the agent's question (title + explanation), every option as a selectable
+   card, and a final empty free-text input box. The user answers by picking
+   an option (the answer is that option's title) or typing their own text. */
+.ask-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+  padding: 12px;
+}
+
+.ask-card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.ask-card-title {
+  font-weight: 600;
+}
+
+.ask-question {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ask-question-title {
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.ask-question-text {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-h);
+}
+
+.ask-options {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ask-option {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  padding: 8px 10px;
+  font: inherit;
+  color: var(--text-h);
+  cursor: pointer;
+}
+
+.ask-option:hover {
+  border-color: var(--accent);
+}
+
+.ask-option.selected {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+}
+
+.ask-option-title {
+  font-weight: 600;
+}
+
+.ask-option-text {
+  color: var(--text-muted);
+  font-size: 0.9em;
+}
+
+.ask-freestyle {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text-h);
+  padding: 8px 10px;
+  font: inherit;
+}
+
+.ask-freestyle:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.ask-card-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.ask-card-actions .send {
+  border-radius: 6px;
+  padding: 6px 18px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  background: var(--accent-bg);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+}
+
+.ask-card-actions .send:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* ---------- status bar ---------- */
 
 .status-bar {

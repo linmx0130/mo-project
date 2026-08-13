@@ -1,5 +1,6 @@
 //! Shared domain types: sessions and journal events.
 
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -162,6 +163,59 @@ pub struct JournalMessage {
     pub tool_calls: Option<Vec<ToolCallInfo>>,
 }
 
+/// One selectable option of a clarification question (`ask_user` tool).
+/// `option_title` is the precise, concise label the user picks — and the
+/// value that comes back as the answer when the option is chosen;
+/// `option_text` further explains the option in the UI.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AskUserOption {
+    pub option_title: String,
+    pub option_text: String,
+}
+
+/// One clarification question (`ask_user` tool). Stage 1 supports exactly
+/// one question per tool call — the model calls the tool again for further
+/// questions, and a second call is refused while one is pending.
+///
+/// `question_id` is assigned by the worker (`q1` by default) and keys the
+/// answer in the `AskUserAnswered` answers object. `question_title` is the
+/// precise, concise headline; `question_text` further explains the question
+/// to the user. `options` lists the preset choices (each with a concise
+/// `option_title` and an explanatory `option_text`); it may be empty, in
+/// which case the user answers with free text only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AskUserQuestion {
+    pub question_id: String,
+    pub question_title: String,
+    pub question_text: String,
+    pub options: Vec<AskUserOption>,
+}
+
+/// The journal's *ask-user marker* — the last event that pins down the
+/// clarification-request state, as scanned by the worker's `ask_user` tool
+/// (refuse while a request is pending) and the gateway's answer endpoint
+/// (409 unless a request is pending).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskUserMarker {
+    /// An `ask_user_request` with no `ask_user_answered` after it: the
+    /// question is still waiting for the user's answer.
+    RequestPending,
+    /// An `ask_user_answered` event: the pending request was answered; no
+    /// request is pending.
+    Answered,
+}
+
+/// Scan journal events (oldest first) for the last ask-user marker, if any.
+/// Anything else (`ModeChangeRequest`, messages, tool events, ...) does not
+/// resolve a request and is skipped.
+pub fn last_ask_user_marker(events: &[JournalEvent]) -> Option<AskUserMarker> {
+    events.iter().rev().find_map(|e| match &e.kind {
+        JournalEventKind::AskUserRequest { .. } => Some(AskUserMarker::RequestPending),
+        JournalEventKind::AskUserAnswered { .. } => Some(AskUserMarker::Answered),
+        _ => None,
+    })
+}
+
 /// The payload of a journal line, serde-tagged on `kind`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -246,6 +300,33 @@ pub enum JournalEventKind {
     /// reaches the model context — it is flow metadata, not a chat message.
     ModeChangeRequestDeclined {
         mode: Mode,
+    },
+    /// The worker's clarification question, via the `ask_user` tool.
+    /// Journaled by the worker when the model calls the tool; the frontend
+    /// renders it as a question card (every option plus a free-text input
+    /// box) and freezes the composer while it is pending. Stage 1 supports
+    /// exactly one question per call — the model calls the tool again for
+    /// further questions, and a second call is refused while one is pending.
+    ///
+    /// `question.question_id` is assigned by the worker (`q1`) and keys the
+    /// answer in the `AskUserAnswered` answers object. Readers (the worker's
+    /// history rebuild) skip this event: it is flow metadata for the UI,
+    /// never a chat message.
+    AskUserRequest {
+        question: AskUserQuestion,
+    },
+    /// The user answered a pending `AskUserRequest`. Journaled by the
+    /// gateway (`POST /api/sessions/:id/ask/answer`) when the user picks an
+    /// option or types a free-form answer in the UI; it resolves the request
+    /// (the worker respawns and the run continues) and carries the answers
+    /// as a JSON object keyed by `question_id` — each value is the chosen
+    /// option's `option_title` or the user's typed text.
+    ///
+    /// Like `ModeChange`, the worker's history rebuild maps this event to a
+    /// user-role message, so the model receives the answers (the tool's
+    /// "return value") as a user message on the resumed run.
+    AskUserAnswered {
+        answers: BTreeMap<String, String>,
     },
     /// A streamed chunk of an assistant message (token-by-token preview).
     ///
@@ -335,3 +416,8 @@ pub struct JournalEvent {
     pub ts: chrono::DateTime<chrono::Utc>,
     pub kind: JournalEventKind,
 }
+
+// Unit tests live in `mo_core/src/tests/types_tests.rs` (see AGENTS.md).
+#[cfg(test)]
+#[path = "tests/types_tests.rs"]
+mod tests;

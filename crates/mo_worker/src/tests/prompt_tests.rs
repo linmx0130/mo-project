@@ -205,6 +205,31 @@ fn all_modes_mention_context_compression() {
     }
 }
 
+/// Every mode's system prompt explicitly tells the model to ask the user
+/// for clarification (via the `ask_user` tool) when it needs more input —
+/// a choice, a preference, or a detail only the user can decide.
+#[test]
+fn all_modes_tell_the_model_to_ask_clarification() {
+    let dir = tempfile::tempdir().unwrap();
+    let agents = tempfile::tempdir().unwrap();
+    for mode in [Mode::Build, Mode::Plan, Mode::Explore] {
+        let prompt = prompt_for(mode, &dir, &agents);
+        assert!(prompt.contains("`ask_user`"), "mode {mode}: {prompt}");
+        assert!(
+            prompt.contains("If you need more input from the user to continue"),
+            "mode {mode}: {prompt}"
+        );
+        assert!(
+            prompt.contains("preset options and a free-text input box"),
+            "mode {mode}: {prompt}"
+        );
+        assert!(
+            prompt.contains("the user's answer arrives as a user message"),
+            "mode {mode}: {prompt}"
+        );
+    }
+}
+
 /// The handoff-generation instruction must demand all five sections.
 #[test]
 fn handoff_instruction_covers_all_sections() {

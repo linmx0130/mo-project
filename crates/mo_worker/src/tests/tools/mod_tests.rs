@@ -41,7 +41,7 @@ fn test_ctx(agents_dir: PathBuf) -> ToolContext {
 #[test]
 fn definitions_cover_all_tools() {
     let defs = tool_definitions();
-    assert_eq!(defs.len(), 8);
+    assert_eq!(defs.len(), 9);
     let names: Vec<&str> = defs
         .iter()
         .map(|d| d["function"]["name"].as_str().unwrap())
@@ -54,6 +54,7 @@ fn definitions_cover_all_tools() {
     assert!(names.contains(&TOOL_SPAWN_SUBAGENT));
     assert!(names.contains(&TOOL_LOAD_SKILL));
     assert!(names.contains(&TOOL_REQUEST_MODE_CHANGE));
+    assert!(names.contains(&TOOL_ASK_USER));
     // The request_mode_change definition carries the mode enum and the
     // user-language guidance.
     let def = defs
@@ -85,6 +86,42 @@ fn definitions_cover_all_tools() {
         description.contains("must-answer questions"),
         "got: {description}"
     );
+
+    // The ask_user definition carries the single-question shape: title,
+    // text and an options array of {option_title, option_text}; the
+    // description tells the model to stop and wait for the answer.
+    let def = defs
+        .iter()
+        .find(|d| d["function"]["name"] == TOOL_ASK_USER)
+        .unwrap();
+    let params = &def["function"]["parameters"];
+    assert_eq!(
+        params["properties"]["question_title"]["type"], "string",
+        "got: {params}"
+    );
+    assert_eq!(
+        params["properties"]["question_text"]["type"], "string",
+        "got: {params}"
+    );
+    assert_eq!(
+        params["properties"]["options"]["items"]["properties"]["option_title"]["type"], "string",
+        "got: {params}"
+    );
+    assert_eq!(
+        params["properties"]["options"]["items"]["properties"]["option_text"]["type"], "string",
+        "got: {params}"
+    );
+    assert_eq!(
+        params["required"],
+        json!(["question_title", "question_text", "options"]),
+        "got: {params}"
+    );
+    let description = def["function"]["description"].as_str().unwrap();
+    assert!(
+        description.contains("one question per call"),
+        "got: {description}"
+    );
+    assert!(description.contains("question_id"), "got: {description}");
 }
 
 #[tokio::test]

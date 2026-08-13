@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { JournalEvent, Mode, Session, SessionStatus } from '../api'
+import type { AskUserQuestion, JournalEvent, Mode, Session, SessionStatus } from '../api'
 import {
+  answerAskUser,
   approveModeChange,
   cancelSession,
   getHistory,
@@ -9,6 +10,7 @@ import {
   rejectModeChange,
   switchMode,
 } from '../api'
+import AskUserCard from './AskUserCard'
 import Composer from './Composer'
 import StatusBar from './StatusBar'
 import SubagentModal from './SubagentModal'
@@ -200,6 +202,29 @@ export default function SessionView({ session, onStatusChange }: Props) {
     }
     return lastRequest
   }, [events])
+  // A pending clarification question: the agent called `ask_user` (journaled
+  // as `ask_user_request`) and the user has not answered yet. Resolved by an
+  // `ask_user_answered` event after it. While pending, the composer is frozen
+  // and the question card (every option plus a free-text input) is shown.
+  const pendingQuestion = useMemo(() => {
+    let lastQuestion: { question: AskUserQuestion; seq: number } | null = null
+    let lastAnswerSeq: number | null = null
+    for (const ev of events) {
+      if (ev.kind.kind === 'ask_user_request') {
+        lastQuestion = {
+          question: ev.kind.question,
+          seq: ev.seq ?? -1,
+        }
+      } else if (ev.kind.kind === 'ask_user_answered') {
+        lastAnswerSeq = ev.seq ?? -1
+      }
+    }
+    if (!lastQuestion) return null
+    if (lastAnswerSeq !== null && lastAnswerSeq > lastQuestion.seq) {
+      return null
+    }
+    return lastQuestion
+  }, [events])
   // While any tool is still streaming, re-render once per second so the
   // elapsed badge ticks; stop when everything settles.
   const anyToolStreaming = timeline.some(
@@ -249,6 +274,25 @@ export default function SessionView({ session, onStatusChange }: Props) {
       setStatus(updated.status)
       // Re-arm the SSE stream / refetch history so the declined marker
       // lands in the timeline and the request stops being pending.
+      setRunId((r) => r + 1)
+      onStatusChange()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSending(false)
+    }
+  }
+
+  /** Answer the pending clarification question: the backend journals the
+   *  answers (a JSON object keyed by question_id) and resumes the run; the
+   *  model receives them as a user message. */
+  const submitAnswer = async (answers: Record<string, string>) => {
+    setSending(true)
+    try {
+      const updated = await answerAskUser(session.id, answers)
+      setStatus(updated.status)
+      // Re-arm the SSE stream (the run continues with the answer); the
+      // effect also refetches the history, which now resolves the request.
       setRunId((r) => r + 1)
       onStatusChange()
     } catch (err) {
@@ -316,7 +360,16 @@ export default function SessionView({ session, onStatusChange }: Props) {
         )}
       </div>
 
-      {pendingRequest && !running ? (
+      {pendingQuestion && !running ? (
+        // A clarification question from the agent is awaiting the user's
+        // answer: freeze the composer and show the question card (every
+        // option plus a free-text input box) instead.
+        <AskUserCard
+          question={pendingQuestion.question}
+          busy={sending}
+          onSubmit={(answers) => void submitAnswer(answers)}
+        />
+      ) : pendingRequest && !running ? (
         // A mode-change request from the agent is awaiting the user's
         // decision: freeze the input box and show Agree / Reject instead.
         <ModeChangeRequestBanner

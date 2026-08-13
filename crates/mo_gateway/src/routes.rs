@@ -1,6 +1,7 @@
 //! HTTP routes. Same skeleton as the rite-rsjs backend prototype:
 //! permissive CORS, trace layer, state behind `Arc`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -11,7 +12,8 @@ use axum::{
     routing::{get, post},
 };
 use mo_core::{
-    JournalEvent, JournalEventKind, JournalMessage, JournalWriter, Mode, Session, SessionStatus, db,
+    AskUserMarker, JournalEvent, JournalEventKind, JournalMessage, JournalWriter, Mode, Session,
+    SessionStatus, db,
 };
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
@@ -41,6 +43,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/mode", post(switch_mode))
         .route("/api/sessions/{id}/mode/approve", post(approve_mode_change))
         .route("/api/sessions/{id}/mode/reject", post(reject_mode_change))
+        .route("/api/sessions/{id}/ask/answer", post(answer_ask_user))
         .route("/api/sessions/{id}/cancel", post(cancel))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -529,6 +532,106 @@ async fn reject_mode_change(
         .map_err(ApiError::internal)?
         .expect("session row exists");
     Ok(Json(session))
+}
+
+#[derive(Deserialize)]
+struct AnswerAskUserRequest {
+    /// The answers as a JSON object keyed by `question_id`; each value is
+    /// the chosen option's `option_title` or the user's typed text.
+    answers: BTreeMap<String, String>,
+}
+
+/// POST /api/sessions/:id/ask/answer — the user answered a pending
+/// `ask_user_request` in the UI (picked an option or typed free text).
+///
+/// Validates the answers against the pending question (exactly its
+/// `question_id`, non-empty, no unknown ids), journals an `AskUserAnswered`
+/// event, and respawns the worker — the history rebuild maps the event to a
+/// user-role message carrying the answers, so the model continues with the
+/// answer. The session must be terminal and the journal's last ask-user
+/// marker must be a pending request.
+async fn answer_ask_user(
+    State(state): State<Arc<AppState>>,
+    PathParam(id): PathParam<String>,
+    Json(payload): Json<AnswerAskUserRequest>,
+) -> ApiResult<(StatusCode, Json<Session>)> {
+    let (status, pid, journal_path) = {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        match db::get_session(&conn, &id).map_err(ApiError::internal)? {
+            Some(session) => (session.status, session.pid, session.journal_path),
+            None => return Err(ApiError::not_found("session not found")),
+        }
+    };
+    if status == SessionStatus::Running || status == SessionStatus::Pending {
+        return Err(ApiError::conflict("session is already running"));
+    }
+    if pid.is_some_and(process::is_pid_alive) {
+        return Err(ApiError::conflict("session worker is still shutting down"));
+    }
+    let events = mo_core::read_events(Path::new(&journal_path)).map_err(ApiError::internal)?;
+    // The pending question: the last ask-user marker is a request, and the
+    // request whose id the answer keys. (Stage 1: one question per request.)
+    let question_id = match mo_core::last_ask_user_marker(&events) {
+        Some(AskUserMarker::RequestPending) => events
+            .iter()
+            .rev()
+            .find_map(|e| match &e.kind {
+                JournalEventKind::AskUserRequest { question } => Some(question.question_id.clone()),
+                _ => None,
+            })
+            .expect("a pending ask-user marker implies an ask_user_request"),
+        _ => {
+            return Err(ApiError::conflict(
+                "no pending clarification question to answer",
+            ));
+        }
+    };
+    // Validate: every answer must be non-empty and key the pending question;
+    // unknown ids are rejected (there is exactly one question to answer).
+    let mut answers = BTreeMap::new();
+    for (key, value) in &payload.answers {
+        if *key != question_id {
+            return Err(ApiError::bad_request(format!(
+                "unknown question id: {key} (the pending question is {question_id})"
+            )));
+        }
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "answer for {key} must not be empty"
+            )));
+        }
+        answers.insert(key.clone(), trimmed.to_string());
+    }
+    if !answers.contains_key(&question_id) {
+        return Err(ApiError::bad_request(format!(
+            "missing answer for {question_id}"
+        )));
+    }
+
+    {
+        let mut journal =
+            JournalWriter::open(Path::new(&journal_path)).map_err(ApiError::internal)?;
+        journal
+            .append(JournalEventKind::AskUserAnswered { answers })
+            .map_err(ApiError::internal)?;
+    }
+
+    {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::clear_pid(&conn, &id).map_err(ApiError::internal)?;
+        db::update_status(&conn, &id, SessionStatus::Pending, None).map_err(ApiError::internal)?;
+    }
+
+    let mut session = {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::get_session(&conn, &id)
+            .map_err(ApiError::internal)?
+            .expect("session row exists")
+    };
+    spawn_and_patch(&state, &mut session);
+
+    Ok((StatusCode::ACCEPTED, Json(session)))
 }
 
 async fn list_sessions(State(state): State<Arc<AppState>>) -> ApiResult<Json<Vec<Session>>> {

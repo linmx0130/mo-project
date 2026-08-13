@@ -48,6 +48,34 @@ export function EventRow({ event }: { event: JournalEvent }) {
           <span className="muted">The user rejected the mode change request.</span>
         </div>
       )
+    case 'ask_user_request':
+      // The agent asked a clarification question (via ask_user); the
+      // actionable question card is rendered above the composer while the
+      // request is pending. This is the passive timeline record.
+      return (
+        <div className="mode-change">
+          <span className="badge">→ question asked</span>
+          <span className="muted">
+            {kind.question.question_title}
+            {kind.question.options.length > 0
+              ? ` (${kind.question.options.length} option${kind.question.options.length === 1 ? '' : 's'} + free text)`
+              : ' (free text)'}
+          </span>
+        </div>
+      )
+    case 'ask_user_answered':
+      // The user answered the question (picked an option or typed free
+      // text); the request is resolved and the answer was sent to the agent.
+      return (
+        <div className="mode-change">
+          <span className="badge">→ answered</span>
+          <span className="muted">
+            {Object.entries(kind.answers)
+              .map(([id, value]) => `${id}: ${value}`)
+              .join(' · ')}
+          </span>
+        </div>
+      )
     case 'handoff':
       // Context compression: the model generated a handoff prompt and the
       // events before it are no longer sent to the model (they stay in the
