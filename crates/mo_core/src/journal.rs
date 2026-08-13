@@ -5,7 +5,7 @@
 //! (only a trailing partial line, which readers tolerate).
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use chrono::Utc;
@@ -98,13 +98,66 @@ pub fn read_events(path: &Path) -> Result<Vec<JournalEvent>> {
     Ok(events)
 }
 
-/// Return only events with `seq > after_seq` (cheap re-fetch for the
-/// history endpoint and the SSE tail).
+/// Return only events with `seq > after_seq` (used by the history endpoint
+/// for incremental client refetches).
 pub fn read_events_after(path: &Path, after_seq: u64) -> Result<Vec<JournalEvent>> {
     Ok(read_events(path)?
         .into_iter()
         .filter(|e| e.seq > after_seq)
         .collect())
+}
+
+/// Incremental journal tail reader for the gateway SSE endpoint: reads only
+/// the bytes appended after `offset` and parses the complete JSON lines they
+/// contain. Reading the whole history every poll is what made the gateway
+/// burn CPU on a running session (streamed `message_delta` events can push a
+/// journal to hundreds of thousands of lines), so this is the O(new bytes)
+/// replacement for the poll loop.
+///
+/// `pending` carries the trailing, not-yet-newline-terminated bytes from the
+/// previous read — the writer appends a line and its newline in two separate
+/// writes, and a UTF-8 codepoint can straddle a read boundary — so it is
+/// threaded back in on every call. Returns the events parsed from complete
+/// lines plus the new byte offset to pass to the next call. A journal that
+/// does not exist yet (the worker has not created it) yields no events and
+/// leaves `offset` unchanged.
+pub fn read_events_tail(
+    path: &Path,
+    offset: u64,
+    pending: &mut Vec<u8>,
+) -> Result<(Vec<JournalEvent>, u64)> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), offset));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    let new_offset = offset + buf.len() as u64;
+    pending.extend_from_slice(&buf);
+
+    // Split on newlines; the final segment has no trailing newline yet and
+    // stays in `pending` for the next read. Non-JSON lines are skipped, as
+    // in `read_events`, so a stray/corrupt line never breaks the tail.
+    let mut events = Vec::new();
+    let mut consumed = 0usize;
+    while let Some(nl) = pending[consumed..].iter().position(|&b| b == b'\n') {
+        let line_end = consumed + nl;
+        let line = &pending[consumed..line_end];
+        consumed = line_end + 1;
+        let trimmed = std::str::from_utf8(line).unwrap_or("").trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<JournalEvent>(trimmed) {
+            events.push(event);
+        }
+    }
+    pending.drain(..consumed);
+    Ok((events, new_offset))
 }
 
 // Unit tests live in `mo_core/src/tests/journal_tests.rs` (see AGENTS.md).

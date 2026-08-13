@@ -527,6 +527,67 @@ async fn sse_streams_journal_events_and_closes_on_terminal() {
     );
 }
 
+/// A running session's journal keeps growing while the SSE connection is
+/// open: an event appended *after* the stream connected must still reach the
+/// client (the incremental tail reader picks up appended bytes on the next
+/// poll) and the stream must still close once the session turns terminal.
+#[tokio::test]
+async fn sse_streams_events_appended_after_connect() {
+    let (_dir, app) = setup(true); // stub worker sleeps: session stays pending
+    let workdir = _dir.path().join("work");
+    let (_, session) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({ "workdir": workdir.display().to_string(), "prompt": "live" })),
+    )
+    .await;
+    let id = session["id"].as_str().unwrap().to_string();
+    let journal_path = session["journal_path"].as_str().unwrap().to_string();
+
+    // Open the SSE stream, then keep it open while the journal is appended.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/sessions/{id}/events"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_task = tokio::spawn(async move {
+        axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
+            .await
+            .unwrap()
+    });
+
+    // Append an event while the stream is already polling.
+    let mut journal = JournalWriter::open(Path::new(&journal_path)).unwrap();
+    journal
+        .append(JournalEventKind::MessageDelta {
+            content: "live chunk".into(),
+            reasoning_content: None,
+        })
+        .unwrap();
+    drop(journal);
+
+    // Turn the session terminal so the stream drains and closes.
+    let conn = open_db(&_dir.path().join("data").join("mo.db")).unwrap();
+    db::update_status(&conn, &id, SessionStatus::Completed, None).unwrap();
+    drop(conn);
+
+    let body = match tokio::time::timeout(Duration::from_secs(10), body_task).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => panic!("SSE body task failed: {e}"),
+        Err(_) => panic!("SSE stream did not close within 10s"),
+    };
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("\"kind\":\"message_delta\""), "got: {text}");
+    assert!(text.contains("live chunk"), "got: {text}");
+}
+
 #[tokio::test]
 async fn followup_message_respawns_worker_and_journals() {
     let (_dir, app) = setup(true);
