@@ -103,9 +103,14 @@ async fn times_out_and_kills() {
 async fn timeout_kills_whole_process_group() {
     let dir = tempfile::tempdir().unwrap();
     let sink = noop_sink();
+    // A unique sleep argument: the other timeout tests in this binary also
+    // spawn `sleep 30` (concurrently, under `cargo test`'s parallel threads),
+    // so a broad `^sleep 30$` pattern would flag a *peer* test's not-yet-
+    // killed sleep as this test's orphan under load. `sleep 30.123` matches
+    // only the process this test itself spawned.
     let err = bash(
         dir.path(),
-        "sleep 30 & echo $!; wait",
+        "sleep 30.123 & echo $!; wait",
         Duration::from_millis(300),
         "call_1",
         &sink,
@@ -114,12 +119,12 @@ async fn timeout_kills_whole_process_group() {
     assert!(err.is_err());
     assert!(err.unwrap_err().contains("timed out"));
 
-    // The backgrounded `sleep 30` shares the bash child's process group,
+    // The backgrounded `sleep 30.123` shares the bash child's process group,
     // so the timeout must have killed it too — no orphan survives.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let out = std::process::Command::new("sh")
         .arg("-c")
-        .arg("pgrep -f '^sleep 30$' || true")
+        .arg("pgrep -f '^sleep 30\\.123$' || true")
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
