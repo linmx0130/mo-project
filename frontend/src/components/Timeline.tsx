@@ -151,6 +151,13 @@ export function MessageRow({ message }: { message: MessageBlock }) {
           </ReactMarkdown>
         </div>
       )}
+      {message.truncated && (
+        // The stream was interrupted before the run produced its final
+        // `message` event (the worker died / was stopped mid-stream): the
+        // bubble keeps the partial text, but it is not the model's final
+        // answer and the next run's response starts a new message.
+        <span className="muted truncated-hint">(interrupted)</span>
+      )}
       {message.streaming && (
         <span className="stream-cursor" aria-hidden="true" />
       )}

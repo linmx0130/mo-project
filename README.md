@@ -455,7 +455,7 @@ placeholder stays.
 cargo fmt --check
 cargo clippy --all-targets
 cargo test --workspace        # includes e2e agent-loop test vs a mock LLM
-cd frontend && npm run lint && npm run build
+cd frontend && npm run lint && npm test && npm run build
 ```
 
 ## Copyright

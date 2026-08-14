@@ -1155,6 +1155,16 @@ p {
   animation: mo-pulse 1s ease-in-out infinite;
 }
 
+/* Shown under an assistant message whose stream was interrupted before the
+   run produced its final `message` event (worker died / was stopped
+   mid-stream): the bubble keeps its partial text, but the answer is not the
+   model's final one and the next run's response starts a new message. */
+.truncated-hint {
+  display: block;
+  margin-top: 6px;
+  font-size: 0.85em;
+}
+
 @keyframes mo-pulse {
   0%,
   100% {
