@@ -1015,7 +1015,7 @@ async fn modes_endpoint_lists_the_three_modes() {
     for m in modes {
         assert!(!m["label"].as_str().unwrap().is_empty());
         assert!(!m["description"].as_str().unwrap().is_empty());
-        assert!(m["tools"].as_array().unwrap().len() == 9);
+        assert!(m["tools"].as_array().unwrap().len() == 10);
         assert!(
             m["tools"]
                 .as_array()
@@ -1029,6 +1029,13 @@ async fn modes_endpoint_lists_the_three_modes() {
                 .unwrap()
                 .iter()
                 .any(|t| t == "ask_user")
+        );
+        assert!(
+            m["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t == "bash_in_background")
         );
     }
 }

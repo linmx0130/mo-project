@@ -92,9 +92,11 @@ async fn main() {
     // to kill any running bash command's process group first — pipeline
     // children (gradlew, tail, ...) would otherwise survive as orphans once
     // the worker dies. With parallel tool execution several bash commands
-    // may run at once, so every tracked process group is killed. Exiting
-    // here also guarantees the worker never finishes the loop and
-    // overwrites the session's `cancelled` status.
+    // may run at once, so every tracked process group is killed. Background
+    // jobs started via `bash_in_background` are in their own process groups
+    // (not the worker's), so they are killed too. Exiting here also
+    // guarantees the worker never finishes the loop and overwrites the
+    // session's `cancelled` status.
     {
         use tokio::signal::unix::{SignalKind, signal};
         tokio::spawn(async move {
@@ -107,6 +109,7 @@ async fn main() {
                     libc::kill(-(pgid as i32), libc::SIGKILL);
                 }
             }
+            crate::tools::bash_in_background::kill_all();
             std::process::exit(0);
         });
     }
@@ -137,7 +140,12 @@ async fn main() {
         context_compression_threshold: cfg.context_compression_threshold,
     };
 
-    match agent::run_agent(agent_cfg, &mut journal).await {
+    let run_result = agent::run_agent(agent_cfg, &mut journal).await;
+    // Background jobs run in their own process groups (not the worker's),
+    // so they would outlive the worker; kill any still-running ones before
+    // the session is marked complete/failed and the process exits.
+    crate::tools::bash_in_background::kill_all();
+    match run_result {
         Ok(()) => {
             let _ =
                 mo_core::db::update_status(&conn, &cfg.session_id, SessionStatus::Completed, None);

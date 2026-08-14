@@ -160,8 +160,9 @@ fn mode_framing(mode: Mode, workdir: &Path, scratch: &Path) -> String {
              The codebase ({}) is READ-ONLY: create/edit/remove are denied there.\n\
              You may create, edit and remove temporary files under the session scratch \
              directory {} (use absolute paths).\n\
-             bash is available but treat it as read-only (a soft restriction): use it to \
-             gather facts (builds, tests, greps), not to change anything.\n\
+             bash and bash_in_background are available but treat them as read-only (a soft \
+             restriction): use them to gather facts (builds, tests, greps), not to change \
+             anything.\n\
              If you need more input from the user to continue — a choice between \
              approaches, a preference, or a detail only they can decide — ask for it via \
              the `ask_user` tool: the question appears in the UI with the preset options \
@@ -190,7 +191,8 @@ fn mode_framing(mode: Mode, workdir: &Path, scratch: &Path) -> String {
              The codebase ({}) is READ-ONLY: create/edit/remove are denied there.\n\
              You may create, edit and remove temporary files under the session scratch \
              directory {} (use absolute paths).\n\
-             Prefer read_file; run read-only bash commands when helpful.\n\
+             Prefer read_file; run read-only bash or bash_in_background commands when \
+             helpful.\n\
              If you need more input from the user to continue — a choice between \
              approaches, a preference, or a detail only they can decide — ask for it via \
              the `ask_user` tool: the question appears in the UI with the preset options \
@@ -217,6 +219,10 @@ fn tool_usage_rules(mode: Mode, scratch: &Path) -> String {
              - Make precise edits: provide a unique old_string that appears exactly once\n\
                (use replace_all only when every occurrence should change).\n\
              - Use bash for anything outside the file tools: builds, tests, git, etc.\n\
+             - Use bash_in_background for commands that run longer than ~2 minutes:\n\
+               it returns a process id immediately; check it with action=status and\n\
+               stop it with action=kill. Redirect its output to a file (background\n\
+               stdout/stderr are discarded).\n\
              - After making changes, verify them with read_file or bash before finishing.\n\
              - Tool calls in one message run concurrently (up to max_tool_concurrency);\n\
                completion order is not guaranteed, so never put dependent calls in the\n\
@@ -230,8 +236,8 @@ fn tool_usage_rules(mode: Mode, scratch: &Path) -> String {
              - create_file / edit_file / remove_file are allowed ONLY under the session\n\
                scratch directory {} (absolute paths); the codebase is read-only and\n\
                modifications there are denied.\n\
-             - Use bash for anything outside the file tools (builds, tests, git, ...),\n\
-               keeping it read-only.\n\
+             - Use bash or bash_in_background for anything outside the file tools\n\
+               (builds, tests, git, ...), keeping them read-only.\n\
              - Tool calls in one message run concurrently (up to max_tool_concurrency);\n\
                completion order is not guaranteed, so never put dependent calls in the\n\
                same message — wait for a result, then make the next call.\n\

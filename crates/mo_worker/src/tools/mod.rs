@@ -3,6 +3,7 @@
 
 pub mod ask_user;
 pub mod bash;
+pub mod bash_in_background;
 pub mod fs;
 pub mod request_mode_change;
 pub mod skill;
@@ -19,6 +20,7 @@ pub const TOOL_EDIT_FILE: &str = "edit_file";
 pub const TOOL_CREATE_FILE: &str = "create_file";
 pub const TOOL_REMOVE_FILE: &str = "remove_file";
 pub const TOOL_BASH: &str = "bash";
+pub const TOOL_BASH_IN_BACKGROUND: &str = "bash_in_background";
 pub const TOOL_SPAWN_SUBAGENT: &str = "spawn_subagent";
 pub const TOOL_LOAD_SKILL: &str = "load_skill";
 pub const TOOL_REQUEST_MODE_CHANGE: &str = "request_mode_change";
@@ -125,13 +127,30 @@ pub fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": TOOL_BASH,
-                "description": "Run a shell command via sh -c in the working directory. 120s timeout — the whole process group is killed on timeout. Avoid piping output through `tail`/`head`: it buffers everything, so nothing is streamed to the UI until the command ends (and a timeout looks like a hang). For long-running builds (Gradle, etc.), run them in the background (`nohup ... > build.log 2>&1 &`) and poll the log file. Returns stdout, stderr and the exit code.",
+                "description": "Run a shell command via sh -c in the working directory. 120s timeout — the whole process group is killed on timeout. Avoid piping output through `tail`/`head`: it buffers everything, so nothing is streamed to the UI until the command ends (and a timeout looks like a hang). For long-running commands (>2 minutes), use `bash_in_background` instead and redirect its output to a file. Returns stdout, stderr and the exit code.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "command": { "type": "string", "description": "The shell command to run." }
                     },
                     "required": ["command"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": TOOL_BASH_IN_BACKGROUND,
+                "description": "Run a long-running shell command in the background via sh -c and return immediately with a process id; then use the same tool with action=status or action=kill to check on or stop it. Prefer this over `bash` for commands that run longer than ~2 minutes. stdout/stderr are discarded, so redirect them to files in the command (e.g. `make build > build.log 2>&1`); do NOT append `&` — the tool already backgrounds the command. `run` returns the process id (or an error if the process fails to launch), `status` returns whether the process is still running, and `kill` returns an acknowledgement that the kill signal was sent.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["run", "kill", "status"], "description": "Which operation to perform: run a command, kill a process, or query a process's status." },
+                        "command": { "type": "string", "description": "The shell command to run in the background (required for action=run)." },
+                        "process_id": { "type": "string", "description": "The process id returned by a previous action=run (required for action=status and action=kill)." }
+                    },
+                    "required": ["action"],
                     "additionalProperties": false
                 }
             }
@@ -246,6 +265,13 @@ struct BashArgs {
 }
 
 #[derive(Deserialize)]
+struct BashInBackgroundArgs {
+    action: String,
+    command: Option<String>,
+    process_id: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct SpawnSubagentArgs {
     prompt: String,
     /// Optional mode for the subagent (`build` | `plan` | `explore`);
@@ -342,6 +368,16 @@ pub async fn execute_tool(
                 on_event,
             )
             .await
+        }
+        TOOL_BASH_IN_BACKGROUND => {
+            let args: BashInBackgroundArgs = serde_json::from_str(arguments)
+                .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
+            bash_in_background::execute(
+                &ctx.workdir,
+                &args.action,
+                args.command.as_deref(),
+                args.process_id.as_deref(),
+            )
         }
         TOOL_SPAWN_SUBAGENT => {
             let args: SpawnSubagentArgs = serde_json::from_str(arguments)

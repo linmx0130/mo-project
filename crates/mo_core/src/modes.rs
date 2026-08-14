@@ -38,6 +38,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "create_file",
     "remove_file",
     "bash",
+    "bash_in_background",
     "spawn_subagent",
     "load_skill",
     "request_mode_change",
@@ -106,8 +107,9 @@ pub fn mode_change_message(mode: Mode, scratch: &Path) -> String {
              The codebase is READ-ONLY: create/edit/remove are denied there.\n\
              You may create, edit and remove temporary files under the session scratch \
              directory {} (use absolute paths).\n\
-             bash is available but treat it as read-only (a soft restriction): use it to \
-             gather facts (builds, tests, greps), not to change anything.\n\
+             bash and bash_in_background are available but treat them as read-only (a soft \
+             restriction): use them to gather facts (builds, tests, greps), not to change \
+             anything.\n\
              Finish with the plan as your final answer. Once the plan is ready, if it has \
              no open questions the user must answer before implementation, call the \
              `request_mode_change` tool with mode \"build\" to switch to build mode; if it \
@@ -121,7 +123,8 @@ pub fn mode_change_message(mode: Mode, scratch: &Path) -> String {
              The codebase is READ-ONLY: create/edit/remove are denied there.\n\
              You may create, edit and remove temporary files under the session scratch \
              directory {} (use absolute paths).\n\
-             Prefer read_file; run read-only bash commands when helpful.\n\
+             Prefer read_file; run read-only bash or bash_in_background commands when \
+             helpful.\n\
              Report concise findings as your final answer.\n",
             scratch.display()
         ),

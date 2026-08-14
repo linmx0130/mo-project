@@ -41,7 +41,7 @@ fn test_ctx(agents_dir: PathBuf) -> ToolContext {
 #[test]
 fn definitions_cover_all_tools() {
     let defs = tool_definitions();
-    assert_eq!(defs.len(), 9);
+    assert_eq!(defs.len(), 10);
     let names: Vec<&str> = defs
         .iter()
         .map(|d| d["function"]["name"].as_str().unwrap())
@@ -51,6 +51,7 @@ fn definitions_cover_all_tools() {
     assert!(names.contains(&TOOL_CREATE_FILE));
     assert!(names.contains(&TOOL_REMOVE_FILE));
     assert!(names.contains(&TOOL_BASH));
+    assert!(names.contains(&TOOL_BASH_IN_BACKGROUND));
     assert!(names.contains(&TOOL_SPAWN_SUBAGENT));
     assert!(names.contains(&TOOL_LOAD_SKILL));
     assert!(names.contains(&TOOL_REQUEST_MODE_CHANGE));
@@ -122,6 +123,27 @@ fn definitions_cover_all_tools() {
         "got: {description}"
     );
     assert!(description.contains("question_id"), "got: {description}");
+
+    // The bash_in_background definition carries the run/kill/status action
+    // enum and tells the model to redirect output (background output is
+    // discarded).
+    let def = defs
+        .iter()
+        .find(|d| d["function"]["name"] == TOOL_BASH_IN_BACKGROUND)
+        .unwrap();
+    assert_eq!(
+        def["function"]["parameters"]["properties"]["action"]["enum"],
+        json!(["run", "kill", "status"])
+    );
+    assert_eq!(
+        def["function"]["parameters"]["required"],
+        json!(["action"]),
+        "got: {}",
+        def["function"]["parameters"]["required"]
+    );
+    let description = def["function"]["description"].as_str().unwrap();
+    assert!(description.contains("process id"), "got: {description}");
+    assert!(description.contains("discarded"), "got: {description}");
 }
 
 #[tokio::test]
@@ -132,6 +154,58 @@ async fn unknown_tool_errors() {
         .await
         .unwrap_err();
     assert!(err.contains("unknown tool"));
+}
+
+#[tokio::test]
+async fn bash_in_background_dispatches_and_validates() {
+    let ctx = test_ctx(PathBuf::from("/tmp/agents"));
+    let no_event = |_: JournalEventKind| {};
+
+    // `run` requires a command, `status`/`kill` require a process id, and
+    // an unknown action is rejected before any process is spawned.
+    let err = execute_tool(
+        &ctx,
+        TOOL_BASH_IN_BACKGROUND,
+        r#"{"action":"run"}"#,
+        "c1",
+        &no_event,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("requires `command`"), "got: {err}");
+
+    let err = execute_tool(
+        &ctx,
+        TOOL_BASH_IN_BACKGROUND,
+        r#"{"action":"status"}"#,
+        "c2",
+        &no_event,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("requires `process_id`"), "got: {err}");
+
+    let err = execute_tool(
+        &ctx,
+        TOOL_BASH_IN_BACKGROUND,
+        r#"{"action":"kill"}"#,
+        "c3",
+        &no_event,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("requires `process_id`"), "got: {err}");
+
+    let err = execute_tool(
+        &ctx,
+        TOOL_BASH_IN_BACKGROUND,
+        r#"{"action":"explode"}"#,
+        "c4",
+        &no_event,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("unknown action"), "got: {err}");
 }
 
 #[tokio::test]

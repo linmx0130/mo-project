@@ -35,7 +35,7 @@ Frontend  <->  Gateway Service  <->  Agent worker(s)
 | --- | --- |
 | `mo_core` | Shared types, JSONL journal I/O, SQLite metadata DB (WAL), TOML config, the session-mode registry (`build` / `plan` / `explore`) |
 | `mo_gateway` | axum HTTP service: sessions CRUD, history, SSE live updates, worker spawn/kill, mode switching (port 3031) |
-| `mo_worker` | One process per session: runs the LLM agent loop (via `nah_chat`) with tools `read_file`, `edit_file`, `create_file`, `remove_file`, `bash`, `spawn_subagent`, `load_skill`, `request_mode_change`, `ask_user`; journals the system prompt once and reuses it verbatim on every run |
+| `mo_worker` | One process per session: runs the LLM agent loop (via `nah_chat`) with tools `read_file`, `edit_file`, `create_file`, `remove_file`, `bash`, `bash_in_background`, `spawn_subagent`, `load_skill`, `request_mode_change`, `ask_user`; journals the system prompt once and reuses it verbatim on every run |
 | `frontend` | React 19 + Vite + TS UI (Vite dev server on 3030, proxy `/api → :3031`) |
 
 Workers append chat/tool events to a per-session `journal.jsonl` and update
@@ -176,15 +176,15 @@ the LLM on every run (prompt-cache friendly). A session never picks up
 | Mode | Framing | Write sandbox |
 | --- | --- | --- |
 | `build` | Full coding-agent instructions: modify the codebase, run commands, use subagents and skills. | The codebase (workdir) |
-| `plan` | Produce a clear, actionable implementation plan — do not implement yet. Codebase is **read-only**; use the scratch dir for drafts. `bash` is available but should be treated as read-only (a soft restriction). Finish with the plan, then request `build` mode when the plan is ready and no must-answer questions remain. | The session scratch dir only |
+| `plan` | Produce a clear, actionable implementation plan — do not implement yet. Codebase is **read-only**; use the scratch dir for drafts. `bash` and `bash_in_background` are available but should be treated as read-only (a soft restriction). Finish with the plan, then request `build` mode when the plan is ready and no must-answer questions remain. | The session scratch dir only |
 | `explore` | Investigate the codebase to answer questions / gather facts for a parent agent. Codebase is **read-only**; prefer `read_file`. | The session scratch dir only |
 
 The session scratch dir is `<data_dir>/sessions/<id>/tmp/` (created by the
 worker, removed with the session). In `plan`/`explore` mode a mutation that
 would land inside the codebase is denied with an explicit error telling the
 model where it *may* write; writes inside the scratch dir use absolute
-paths. `bash` remains available everywhere — a documented soft restriction
-(it can mutate state), not a hard one.
+paths. `bash` and `bash_in_background` remain available everywhere — a
+documented soft restriction (they can mutate state), not a hard one.
 
 **Switching modes.** A terminal session's mode can be switched from the
 status-bar picker (`POST /api/sessions/:id/mode`; rejected while the

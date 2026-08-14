@@ -85,6 +85,14 @@ fn tool_names_include_request_mode_change() {
 }
 
 #[test]
+fn tool_names_include_bash_in_background() {
+    assert!(TOOL_NAMES.contains(&"bash_in_background"));
+    for mode in [Mode::Build, Mode::Plan, Mode::Explore] {
+        assert!(mode.info().tools.contains(&"bash_in_background"));
+    }
+}
+
+#[test]
 fn last_mode_marker_resolves_pending_requests() {
     use crate::types::{JournalEvent, JournalEventKind, JournalMessage};
     let mk = |kind: JournalEventKind| JournalEvent {
