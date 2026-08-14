@@ -101,8 +101,10 @@ export type JournalEventKind =
    *  (never as a chat message). `mode` is the mode the session ran under
    *  when the prompt was journaled — together with `mode_change` events it
    *  is the journal's mode marker (legacy events without it default to
-   *  `build`). */
-  | { kind: 'system_prompt'; content: string; mode: Mode }
+   *  `build`). `model` is the model the session ran under when the prompt
+   *  was journaled — together with `model_change` events it is the
+   *  journal's model marker (legacy events lack it). */
+  | { kind: 'system_prompt'; content: string; mode: Mode; model?: string }
   /** A notice that the session's mode changed since the last run, injected
    *  by the gateway right before a followup user message when the mode
    *  differs from the mode of the last run (at most one per followup).
@@ -111,6 +113,15 @@ export type JournalEventKind =
    *  `POST /:id/mode/approve` — approving a `mode_change_request` switches
    *  the mode and injects this single notice to continue the run. */
   | { kind: 'mode_change'; mode: Mode; content: string }
+  /** A notice that the session's model changed since the last run, injected
+   *  by the gateway right before a followup user message (or the
+   *  mode-approve continuation) when the model differs from the model of
+   *  the last run — at most one per followup; several switches before a
+   *  single followup collapse into one event describing the final model.
+   *  `from` is the model of the last run; `to` is the session's current
+   *  model. Flow metadata only (the next run is spawned with `to`
+   *  regardless), rendered as a subtle notice row. */
+  | { kind: 'model_change'; from: string; to: string }
   /** The agent's request, via the `request_mode_change` tool, to switch the
    *  session's mode. `message` is the model's request text in the user's
    *  language. While the latest such request is pending (no `mode_change` /
@@ -227,6 +238,18 @@ export function switchMode(id: string, mode: Mode): Promise<Session> {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ mode }),
+  })
+}
+
+/** Switch a terminal session's model. Only the next run is affected: the
+ *  worker respawned for the next followup is spawned with the new model,
+ *  and the backend journals a `model_change` notice right before that run
+ *  when the model differs from the model of the last run. */
+export function switchModel(id: string, model: string): Promise<Session> {
+  return http(`/api/sessions/${id}/model`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model }),
   })
 }
 

@@ -1190,6 +1190,7 @@ async fn approve_mode_change_switches_mode_and_continues() {
             .append(JournalEventKind::SystemPrompt {
                 content: "plan framing".to_string(),
                 mode: Mode::Plan,
+                model: "default-model".to_string(),
             })
             .unwrap();
         journal
@@ -1371,6 +1372,7 @@ async fn answer_ask_user_continues_run() {
             .append(JournalEventKind::SystemPrompt {
                 content: "build framing".to_string(),
                 mode: Mode::Build,
+                model: "default-model".to_string(),
             })
             .unwrap();
         journal

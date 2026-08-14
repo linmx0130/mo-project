@@ -680,6 +680,21 @@ p {
   gap: 6px;
 }
 
+/* Model picker in the status bar, side-by-side with the mode picker:
+   a label + badge-like select sharing the mode-select look, tinted
+   differently so the two pickers read as distinct controls. Switching
+   only affects the next run — it is spawned with the newly selected
+   model and receives the full journal history. */
+.model-switch {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.model-select {
+  color: var(--status-pending);
+}
+
 .mode-select {
   appearance: none;
   -webkit-appearance: none;

@@ -321,7 +321,7 @@ fn streaming_delta_events_round_trip() {
 }
 
 #[test]
-fn system_prompt_event_round_trips_with_mode() {
+fn system_prompt_event_round_trips_with_mode_and_model() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("journal.jsonl");
     let mut writer = JournalWriter::open(&path).unwrap();
@@ -329,6 +329,7 @@ fn system_prompt_event_round_trips_with_mode() {
         .append(JournalEventKind::SystemPrompt {
             content: "You are in Explore mode.".to_string(),
             mode: crate::types::Mode::Explore,
+            model: "mock-model".to_string(),
         })
         .unwrap();
     let events = read_events(&path).unwrap();
@@ -337,6 +338,7 @@ fn system_prompt_event_round_trips_with_mode() {
         JournalEventKind::SystemPrompt {
             content: "You are in Explore mode.".to_string(),
             mode: crate::types::Mode::Explore,
+            model: "mock-model".to_string(),
         }
     );
 }
@@ -383,18 +385,23 @@ fn mode_change_event_round_trips() {
     );
 }
 
-/// A journal line written before `SystemPrompt` carried a mode must
-/// still parse: the missing field defaults to `build`, so journals
-/// created by older versions keep working (and the mode-marker scan
-/// treats them as a build-mode run).
+/// A journal line written before `SystemPrompt` carried a mode or a model
+/// must still parse: the missing fields default to `build` / empty, so
+/// journals created by older versions keep working (the mode-marker scan
+/// treats them as a build-mode run and the model-marker scan skips them).
 #[test]
 fn legacy_system_prompt_without_mode_defaults_to_build() {
     let line = r#"{"seq":0,"ts":"2026-01-01T00:00:00Z","kind":{"kind":"system_prompt","content":"legacy prompt"}}"#;
     let event: JournalEvent = serde_json::from_str(line).unwrap();
     match event.kind {
-        JournalEventKind::SystemPrompt { content, mode } => {
+        JournalEventKind::SystemPrompt {
+            content,
+            mode,
+            model,
+        } => {
             assert_eq!(content, "legacy prompt");
             assert_eq!(mode, crate::types::Mode::Build);
+            assert!(model.is_empty(), "legacy prompts carry no model");
         }
         other => panic!("expected system_prompt, got: {other:?}"),
     }

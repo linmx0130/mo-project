@@ -38,7 +38,32 @@ fn test_app() -> TestApp {
         agents_dir: dir.path().join("agents"),
         max_tool_concurrency: mo_core::config::DEFAULT_MAX_TOOL_CONCURRENCY,
         context_compression_threshold: mo_core::config::DEFAULT_CONTEXT_COMPRESSION_THRESHOLD,
-        models: Vec::new(),
+        // Three models so the model-switch endpoint has something to switch
+        // to/from (and a collapse test can go mock → other → third);
+        // sessions are inserted with `mock-model`.
+        models: vec![
+            mo_core::ModelConfig {
+                base_url: "http://127.0.0.1:9001".into(),
+                name: "mock-model".into(),
+                token: None,
+                nickname: None,
+                context_window: None,
+            },
+            mo_core::ModelConfig {
+                base_url: "http://127.0.0.1:9002".into(),
+                name: "other-model".into(),
+                token: None,
+                nickname: None,
+                context_window: None,
+            },
+            mo_core::ModelConfig {
+                base_url: "http://127.0.0.1:9003".into(),
+                name: "third-model".into(),
+                token: None,
+                nickname: None,
+                context_window: None,
+            },
+        ],
     });
     TestApp { state, _dir: dir }
 }
@@ -118,6 +143,14 @@ fn system_prompt(mode: Mode) -> JournalEventKind {
     JournalEventKind::SystemPrompt {
         content: format!("You are in {:?} mode.", mode).to_lowercase(),
         mode,
+        model: "mock-model".to_string(),
+    }
+}
+
+fn model_change(from: &str, to: &str) -> JournalEventKind {
+    JournalEventKind::ModelChange {
+        from: from.to_string(),
+        to: to.to_string(),
     }
 }
 
@@ -733,5 +766,362 @@ async fn answer_ask_user_rejects_bad_answers() {
             .iter()
             .any(|k| matches!(k, JournalEventKind::AskUserAnswered { .. })),
         "no answer may be journaled: {kinds:#?}"
+    );
+}
+
+async fn post_model_switch(
+    app: &Arc<AppState>,
+    id: &str,
+    model: &str,
+) -> (StatusCode, serde_json::Value) {
+    let router = create_router(app.clone());
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/sessions/{id}/model"))
+        .header("content-type", "application/json")
+        .body(Body::from(format!(r#"{{"model":"{model}"}}"#)))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
+/// Switching a terminal session's model updates only the DB row — nothing
+/// is journaled at switch time. The `ModelChange` notice lands right before
+/// the next followup instead (like the mode change), so switches that never
+/// affect a run leave no trace.
+#[tokio::test]
+async fn switch_model_updates_db_and_does_not_journal() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    append_kinds(
+        &session.journal_path,
+        &[
+            user_msg("hi"),
+            system_prompt(Mode::Build),
+            assistant_msg("done"),
+        ],
+    );
+
+    let (status, body) = post_model_switch(&app.state, "s1", "other-model").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["model"], "other-model", "body: {body}");
+
+    let row = {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::get_session(&conn, "s1").unwrap().unwrap()
+    };
+    assert_eq!(row.model, "other-model");
+    let kinds = read_kinds(&app, "s1");
+    assert_eq!(kinds.len(), 3, "kinds: {kinds:#?}");
+    assert!(
+        !kinds
+            .iter()
+            .any(|k| matches!(k, JournalEventKind::ModelChange { .. })),
+        "no model change may be journaled at switch time: {kinds:#?}"
+    );
+
+    // Switching to the same model is a no-op (no extra DB write).
+    let (status, _) = post_model_switch(&app.state, "s1", "other-model").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(read_kinds(&app, "s1").len(), 3);
+}
+
+/// Unknown model -> 400, unknown session -> 404, running session -> 409;
+/// a rejected switch never touches the DB model.
+#[tokio::test]
+async fn switch_model_rejects_unknown_and_running() {
+    let app = test_app();
+    let _session = insert_session(&app.state, "s1", Mode::Build);
+
+    let (status, _) = post_model_switch(&app.state, "s1", "nope-model").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = post_model_switch(&app.state, "nope", "other-model").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::update_status(&conn, "s1", SessionStatus::Running, None).unwrap();
+    }
+    let (status, _) = post_model_switch(&app.state, "s1", "other-model").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let row = {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::get_session(&conn, "s1").unwrap().unwrap()
+    };
+    assert_eq!(
+        row.model, "mock-model",
+        "rejected switches must not change the model"
+    );
+}
+
+/// The happy path of the followup journal: a single `ModelChange` notice
+/// immediately before the user message, describing the switch from the
+/// model of the last run to the session's current model.
+#[tokio::test]
+async fn send_message_injects_model_change_when_switched() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    // The journal records a completed run under `mock-model` (the model the
+    // session was created with).
+    append_kinds(
+        &session.journal_path,
+        &[
+            user_msg("hi"),
+            system_prompt(Mode::Build),
+            assistant_msg("done"),
+        ],
+    );
+    {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::update_model(&conn, "s1", "other-model").unwrap();
+    }
+
+    let status = send_followup(&app.state, "s1", "continue").await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let kinds = read_kinds(&app, "s1");
+    assert_eq!(kinds.len(), 5, "kinds: {kinds:#?}");
+    assert_eq!(
+        kinds[3],
+        model_change("mock-model", "other-model"),
+        "one model_change notice right before the followup: {kinds:#?}"
+    );
+    assert_eq!(kinds[4], user_msg("continue"));
+}
+
+/// Multiple switches before a single followup collapse into one
+/// `ModelChange` describing the *final* model (intermediate switches never
+/// affected a run).
+#[tokio::test]
+async fn multiple_model_switches_collapse_into_one_model_change() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    append_kinds(
+        &session.journal_path,
+        &[
+            user_msg("hi"),
+            system_prompt(Mode::Build),
+            assistant_msg("done"),
+        ],
+    );
+    // Simulate the switches: mock-model (last run) → other-model →
+    // third-model.
+    {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::update_model(&conn, "s1", "other-model").unwrap();
+        db::update_model(&conn, "s1", "third-model").unwrap();
+    }
+
+    let status = send_followup(&app.state, "s1", "continue").await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let kinds = read_kinds(&app, "s1");
+    assert_eq!(kinds.len(), 5, "kinds: {kinds:#?}");
+    let model_changes: Vec<&JournalEventKind> = kinds
+        .iter()
+        .filter(|k| matches!(k, JournalEventKind::ModelChange { .. }))
+        .collect();
+    assert_eq!(model_changes.len(), 1, "kinds: {kinds:#?}");
+    assert_eq!(
+        kinds[3],
+        model_change("mock-model", "third-model"),
+        "the single notice must describe the final model: {kinds:#?}"
+    );
+    assert_eq!(kinds[4], user_msg("continue"));
+}
+
+/// No switch: the last-run model equals the session model, so no
+/// ModelChange is journaled.
+#[tokio::test]
+async fn no_model_switch_injects_nothing() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    append_kinds(
+        &session.journal_path,
+        &[
+            user_msg("hi"),
+            system_prompt(Mode::Build),
+            assistant_msg("done"),
+        ],
+    );
+
+    let status = send_followup(&app.state, "s1", "continue").await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let kinds = read_kinds(&app, "s1");
+    assert_eq!(kinds.len(), 4, "kinds: {kinds:#?}");
+    assert!(
+        !kinds
+            .iter()
+            .any(|k| matches!(k, JournalEventKind::ModelChange { .. })),
+        "no model change expected: {kinds:#?}"
+    );
+    assert_eq!(kinds[3], user_msg("continue"));
+}
+
+/// Switching back to the model of the last run: the journal's model marker
+/// is accurate again, so no notice is needed.
+#[tokio::test]
+async fn switch_back_to_last_run_model_injects_nothing() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    append_kinds(
+        &session.journal_path,
+        &[
+            user_msg("hi"),
+            system_prompt(Mode::Build),
+            assistant_msg("done"),
+        ],
+    );
+    {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::update_model(&conn, "s1", "other-model").unwrap();
+        db::update_model(&conn, "s1", "mock-model").unwrap();
+    }
+
+    let status = send_followup(&app.state, "s1", "continue").await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let kinds = read_kinds(&app, "s1");
+    assert_eq!(kinds.len(), 4, "kinds: {kinds:#?}");
+    assert!(
+        !kinds
+            .iter()
+            .any(|k| matches!(k, JournalEventKind::ModelChange { .. })),
+        "no model change expected when switching back: {kinds:#?}"
+    );
+}
+
+/// A session that never ran has no model marker: the upcoming first run
+/// journals the SystemPrompt with the current model, so no notice.
+#[tokio::test]
+async fn never_ran_session_model_switch_injects_nothing() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    // Only the gateway's initial user message is journaled — the first
+    // worker died before journaling the system prompt.
+    append_kinds(&session.journal_path, &[user_msg("first message")]);
+    {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::update_model(&conn, "s1", "other-model").unwrap();
+    }
+
+    let status = send_followup(&app.state, "s1", "continue").await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let kinds = read_kinds(&app, "s1");
+    assert_eq!(kinds.len(), 2, "kinds: {kinds:#?}");
+    assert!(
+        !kinds
+            .iter()
+            .any(|k| matches!(k, JournalEventKind::ModelChange { .. })),
+        "no model change expected for a never-ran session: {kinds:#?}"
+    );
+    assert_eq!(kinds[1], user_msg("continue"));
+}
+
+/// A previously injected ModelChange doubles as the model marker: after a
+/// run under `other-model` (following a `mock-model` first run), switching
+/// to `third-model` and following up injects one notice from
+/// `other-model` — the `mock-model` SystemPrompt is not scanned past the
+/// marker.
+#[tokio::test]
+async fn previous_model_change_acts_as_marker() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    append_kinds(
+        &session.journal_path,
+        &[
+            user_msg("hi"),
+            system_prompt(Mode::Build),
+            assistant_msg("done"),
+        ],
+    );
+    // Run 1: switched to other-model, followup -> one notice + user msg.
+    {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::update_model(&conn, "s1", "other-model").unwrap();
+    }
+    let status = send_followup(&app.state, "s1", "followup 1").await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::clear_pid(&conn, "s1").unwrap();
+        db::update_status(&conn, "s1", SessionStatus::Completed, None).unwrap();
+    }
+    // Simulate run 1 completing under other-model (the worker answered).
+    append_kinds(&session.journal_path, &[assistant_msg("done 1")]);
+    // Run 2: switch to third-model, followup.
+    {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::update_model(&conn, "s1", "third-model").unwrap();
+    }
+    let status = send_followup(&app.state, "s1", "followup 2").await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let kinds = read_kinds(&app, "s1");
+    let model_changes: Vec<&JournalEventKind> = kinds
+        .iter()
+        .filter(|k| matches!(k, JournalEventKind::ModelChange { .. }))
+        .collect();
+    // One notice for run 1, one for run 2 — the mock-model marker was never
+    // re-scanned.
+    assert_eq!(model_changes.len(), 2, "kinds: {kinds:#?}");
+    assert_eq!(
+        kinds[3],
+        model_change("mock-model", "other-model"),
+        "kinds: {kinds:#?}"
+    );
+    // The last two events are the second notice + the followup.
+    assert_eq!(
+        kinds[kinds.len() - 2],
+        model_change("other-model", "third-model"),
+        "kinds: {kinds:#?}"
+    );
+    assert_eq!(kinds[kinds.len() - 1], user_msg("followup 2"));
+}
+
+/// Approving a pending mode-change request while the model was switched (in
+/// the status bar) records the model change too: a `ModelChange` notice
+/// right before the `ModeChange` continuation notice.
+#[tokio::test]
+async fn approve_mode_change_injects_model_change_when_switched() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Plan);
+    pending_request_journal(&session);
+    // The user switched the model while the request was pending.
+    {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::update_model(&conn, "s1", "other-model").unwrap();
+    }
+
+    let (status, body) = post_empty_json(&app.state, "s1", "/mode/approve").await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["mode"], "build", "body: {body}");
+    assert_eq!(body["model"], "other-model", "body: {body}");
+
+    let kinds = read_kinds(&app, "s1");
+    // seq 0 user, 1 system_prompt, 2 assistant, 3 mode_change_request,
+    // 4 model_change, 5 mode_change (the continuation notice).
+    assert_eq!(kinds.len(), 6, "kinds: {kinds:#?}");
+    assert_eq!(
+        kinds[4],
+        model_change("mock-model", "other-model"),
+        "kinds: {kinds:#?}"
+    );
+    assert!(
+        matches!(
+            &kinds[5],
+            JournalEventKind::ModeChange {
+                mode: Mode::Build,
+                ..
+            }
+        ),
+        "kinds: {kinds:#?}"
     );
 }

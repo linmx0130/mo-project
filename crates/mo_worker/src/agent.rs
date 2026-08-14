@@ -95,6 +95,7 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
             journal.append(JournalEventKind::SystemPrompt {
                 content: prompt.clone(),
                 mode: config.session.mode,
+                model: config.model_name.clone(),
             })?;
             prompt
         }
@@ -155,6 +156,7 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
                     journal.append(JournalEventKind::SystemPrompt {
                         content: new_system,
                         mode: config.session.mode,
+                        model: config.model_name.clone(),
                     })?;
                     tracing::info!(
                         session = %config.session.id,

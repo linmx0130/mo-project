@@ -131,6 +131,22 @@ describe('buildTimeline — interrupted run followed by a continue', () => {
     expect(assistant[0].truncated).toBe(true)
     expect(assistant[1].content).toBe('new run')
   })
+
+  it('treats a model_change notice as a boundary too', () => {
+    const items = buildTimeline([
+      userMsg('Do X'),
+      delta('old '),
+      ev({ kind: 'model_change', from: 'model-a', to: 'model-b' }),
+      delta('new run'),
+      asstMsg('new run'),
+    ])
+
+    const assistant = assistantMessages(items)
+    expect(assistant).toHaveLength(2)
+    expect(assistant[0].content).toBe('old ')
+    expect(assistant[0].truncated).toBe(true)
+    expect(assistant[1].content).toBe('new run')
+  })
 })
 
 describe('buildTimeline — normal streaming (unchanged behavior)', () => {

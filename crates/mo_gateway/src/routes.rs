@@ -41,6 +41,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/events", get(sse::events))
         .route("/api/sessions/{id}/messages", post(send_message))
         .route("/api/sessions/{id}/mode", post(switch_mode))
+        .route("/api/sessions/{id}/model", post(switch_model))
         .route("/api/sessions/{id}/mode/approve", post(approve_mode_change))
         .route("/api/sessions/{id}/mode/reject", post(reject_mode_change))
         .route("/api/sessions/{id}/ask/answer", post(answer_ask_user))
@@ -264,7 +265,7 @@ async fn send_message(
     if payload.content.trim().is_empty() {
         return Err(ApiError::bad_request("message must not be empty"));
     }
-    let (status, pid, journal_path, mode) = {
+    let (status, pid, journal_path, mode, model) = {
         let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
         match db::get_session(&conn, &id).map_err(ApiError::internal)? {
             Some(session) => (
@@ -272,6 +273,7 @@ async fn send_message(
                 session.pid,
                 session.journal_path,
                 session.mode,
+                session.model,
             ),
             None => return Err(ApiError::not_found("session not found")),
         }
@@ -304,15 +306,12 @@ async fn send_message(
     {
         let mut journal =
             JournalWriter::open(Path::new(&journal_path)).map_err(ApiError::internal)?;
-        let last_mode = mo_core::read_events(Path::new(&journal_path))
-            .map_err(ApiError::internal)?
-            .iter()
-            .rev()
-            .find_map(|e| match &e.kind {
-                JournalEventKind::SystemPrompt { mode, .. } => Some(*mode),
-                JournalEventKind::ModeChange { mode, .. } => Some(*mode),
-                _ => None,
-            });
+        let events = mo_core::read_events(Path::new(&journal_path)).map_err(ApiError::internal)?;
+        let last_mode = events.iter().rev().find_map(|e| match &e.kind {
+            JournalEventKind::SystemPrompt { mode, .. } => Some(*mode),
+            JournalEventKind::ModeChange { mode, .. } => Some(*mode),
+            _ => None,
+        });
         if last_mode.is_some_and(|last| last != mode) {
             // The session scratch dir (`<data_dir>/sessions/<id>/tmp`, the
             // same deterministic path the worker creates and canonicalizes
@@ -324,6 +323,33 @@ async fn send_message(
                 .append(JournalEventKind::ModeChange {
                     mode,
                     content: mo_core::mode_change_message(mode, &scratch),
+                })
+                .map_err(ApiError::internal)?;
+        }
+        // The session's model may have been switched since the last run.
+        // Unlike the mode change, nothing about the model context changes —
+        // the system prompt is model-agnostic and the respawned worker is
+        // spawned with the session's current model regardless — so the
+        // notice is flow metadata for the journal/UI only, never a chat
+        // message (the worker's history rebuild skips it). When the model
+        // differs from the model of the last run (the last *model marker*:
+        // the journaled `SystemPrompt`'s model or a previously injected
+        // `ModelChange`, scanned from the end), inject a single model-change
+        // notice right before the followup, with the same collapse rules as
+        // the mode change above:
+        //   - multiple switches before one followup → one notice, describing
+        //     the final model (intermediate switches never affected a run);
+        //   - switching back to the model of the last run → no notice;
+        //   - a session that never ran has no marker → no notice (its
+        //     upcoming first run journals the SystemPrompt with the current
+        //     model).
+        if let Some(last_model) = mo_core::last_model_marker(&events)
+            && last_model != model
+        {
+            journal
+                .append(JournalEventKind::ModelChange {
+                    from: last_model,
+                    to: model,
                 })
                 .map_err(ApiError::internal)?;
         }
@@ -402,6 +428,50 @@ async fn switch_mode(
     Ok(Json(session))
 }
 
+#[derive(Deserialize)]
+struct SwitchModelRequest {
+    /// Model name from `GET /api/models`; must match a configured model.
+    model: String,
+}
+
+/// POST /api/sessions/:id/model — switch the session's model once it is
+/// terminal. Only the next run is affected: the worker respawned for the
+/// next followup (or the mode-approve continuation) is spawned with the new
+/// model's env, and the gateway injects a `ModelChange` notice into the
+/// journal right before that run when the model differs from the model of
+/// the last run. The journaled system prompt is model-agnostic and is never
+/// rebuilt, so switching only changes which endpoint the next run talks to.
+async fn switch_model(
+    State(state): State<Arc<AppState>>,
+    PathParam(id): PathParam<String>,
+    Json(payload): Json<SwitchModelRequest>,
+) -> ApiResult<Json<Session>> {
+    let model = state
+        .find_model(&payload.model)
+        .ok_or_else(|| ApiError::bad_request(format!("unknown model: {}", payload.model)))?;
+    let (status, current_model) = {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        match db::get_session(&conn, &id).map_err(ApiError::internal)? {
+            Some(session) => (session.status, session.model),
+            None => return Err(ApiError::not_found("session not found")),
+        }
+    };
+    if status == SessionStatus::Running || status == SessionStatus::Pending {
+        return Err(ApiError::conflict(
+            "cannot switch model while the session is running",
+        ));
+    }
+    if current_model != model.name {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::update_model(&conn, &id, &model.name).map_err(ApiError::internal)?;
+    }
+    let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+    let session = db::get_session(&conn, &id)
+        .map_err(ApiError::internal)?
+        .expect("session row exists");
+    Ok(Json(session))
+}
+
 /// POST /api/sessions/:id/mode/approve — the user approved a pending
 /// `request_mode_change` request in the UI (the agent asked, via the
 /// `request_mode_change` tool, to switch the session's mode).
@@ -416,10 +486,15 @@ async fn approve_mode_change(
     State(state): State<Arc<AppState>>,
     PathParam(id): PathParam<String>,
 ) -> ApiResult<(StatusCode, Json<Session>)> {
-    let (status, pid, journal_path) = {
+    let (status, pid, journal_path, model) = {
         let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
         match db::get_session(&conn, &id).map_err(ApiError::internal)? {
-            Some(session) => (session.status, session.pid, session.journal_path),
+            Some(session) => (
+                session.status,
+                session.pid,
+                session.journal_path,
+                session.model,
+            ),
             None => return Err(ApiError::not_found("session not found")),
         }
     };
@@ -457,6 +532,22 @@ async fn approve_mode_change(
     {
         let mut journal =
             JournalWriter::open(Path::new(&journal_path)).map_err(ApiError::internal)?;
+        // The session's model may have been switched (in the status bar)
+        // while the mode-change request was pending. The continuation run
+        // is spawned with the session's current model, so record the switch
+        // with the same collapse rules as `send_message` — a single
+        // `ModelChange` notice when the model differs from the model of the
+        // last run, never a chat message.
+        if let Some(last_model) = mo_core::last_model_marker(&events)
+            && last_model != model
+        {
+            journal
+                .append(JournalEventKind::ModelChange {
+                    from: last_model,
+                    to: model,
+                })
+                .map_err(ApiError::internal)?;
+        }
         // The single mode-change message: the worker maps this event to a
         // user-role message, so the model sees the new mode's framing and
         // the approval directly before continuing the task.
