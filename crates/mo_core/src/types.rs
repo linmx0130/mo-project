@@ -216,6 +216,28 @@ pub fn last_ask_user_marker(events: &[JournalEvent]) -> Option<AskUserMarker> {
     })
 }
 
+/// The journal's *model marker* — the last event that pins down which model
+/// the conversation last ran under, as scanned by the gateway when a
+/// followup arrives to decide whether to inject a `ModelChange` notice.
+///
+/// The marker set is `SystemPrompt` (its `model` field: the model of the
+/// first run — or of the run that followed a context compression, which
+/// journals a fresh prompt) and `ModelChange` (its `to` field: every run
+/// after an injected notice happened under the new model). Anything else is
+/// skipped, exactly like the mode-marker scan. A `SystemPrompt` whose
+/// `model` is empty (journals written before the field existed) carries no
+/// marker — an old session's very first switch is therefore not journaled
+/// (the DB still records the new model and the next run uses it; only the
+/// notice is skipped), and a session that never ran (no `SystemPrompt`, no
+/// `ModelChange`) has no marker either.
+pub fn last_model_marker(events: &[JournalEvent]) -> Option<String> {
+    events.iter().rev().find_map(|e| match &e.kind {
+        JournalEventKind::SystemPrompt { model, .. } if !model.is_empty() => Some(model.clone()),
+        JournalEventKind::ModelChange { to, .. } => Some(to.clone()),
+        _ => None,
+    })
+}
+
 /// The payload of a journal line, serde-tagged on `kind`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -251,10 +273,21 @@ pub enum JournalEventKind {
     /// last one when a followup arrives to decide whether the session's
     /// mode changed since the last run. `#[serde(default)]` (→ `build`)
     /// keeps journals written before the field existed parseable.
+    ///
+    /// `model` is the model the session ran under when this prompt was
+    /// journaled (the model of the first run, or of the run that followed a
+    /// context compression, which journals a fresh prompt). Together with
+    /// `ModelChange` events it is the journal's *model marker*: the gateway
+    /// scans for the last one when a followup arrives to decide whether the
+    /// session's model changed since the last run. `#[serde(default)]` (→
+    /// empty) keeps journals written before the field existed parseable —
+    /// an empty model is treated as "no recorded marker" by the scan.
     SystemPrompt {
         content: String,
         #[serde(default)]
         mode: Mode,
+        #[serde(default)]
+        model: String,
     },
     /// A notice that the session's mode changed since the last run. The
     /// gateway injects it into the journal *immediately before* a followup
@@ -300,6 +333,30 @@ pub enum JournalEventKind {
     /// reaches the model context — it is flow metadata, not a chat message.
     ModeChangeRequestDeclined {
         mode: Mode,
+    },
+    /// A notice that the session's model changed since the last run. The
+    /// gateway injects it into the journal *immediately before* a followup
+    /// user message when the session's model differs from the model of the
+    /// last run — and only then (at most one per followup; switching models
+    /// multiple times before a single followup collapses into one event
+    /// describing the final model, and switching back to the last-run model
+    /// injects nothing).
+    ///
+    /// `from` is the model of the last run (the previous model marker: the
+    /// journaled `SystemPrompt`'s model or a previously injected
+    /// `ModelChange`); `to` is the session's current model. Because a
+    /// `ModelChange` is only ever injected right before a run (a followup
+    /// user message or the `mode/approve` continuation), it doubles as a
+    /// model marker: every run after it happened under `to`.
+    ///
+    /// Unlike `ModeChange`, this event never reaches the model context —
+    /// the journaled system prompt is model-agnostic and the next run is
+    /// spawned with `to` regardless — so the worker's history rebuild skips
+    /// it: it is flow metadata for the UI (a timeline notice row) and the
+    /// audit trail, not a chat message.
+    ModelChange {
+        from: String,
+        to: String,
     },
     /// The worker's clarification question, via the `ask_user` tool.
     /// Journaled by the worker when the model calls the tool; the frontend

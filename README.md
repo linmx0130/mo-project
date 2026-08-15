@@ -205,6 +205,32 @@ conversation last ran under. At most one message is injected per followup:
 The worker passes the notice to the model as a user-role message, so the
 model sees the new mode's framing directly before the real user message.
 
+**Switching models.** A terminal session's model can be switched from the
+status-bar picker next to the mode picker (`POST /api/sessions/:id/model`;
+rejected while the session is running). Switching only affects the *next*
+run: the worker respawned for the next followup (or the mode-approve
+continuation) is spawned with the new model's env (base URL, name, token,
+context window), and the full journal history + the new user message are
+sent to it — the journaled system prompt is model-agnostic and is reused
+verbatim, so nothing about the context changes. Before that run the gateway
+injects a single **model-change notice** (journaled as a `model_change`
+event, shown in the timeline as a notice row) when the switched-to model
+differs from the model the conversation last ran under — the last *model
+marker* in the journal: the journaled `SystemPrompt`'s model (the model of
+the first run, or of the run that followed a context compression) or a
+previously injected `ModelChange`. Unlike the mode notice, it is never sent
+to the model (flow metadata for the UI + audit trail only), but it follows
+the same collapse rules:
+
+- several switches before a single followup collapse into **one** event
+  describing the *final* model (intermediate switches never affected a run);
+- switching back to the model of the last run injects **nothing**;
+- a session that never ran injects **nothing** either (its first run
+  journals the SystemPrompt with the current model).
+
+New subagents inherit the parent's current model at spawn; existing
+subagents keep the model they were spawned with.
+
 **Requesting a mode change.** When the model needs a mode it does not have
 (e.g. a plan/explore session and the user asks it to build), it calls the
 `request_mode_change` tool instead of working around the sandbox. The tool
@@ -305,11 +331,14 @@ separate messages.
 
 The session view has a status bar pinned to the bottom showing a mode
 picker (`build` / `plan` / `explore` — switching a terminal session's mode
-changes only the write sandbox of subsequent runs), the session status
-badge and the current context length in tokens. The length comes
-from the LLM API — the worker requests `stream_options.include_usage` and
-journals the reported `usage.prompt_tokens` after every LLM call as a
-`context_usage` event, so the bar live-updates as the conversation grows
+changes only the write sandbox of subsequent runs) with the **model
+picker** side-by-side (switching only affects the next run — the respawned
+worker is spawned with the new model and receives the full journal
+history), the session status badge and the current context length in
+tokens. The length comes from the LLM API — the worker requests
+`stream_options.include_usage` and journals the reported
+`usage.prompt_tokens` after every LLM call as a `context_usage` event, so
+the bar live-updates as the conversation grows
 (tool outputs included) and survives reloads (rebuilt from history). When
 the model config sets a `context_window`, the bar renders `used / window`
 with a thin progress bar and a percentage, turning red at ≥ 90%; without
@@ -404,8 +433,9 @@ $HOME/.agents/
 | `GET /api/sessions/:id` | detail; liveness check flips dead workers to `failed` |
 | `GET /api/sessions/:id/history?after_seq=N` | journal events after `N` |
 | `GET /api/sessions/:id/events` | SSE tail: new events + synthesized status changes |
-| `POST /api/sessions/:id/messages` `{content}` | continue a terminal session: journal the user message (preceded by a `mode_change` notice when the mode was switched since the last run), reset to `pending`, respawn the worker |
+| `POST /api/sessions/:id/messages` `{content}` | continue a terminal session: journal the user message (preceded by a `mode_change` notice when the mode was switched since the last run and/or a `model_change` notice when the model was), reset to `pending`, respawn the worker |
 | `POST /api/sessions/:id/mode` `{mode}` | switch a terminal session's mode (409 while running): changes only the write sandbox of subsequent runs — the journaled system prompt never changes; the switch surfaces as a `mode_change` notice before the next user message |
+| `POST /api/sessions/:id/model` `{model}` | switch a terminal session's model (409 while running): only the next run is affected — the respawned worker is spawned with the new model and receives the full journal history; the switch surfaces as a `model_change` notice before the next run that uses it |
 | `POST /api/sessions/:id/mode/approve` | approve a pending `mode_change_request` (the agent called `request_mode_change`): switch the session's mode to the requested one and continue the run with a single `mode_change` notice (409 unless the journal's last mode marker is a pending request) |
 | `POST /api/sessions/:id/mode/reject` | reject a pending `mode_change_request`: journal a `mode_change_request_declined` marker, no mode switch, nothing sent to the model (409 unless a request is pending) |
 | `POST /api/sessions/:id/ask/answer` `{answers}` | the user answered a pending `ask_user_request` (the agent asked a clarification question via `ask_user`): `answers` is a JSON object keyed by `question_id` whose values are the chosen option's title or the user's typed text; journals an `ask_user_answered` event and resumes the run (409 unless a request is pending) |
@@ -424,6 +454,10 @@ continue a run after a `mode_change_request`), `mode_change_request` (the
 agent's request, via the `request_mode_change` tool, to switch the
 session's mode, with the model's message for the user),
 `mode_change_request_declined` (the user rejected the request),
+`model_change` (a model-change notice injected by the gateway right before
+a run when the session's model differs from the model of the last run:
+`from` is the model of the last run, `to` is the new one; flow metadata —
+never sent to the model, which is spawned with `to` regardless),
 `ask_user_request` (the agent asked a clarification question via the
 `ask_user` tool: the question with its options; the frontend shows a
 question card while it is pending), `ask_user_answered` (the user answered:

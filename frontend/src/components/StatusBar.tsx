@@ -1,4 +1,4 @@
-import type { Mode, SessionStatus } from '../api'
+import type { Mode, ModelInfo, SessionStatus } from '../api'
 
 interface Props {
   status: SessionStatus
@@ -15,14 +15,24 @@ interface Props {
    *  journaled system prompt never changes. */
   modeEnabled: boolean
   onSwitchMode: (mode: Mode) => void
+  /** The configured models (GET /api/models), for the model picker. */
+  models: ModelInfo[]
+  /** The session's current model (its name from /api/models). */
+  model: string
+  /** True when the model picker may be used (the session is not running);
+   *  switching only affects the next run — it is spawned with the new
+   *  model and receives the full journal history. */
+  modelEnabled: boolean
+  onSwitchModel: (model: string) => void
 }
 
 const nf = new Intl.NumberFormat('en-US')
 
 /** The session status bar pinned to the bottom of the session view.
  *
- *  Shows the mode picker (badge + switcher), the session status badge, and
- *  the context length in tokens (from the LLM API's `usage.prompt_tokens`,
+ *  Shows the mode picker (badge + switcher) with the model picker
+ *  (badge-like select) side-by-side, the session status badge, and the
+ *  context length in tokens (from the LLM API's `usage.prompt_tokens`,
  *  journaled by the worker as `context_usage` events). When a context
  *  window is configured the length is rendered against it with a thin
  *  progress bar; additional status items can be appended as siblings. */
@@ -33,12 +43,20 @@ export default function StatusBar({
   mode,
   modeEnabled,
   onSwitchMode,
+  models,
+  model,
+  modelEnabled,
+  onSwitchModel,
 }: Props) {
   const pct =
     tokens !== null && contextWindow !== null && contextWindow > 0
       ? Math.min(100, Math.round((tokens / contextWindow) * 100))
       : null
   const high = pct !== null && pct >= 90
+  // The session's model may not be in the (possibly changed) config list;
+  // keep the select value valid by prepending it as a fallback option.
+  const options =
+    models.some((m) => m.name === model) ? models : [{ name: model, nickname: null, base_url: '', default: false }, ...models]
 
   return (
     <footer className="status-bar">
@@ -52,6 +70,27 @@ export default function StatusBar({
           <option value="build">Build</option>
           <option value="plan">Plan</option>
           <option value="explore">Explore</option>
+        </select>
+      </label>
+      <label
+        className="model-switch"
+        title="Session model — switching only affects the next run: it is spawned with the newly selected model and receives the full journal history"
+      >
+        <select
+          className="mode-select model-select"
+          value={model}
+          onChange={(e) => onSwitchModel(e.target.value)}
+          disabled={!modelEnabled || models.length === 0}
+        >
+          {options.length === 0 ? (
+            <option value={model}>{model}</option>
+          ) : (
+            options.map((m) => (
+              <option key={m.name} value={m.name}>
+                {m.nickname ? `${m.nickname} (${m.name})` : m.name}
+              </option>
+            ))
+          )}
         </select>
       </label>
       <span className={`badge badge-${status}`}>{status}</span>

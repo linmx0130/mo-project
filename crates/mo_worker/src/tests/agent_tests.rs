@@ -599,7 +599,7 @@ async fn e2e_agent_loop_with_mock_llm() {
     // The system prompt is journaled once, on the first run, with the
     // session's mode framing.
     assert!(
-        matches!(kinds[1], JournalEventKind::SystemPrompt { content, mode: Mode::Build } if content.contains("Build mode") && content.contains("Global rule: answer in lowercase.")),
+        matches!(kinds[1], JournalEventKind::SystemPrompt { content, mode: Mode::Build, .. } if content.contains("Build mode") && content.contains("Global rule: answer in lowercase.")),
         "expected journaled Build-mode system prompt, got: {:?}",
         kinds[1]
     );
@@ -694,6 +694,7 @@ fn history_reuses_journaled_system_prompt() {
         .append(JournalEventKind::SystemPrompt {
             content: prompt.to_string(),
             mode: Mode::Build,
+            model: "mock-model".to_string(),
         })
         .unwrap();
     journal
@@ -741,6 +742,7 @@ fn history_places_mode_change_before_followup_user_message() {
         .append(JournalEventKind::SystemPrompt {
             content: "You are in Build mode.".to_string(),
             mode: Mode::Build,
+            model: "mock-model".to_string(),
         })
         .unwrap();
     journal
@@ -817,6 +819,7 @@ fn history_synthesizes_answer_message_from_ask_user_answered() {
         .append(JournalEventKind::SystemPrompt {
             content: "You are in Build mode.".to_string(),
             mode: Mode::Build,
+            model: "mock-model".to_string(),
         })
         .unwrap();
     journal
@@ -926,6 +929,7 @@ fn history_drops_pre_handoff_events_and_injects_handoff_message() {
         .append(JournalEventKind::SystemPrompt {
             content: "old system".to_string(),
             mode: Mode::Build,
+            model: "mock-model".to_string(),
         })
         .unwrap();
     journal.append(assistant_msg("earlier work")).unwrap();
@@ -939,6 +943,7 @@ fn history_drops_pre_handoff_events_and_injects_handoff_message() {
         .append(JournalEventKind::SystemPrompt {
             content: "fresh system".to_string(),
             mode: Mode::Build,
+            model: "mock-model".to_string(),
         })
         .unwrap();
     journal.append(user_msg("followup")).unwrap();
@@ -970,6 +975,7 @@ fn history_uses_last_handoff_when_multiple() {
         .append(JournalEventKind::SystemPrompt {
             content: "old system".to_string(),
             mode: Mode::Build,
+            model: "mock-model".to_string(),
         })
         .unwrap();
     journal
@@ -982,6 +988,7 @@ fn history_uses_last_handoff_when_multiple() {
         .append(JournalEventKind::SystemPrompt {
             content: "sys after one".to_string(),
             mode: Mode::Build,
+            model: "mock-model".to_string(),
         })
         .unwrap();
     journal.append(user_msg("mid work")).unwrap();
@@ -995,6 +1002,7 @@ fn history_uses_last_handoff_when_multiple() {
         .append(JournalEventKind::SystemPrompt {
             content: "sys after two".to_string(),
             mode: Mode::Plan,
+            model: "mock-model".to_string(),
         })
         .unwrap();
     journal.append(user_msg("followup")).unwrap();
@@ -1021,6 +1029,7 @@ fn history_with_handoff_and_no_followup() {
         .append(JournalEventKind::SystemPrompt {
             content: "old system".to_string(),
             mode: Mode::Build,
+            model: "mock-model".to_string(),
         })
         .unwrap();
     journal.append(assistant_msg("earlier work")).unwrap();
@@ -1034,6 +1043,7 @@ fn history_with_handoff_and_no_followup() {
         .append(JournalEventKind::SystemPrompt {
             content: "fresh system".to_string(),
             mode: Mode::Build,
+            model: "mock-model".to_string(),
         })
         .unwrap();
     drop(journal);
@@ -1057,6 +1067,7 @@ fn history_keeps_post_handoff_tool_order() {
         .append(JournalEventKind::SystemPrompt {
             content: "old system".to_string(),
             mode: Mode::Build,
+            model: "mock-model".to_string(),
         })
         .unwrap();
     journal
@@ -1069,6 +1080,7 @@ fn history_keeps_post_handoff_tool_order() {
         .append(JournalEventKind::SystemPrompt {
             content: "fresh system".to_string(),
             mode: Mode::Build,
+            model: "mock-model".to_string(),
         })
         .unwrap();
     journal.append(user_msg("read files")).unwrap();
@@ -1144,6 +1156,7 @@ fn history_drops_dangling_tool_calls_after_handoff() {
         .append(JournalEventKind::SystemPrompt {
             content: "old system".to_string(),
             mode: Mode::Build,
+            model: "mock-model".to_string(),
         })
         .unwrap();
     journal
@@ -1156,6 +1169,7 @@ fn history_drops_dangling_tool_calls_after_handoff() {
         .append(JournalEventKind::SystemPrompt {
             content: "fresh system".to_string(),
             mode: Mode::Build,
+            model: "mock-model".to_string(),
         })
         .unwrap();
     journal.append(user_msg("continue")).unwrap();
@@ -1230,6 +1244,7 @@ fn history_tracks_last_context_usage() {
         .append(JournalEventKind::SystemPrompt {
             content: "old system".to_string(),
             mode: Mode::Build,
+            model: "mock-model".to_string(),
         })
         .unwrap();
     journal
@@ -1248,6 +1263,7 @@ fn history_tracks_last_context_usage() {
         .append(JournalEventKind::SystemPrompt {
             content: "fresh system".to_string(),
             mode: Mode::Build,
+            model: "mock-model".to_string(),
         })
         .unwrap();
     journal
@@ -1455,7 +1471,7 @@ async fn e2e_context_compression_generates_handoff_and_resumes() {
     // The fresh system prompt anchors the compressed context (per spec:
     // the mode system prompt for the current mode).
     assert!(
-        matches!(kinds[7], JournalEventKind::SystemPrompt { content, mode: Mode::Build } if content.contains("Build mode")),
+        matches!(kinds[7], JournalEventKind::SystemPrompt { content, mode: Mode::Build, .. } if content.contains("Build mode")),
         "expected fresh Build-mode system prompt, got: {:?}",
         kinds[7]
     );

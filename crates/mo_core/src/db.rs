@@ -207,6 +207,20 @@ pub fn update_mode(conn: &Connection, id: &str, mode: Mode) -> Result<()> {
     Ok(())
 }
 
+/// Switch the session's model (the value the UI sends from `/api/models`).
+/// Only the next run is affected: the worker that respawns for the next
+/// followup is spawned with the new model's env, and the gateway injects a
+/// `ModelChange` notice before that run if the model differs from the
+/// model of the last run. The journaled system prompt is model-agnostic
+/// and is never rebuilt.
+pub fn update_model(conn: &Connection, id: &str, model: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET model = ?1, updated_at = ?2 WHERE id = ?3",
+        params![model, chrono::Utc::now().to_rfc3339(), id],
+    )?;
+    Ok(())
+}
+
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     let status_str: String = row.get(5)?;
     let status = SessionStatus::from_str(&status_str).map_err(|e| {

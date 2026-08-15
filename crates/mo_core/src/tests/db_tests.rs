@@ -167,6 +167,22 @@ fn update_mode_switches_mode() {
     assert!(get_session(&conn, "missing").unwrap().is_none());
 }
 
+#[test]
+fn update_model_switches_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open(&dir.path().join("mo.db")).unwrap();
+    create_session(&conn, &sample_session("s1")).unwrap();
+
+    update_model(&conn, "s1", "other-model").unwrap();
+    let fetched = get_session(&conn, "s1").unwrap().unwrap();
+    assert_eq!(fetched.model, "other-model");
+    assert!(fetched.updated_at >= fetched.created_at);
+
+    // Unknown session is a no-op (no rows updated).
+    update_model(&conn, "missing", "nope").unwrap();
+    assert!(get_session(&conn, "missing").unwrap().is_none());
+}
+
 /// A database created before modes existed (no `mode` column) must be
 /// migrated in place: the column is added and existing rows default to
 /// `build`, so old sessions keep working.

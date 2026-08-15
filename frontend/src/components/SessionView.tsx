@@ -1,14 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { AskUserQuestion, JournalEvent, Mode, Session, SessionStatus } from '../api'
+import type { AskUserQuestion, JournalEvent, Mode, ModelInfo, Session, SessionStatus } from '../api'
 import {
   answerAskUser,
   approveModeChange,
   cancelSession,
   getHistory,
+  getModels,
   getSession,
   postMessage,
   rejectModeChange,
   switchMode,
+  switchModel,
 } from '../api'
 import AskUserCard from './AskUserCard'
 import Composer from './Composer'
@@ -42,6 +44,34 @@ export default function SessionView({ session, onStatusChange }: Props) {
     setPrevMode(session.mode)
     setMode(session.mode)
   }
+  // The current model, as shown/switched in the status bar. Switching only
+  // affects the next run — the worker respawned for the next followup is
+  // spawned with the new model and receives the full journal history. Local
+  // state is the source of truth while the switcher is used; when the prop
+  // reports a different model (e.g. the sidebar refresh after a switch
+  // lands), adjust state during render — same pattern as `mode`.
+  const [model, setModel] = useState<string>(session.model)
+  const [prevModel, setPrevModel] = useState<string>(session.model)
+  if (prevModel !== session.model) {
+    setPrevModel(session.model)
+    setModel(session.model)
+  }
+  // The configured models (GET /api/models), for the status-bar picker.
+  const [models, setModels] = useState<ModelInfo[]>([])
+
+  useEffect(() => {
+    let cancelled = false
+    getModels()
+      .then((list) => {
+        if (!cancelled) setModels(list)
+      })
+      .catch(() => {
+        // Gateway unreachable; the picker stays disabled.
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
   // Bumped on every send: a terminal session's SSE stream is closed, so a
   // followup must re-arm it to watch the new run.
   const [runId, setRunId] = useState(0)
@@ -154,6 +184,21 @@ export default function SessionView({ session, onStatusChange }: Props) {
     try {
       const updated = await switchMode(session.id, next)
       setMode(updated.mode)
+      onStatusChange()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  /** Switch the session's model (status-bar picker, terminal sessions
+   *  only). Only the next run is affected: the worker respawned for the
+   *  next followup is spawned with the new model, and the backend journals
+   *  a `model_change` notice right before it. */
+  const handleModelSwitch = async (next: string) => {
+    if (next === model || running) return
+    try {
+      const updated = await switchModel(session.id, next)
+      setModel(updated.model)
       onStatusChange()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -309,7 +354,7 @@ export default function SessionView({ session, onStatusChange }: Props) {
           <h2>{session.prompt || 'Untitled session'}</h2>
           <p className="muted">
             {session.workdir}
-            {session.model ? ` · ${session.model}` : ''} ·{' '}
+            {model ? ` · ${model}` : ''} ·{' '}
             {new Date(session.created_at).toLocaleString()}
             {session.error ? ` · error: ${session.error}` : ''}
           </p>
@@ -394,6 +439,10 @@ export default function SessionView({ session, onStatusChange }: Props) {
         mode={mode}
         modeEnabled={!running}
         onSwitchMode={(next) => void handleModeSwitch(next)}
+        models={models}
+        model={model}
+        modelEnabled={!running}
+        onSwitchModel={(next) => void handleModelSwitch(next)}
       />
 
       {subagentId && (

@@ -25,6 +25,18 @@ export function EventRow({ event }: { event: JournalEvent }) {
           <span className="muted">{kind.content}</span>
         </div>
       )
+    case 'model_change':
+      // The gateway injected a model-change notice before a followup user
+      // message (or the mode-approve continuation) when the session's model
+      // differs from the model of the last run. Flow metadata for the audit
+      // trail — the next run is spawned with the new model regardless — so
+      // it is rendered as a subtle notice row, never a chat bubble.
+      return (
+        <div className="mode-change">
+          <span className="badge">→ model: {kind.to}</span>
+          <span className="muted">changed from {kind.from}</span>
+        </div>
+      )
     case 'mode_change_request':
       // The agent asked (via request_mode_change) to switch the session's
       // mode; the passive timeline record of the request. The actionable
