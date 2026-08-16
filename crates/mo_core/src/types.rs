@@ -134,6 +134,13 @@ pub struct Session {
     /// `POST /api/sessions/:id/mode` — switching it changes only the write
     /// sandbox; the journaled system prompt never changes.
     pub mode: Mode,
+    /// The tools enabled for this session (tool names whose schemas are
+    /// injected into the model prompt). Chosen once at creation from the
+    /// "New session" form's checkbox list; `bash` and the file-operation
+    /// tools are always included (see `mo_core::tools`). An empty list
+    /// means "all tools" — the legacy default for sessions created before
+    /// tool selection existed.
+    pub tools: Vec<String>,
     pub pid: Option<u32>,
     pub journal_path: String,
     pub created_at: String,

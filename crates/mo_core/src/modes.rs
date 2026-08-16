@@ -32,41 +32,33 @@ pub struct ModeInfo {
     pub writable: &'static str,
 }
 
-pub const TOOL_NAMES: &[&str] = &[
-    "read_file",
-    "edit_file",
-    "create_file",
-    "remove_file",
-    "bash",
-    "bash_in_background",
-    "spawn_subagent",
-    "load_skill",
-    "request_mode_change",
-    "ask_user",
-];
-
 /// The built-in modes, in display order. `build` is the default for new
 /// sessions (and the fallback for rows migrated from before modes existed).
+///
+/// All modes expose the same *harness* tool set (`crate::tools::TOOL_NAMES`
+/// — what the worker can execute); which of those tools a *session* may use
+/// is chosen per session in the "New session" form (the `Session::tools`
+/// list) and is independent of the mode.
 pub const MODES: [ModeInfo; 3] = [
     ModeInfo {
         name: "build",
         label: "Build",
         description: "Execute tasks: modify the codebase, run commands, use subagents and skills.",
-        tools: TOOL_NAMES,
+        tools: crate::tools::TOOL_NAMES,
         writable: "codebase",
     },
     ModeInfo {
         name: "plan",
         label: "Plan",
         description: "Make a plan before executing: the codebase is read-only; write drafts to the session scratch dir.",
-        tools: TOOL_NAMES,
+        tools: crate::tools::TOOL_NAMES,
         writable: "scratch only",
     },
     ModeInfo {
         name: "explore",
         label: "Explore",
         description: "Understand the codebase and answer questions: the codebase is read-only; write notes to the session scratch dir.",
-        tools: TOOL_NAMES,
+        tools: crate::tools::TOOL_NAMES,
         writable: "scratch only",
     },
 ];

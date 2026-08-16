@@ -20,6 +20,7 @@ fn test_ctx(agents_dir: PathBuf) -> ToolContext {
             model: "m".into(),
             status: mo_core::SessionStatus::Running,
             mode: Mode::Build,
+            tools: vec![],
             pid: None,
             journal_path: "/tmp/j.jsonl".into(),
             created_at: "now".into(),
@@ -40,7 +41,7 @@ fn test_ctx(agents_dir: PathBuf) -> ToolContext {
 
 #[test]
 fn definitions_cover_all_tools() {
-    let defs = tool_definitions();
+    let defs = tool_definitions(&[]);
     assert_eq!(defs.len(), 10);
     let names: Vec<&str> = defs
         .iter()
@@ -270,6 +271,7 @@ fn plan_ctx(dir: &tempfile::TempDir, mode: Mode) -> ToolContext {
             model: "m".into(),
             status: mo_core::SessionStatus::Running,
             mode,
+            tools: vec![],
             pid: None,
             journal_path: "/tmp/j.jsonl".into(),
             created_at: "now".into(),
@@ -600,4 +602,83 @@ async fn request_mode_change_rejects_empty_message() {
     .await
     .unwrap_err();
     assert!(err.contains("message must not be empty"), "got: {err}");
+}
+
+/// `tool_definitions` drops the schemas of disabled tools: the model only
+/// ever sees the tools the session enabled. An empty enabled list (legacy
+/// sessions) advertises everything.
+#[test]
+fn definitions_filter_out_disabled_tools() {
+    // A session with ask_user + spawn_subagent turned off.
+    let enabled: Vec<String> =
+        mo_core::resolve_enabled_tools(&["ask_user".to_string(), "spawn_subagent".to_string()])
+            .unwrap();
+    let defs = tool_definitions(&enabled);
+    let names: Vec<&str> = defs
+        .iter()
+        .map(|d| d["function"]["name"].as_str().unwrap())
+        .collect();
+    assert!(!names.contains(&TOOL_ASK_USER), "got: {names:?}");
+    assert!(!names.contains(&TOOL_SPAWN_SUBAGENT), "got: {names:?}");
+    // The fixed tools and the remaining toggleable ones stay.
+    for name in [
+        TOOL_READ_FILE,
+        TOOL_EDIT_FILE,
+        TOOL_CREATE_FILE,
+        TOOL_REMOVE_FILE,
+        TOOL_BASH,
+        TOOL_BASH_IN_BACKGROUND,
+        TOOL_LOAD_SKILL,
+        TOOL_REQUEST_MODE_CHANGE,
+    ] {
+        assert!(names.contains(&name), "{name} must stay: {names:?}");
+    }
+    assert_eq!(defs.len(), 8, "got: {names:?}");
+}
+
+/// The execution gate refuses a disabled tool even if the model
+/// hallucinates its name (defense in depth: the schema was not injected,
+/// but the call must never be dispatched).
+#[tokio::test]
+async fn execute_tool_refuses_disabled_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctx = plan_ctx(&dir, Mode::Build);
+    ctx.session.tools = mo_core::resolve_enabled_tools(&["ask_user".to_string()]).unwrap();
+    // The ask_user tool reads the session journal; give it a real file.
+    let journal = dir.path().join("data/sessions/s/journal.jsonl");
+    std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+    std::fs::write(&journal, "").unwrap();
+    ctx.session.journal_path = journal.display().to_string();
+    let no_event = |_: JournalEventKind| {};
+
+    // The muted tool is refused with a clear message.
+    let err = execute_tool(
+        &ctx,
+        TOOL_ASK_USER,
+        r#"{"question_title":"t","question_text":"q","options":[]}"#,
+        "c1",
+        &no_event,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("disabled in this session"), "got: {err}");
+
+    // An enabled tool still works (and fixed tools are always enabled).
+    let out = execute_tool(&ctx, TOOL_BASH, r#"{"command":"echo hi"}"#, "c2", &no_event)
+        .await
+        .unwrap();
+    assert!(out.contains("hi"), "got: {out}");
+
+    // A legacy session (empty enabled list = no restriction) can still
+    // call the tool.
+    ctx.session.tools = vec![];
+    let out = execute_tool(
+        &ctx,
+        TOOL_ASK_USER,
+        r#"{"question_title":"t","question_text":"q","options":[]}"#,
+        "c3",
+        &no_event,
+    )
+    .await;
+    assert!(out.is_ok(), "legacy sessions keep every tool: {out:?}");
 }

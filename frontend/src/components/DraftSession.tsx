@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
-import type { Mode, ModeInfo, ModelInfo, Session } from '../api'
-import { createSession, getModels, getModes } from '../api'
+import type { Mode, ModeInfo, ModelInfo, Session, ToolInfo } from '../api'
+import { createSession, getModels, getModes, getTools } from '../api'
 import type { Draft } from '../draft'
 import Composer from './Composer'
 
@@ -17,9 +17,10 @@ interface Props {
 }
 
 /** Placeholder session shown after clicking "New session": a workdir field,
- *  a model picker, a mode picker plus the chat composer. The backend session
- *  is only created on Send. All field values live in the shared `draft`
- *  (App) and are only cleared once a session is actually created. */
+ *  a model picker, a mode picker, a tool checkbox list plus the chat
+ *  composer. The backend session is only created on Send. All field values
+ *  live in the shared `draft` (App) and are only cleared once a session is
+ *  actually created. */
 export default function DraftSession({
   draft,
   onDraftChange,
@@ -28,16 +29,18 @@ export default function DraftSession({
 }: Props) {
   const [models, setModels] = useState<ModelInfo[]>([])
   const [modes, setModes] = useState<ModeInfo[]>([])
+  const [tools, setTools] = useState<ToolInfo[]>([])
   const [sending, setSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  // Load the configured models and modes once. The first model is the
-  // default; it is pre-selected so "just type and send" uses the default
-  // model. The modes are static (build is the default) but fetched for
-  // their descriptions. A draft's stored pick wins when it is still valid
-  // (the list may have changed between visits); otherwise it is reset to
-  // the default. These checks are idempotent, so re-running on every draft
-  // change is harmless.
+  // Load the configured models, modes and tools once. The first model is
+  // the default; it is pre-selected so "just type and send" uses the
+  // default model. The modes are static (build is the default) but fetched
+  // for their descriptions. The tool registry drives the checkbox list
+  // (which tools may be disabled for this session). A draft's stored pick
+  // wins when it is still valid (the lists may have changed between
+  // visits); otherwise it is reset to the default. These checks are
+  // idempotent, so re-running on every draft change is harmless.
   useEffect(() => {
     let cancelled = false
     getModels()
@@ -55,6 +58,15 @@ export default function DraftSession({
       })
       .catch(() => {
         // Gateway unreachable; build stays selected.
+      })
+    getTools()
+      .then((list) => {
+        if (cancelled) return
+        setTools(list)
+      })
+      .catch(() => {
+        // Gateway unreachable; the backend default (all tools enabled)
+        // applies on send.
       })
     return () => {
       cancelled = true
@@ -77,6 +89,19 @@ export default function DraftSession({
 
   const selectedMode = modes.find((m) => m.name === (draft?.mode ?? 'build'))
 
+  /** The toggleable tools the user turned off (draft state; `[]` = all
+   *  enabled, the default). Fixed tools are never banned. */
+  const bannedTools = draft?.bannedTools ?? []
+
+  /** Toggle one tool's checkbox: checking removes it from the ban list,
+   *  unchecking adds it. */
+  const toggleTool = (name: string, enabled: boolean) => {
+    const next = enabled
+      ? bannedTools.filter((t) => t !== name)
+      : [...bannedTools, name]
+    onDraftChange({ bannedTools: next })
+  }
+
   const handleSend = async (text: string): Promise<boolean> => {
     if (!draft?.workdir.trim()) {
       setError('Working directory is required.')
@@ -90,6 +115,7 @@ export default function DraftSession({
         text,
         draft.model || undefined,
         draft.mode,
+        bannedTools,
       )
       onCreated(session)
       return true
@@ -106,7 +132,8 @@ export default function DraftSession({
         <div>
           <h2>New session</h2>
           <p className="muted">
-            Set the working directory, model and mode, then send your first message.
+            Set the working directory, model, mode and tools, then send your
+            first message.
           </p>
         </div>
       </header>
@@ -166,6 +193,36 @@ export default function DraftSession({
             </span>
           )}
         </label>
+        <fieldset className="field tools-field">
+          <legend className="field-label">Tools</legend>
+          <p className="muted tools-hint">
+            Bash and file tools are always available. Disable optional tools
+            for this session — the agent won&apos;t be able to use them.
+          </p>
+          <div className="tools-grid">
+            {tools.map((tool) => {
+              const checked = tool.fixed || !bannedTools.includes(tool.name)
+              return (
+                <label
+                  key={tool.name}
+                  className={
+                    tool.fixed ? 'tool-option tool-fixed' : 'tool-option'
+                  }
+                  title={tool.description}
+                >
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    disabled={tool.fixed || sending}
+                    onChange={(e) => toggleTool(tool.name, e.target.checked)}
+                  />
+                  <span className="tool-name">{tool.label}</span>
+                  <span className="tool-desc">{tool.description}</span>
+                </label>
+              )
+            })}
+          </div>
+        </fieldset>
         {error && <p className="form-error">{error}</p>}
       </div>
       <Composer

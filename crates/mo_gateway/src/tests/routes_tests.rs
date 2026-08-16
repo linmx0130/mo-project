@@ -80,6 +80,7 @@ fn insert_session(state: &AppState, id: &str, mode: Mode) -> Session {
         model: "mock-model".to_string(),
         status: SessionStatus::Completed,
         mode,
+        tools: vec![],
         pid: None,
         journal_path: state
             .data_dir
@@ -790,6 +791,24 @@ async fn post_model_switch(
     (status, value)
 }
 
+/// POST a session-creation request with a JSON body.
+async fn post_create_session(app: &Arc<AppState>, body: &str) -> (StatusCode, serde_json::Value) {
+    let router = create_router(app.clone());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/sessions")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
 /// Switching a terminal session's model updates only the DB row — nothing
 /// is journaled at switch time. The `ModelChange` notice lands right before
 /// the next followup instead (like the mode change), so switches that never
@@ -1124,4 +1143,137 @@ async fn approve_mode_change_injects_model_change_when_switched() {
         ),
         "kinds: {kinds:#?}"
     );
+}
+
+/// GET /api/tools serves the tool registry for the "New session" checkbox
+/// list: name, label, description and a `fixed` flag. The fixed tools are
+/// exactly bash + the file operations; the optional tools are not.
+#[tokio::test]
+async fn list_tools_serves_the_registry() {
+    let app = test_app();
+    let router = create_router(app.state.clone());
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/tools")
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let tools = value.as_array().expect("a JSON array");
+    assert_eq!(tools.len(), mo_core::TOOL_NAMES.len(), "tools: {tools:#?}");
+    let fixed: Vec<&str> = tools
+        .iter()
+        .filter(|t| t["fixed"] == true)
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    for name in [
+        "bash",
+        "bash_in_background",
+        "read_file",
+        "edit_file",
+        "create_file",
+        "remove_file",
+    ] {
+        assert!(fixed.contains(&name), "{name} must be fixed");
+    }
+    for name in [
+        "spawn_subagent",
+        "load_skill",
+        "request_mode_change",
+        "ask_user",
+    ] {
+        assert!(!fixed.contains(&name), "{name} must be toggleable");
+    }
+    // Every entry carries the label + description the UI renders.
+    for tool in tools {
+        assert!(tool["label"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(tool["description"].as_str().is_some_and(|s| !s.is_empty()));
+    }
+}
+
+/// Creating a session with `banned_tools` stores the canonical enabled
+/// list on the session row (and echoes it in the response): the fixed
+/// tools are always included, the banned toggleable ones are not.
+#[tokio::test]
+async fn create_session_with_banned_tools_stores_enabled_list() {
+    let app = test_app();
+    let workdir = app.state.cwd.display().to_string();
+    let body = format!(
+        r#"{{"workdir":"{workdir}","prompt":"do it","banned_tools":["ask_user","spawn_subagent"]}}"#
+    );
+    let (status, value) = post_create_session(&app.state, &body).await;
+    assert_eq!(status, StatusCode::CREATED, "body: {value}");
+    let id = value["id"].as_str().unwrap().to_string();
+    let tools: Vec<String> = value["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|t| t.as_str().unwrap().to_string())
+        .collect();
+    // Fixed tools stay, the two banned toggleable tools are gone, the
+    // other toggleable tools stay.
+    assert!(tools.contains(&"bash".to_string()));
+    assert!(tools.contains(&"read_file".to_string()));
+    assert!(tools.contains(&"load_skill".to_string()));
+    assert!(tools.contains(&"request_mode_change".to_string()));
+    assert!(!tools.contains(&"ask_user".to_string()));
+    assert!(!tools.contains(&"spawn_subagent".to_string()));
+
+    // The DB row carries the same canonical list (the worker reads it
+    // back to filter the schemas it injects).
+    let row = {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::get_session(&conn, &id).unwrap().unwrap()
+    };
+    assert_eq!(row.tools, tools);
+}
+
+/// Without `banned_tools` every tool is enabled (the default).
+#[tokio::test]
+async fn create_session_defaults_to_all_tools() {
+    let app = test_app();
+    let workdir = app.state.cwd.display().to_string();
+    let body = format!(r#"{{"workdir":"{workdir}","prompt":"do it"}}"#);
+    let (status, value) = post_create_session(&app.state, &body).await;
+    assert_eq!(status, StatusCode::CREATED, "body: {value}");
+    let tools: Vec<String> = value["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|t| t.as_str().unwrap().to_string())
+        .collect();
+    let expected: Vec<String> = mo_core::TOOL_NAMES.iter().map(|s| s.to_string()).collect();
+    assert_eq!(tools, expected);
+}
+
+/// Banning a fixed tool (always available) or an unknown tool name is a
+/// bad request — no session is created.
+#[tokio::test]
+async fn create_session_rejects_bad_bans() {
+    let app = test_app();
+    let workdir = app.state.cwd.display().to_string();
+    for (banned, needle) in [
+        (r#"["bash"]"#, "always available"),
+        (r#"["read_file"]"#, "always available"),
+        (r#"["nope"]"#, "unknown tool"),
+    ] {
+        let body = format!(r#"{{"workdir":"{workdir}","prompt":"do it","banned_tools":{banned}}}"#);
+        let (status, value) = post_create_session(&app.state, &body).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "banned: {banned}, body: {value}"
+        );
+        assert!(
+            value.to_string().contains(needle),
+            "banned: {banned}, body: {value}"
+        );
+    }
+    // Nothing was created.
+    let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(db::list_sessions(&conn).unwrap().is_empty());
 }

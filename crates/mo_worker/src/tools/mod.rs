@@ -57,8 +57,15 @@ pub struct ToolContext {
 }
 
 /// OpenAI nested tool definitions advertised to the model.
-pub fn tool_definitions() -> Vec<Value> {
-    vec![
+///
+/// `enabled` is the session's enabled-tool list (`Session::tools`): the
+/// schemas of disabled tools are *not* injected into the prompt, so the
+/// model cannot call them. An empty list means "no restriction" (legacy
+/// sessions) — every tool is advertised. The fixed tools (bash + file
+/// operations) are always in the session list, so they are always
+/// advertised.
+pub fn tool_definitions(enabled: &[String]) -> Vec<Value> {
+    let all = vec![
         json!({
             "type": "function",
             "function": {
@@ -231,7 +238,15 @@ pub fn tool_definitions() -> Vec<Value> {
                 }
             }
         }),
-    ]
+    ];
+    // Drop the schemas of disabled tools: the model only ever sees the
+    // tools the session enabled (an empty enabled list = no restriction).
+    all.into_iter()
+        .filter(|def| {
+            let name = def["function"]["name"].as_str().unwrap_or_default();
+            mo_core::tools::is_enabled(name, enabled)
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -320,6 +335,16 @@ pub async fn execute_tool(
     tool_call_id: &str,
     on_event: &(dyn Fn(JournalEventKind) + Send + Sync),
 ) -> Result<String, String> {
+    // Defense in depth: the session's disabled tools are not advertised to
+    // the model (their schemas are filtered out of the prompt), but a model
+    // may still hallucinate a muted tool name. Refuse it explicitly so the
+    // call is never dispatched and the model gets a clear explanation. An
+    // empty enabled list (legacy sessions) means "no restriction".
+    if !mo_core::tools::is_enabled(name, &ctx.session.tools) {
+        return Err(format!(
+            "tool {name} is disabled in this session (the session was created with it turned off)"
+        ));
+    }
     match name {
         TOOL_READ_FILE => {
             let args: ReadFileArgs = serde_json::from_str(arguments)

@@ -66,6 +66,7 @@ function App() {
           workdir: lastWorkdir,
           model: '',
           mode: 'build',
+          bannedTools: [],
           text: '',
         }
         return { ...base, ...patch }

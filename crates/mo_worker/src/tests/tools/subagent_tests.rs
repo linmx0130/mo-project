@@ -17,6 +17,7 @@ fn test_ctx(dir: &tempfile::TempDir, parent_id: Option<String>) -> ToolContext {
         model: "m".into(),
         status: SessionStatus::Running,
         mode: Mode::Build,
+        tools: vec![],
         pid: None,
         journal_path: "/tmp/j.jsonl".into(),
         created_at: "now".into(),

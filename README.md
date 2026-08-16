@@ -35,7 +35,7 @@ Frontend  <->  Gateway Service  <->  Agent worker(s)
 | --- | --- |
 | `mo_core` | Shared types, JSONL journal I/O, SQLite metadata DB (WAL), TOML config, the session-mode registry (`build` / `plan` / `explore`) |
 | `mo_gateway` | axum HTTP service: sessions CRUD, history, SSE live updates, worker spawn/kill, mode switching (port 3031) |
-| `mo_worker` | One process per session: runs the LLM agent loop (via `nah_chat`) with tools `read_file`, `edit_file`, `create_file`, `remove_file`, `bash`, `bash_in_background`, `spawn_subagent`, `load_skill`, `request_mode_change`, `ask_user`; journals the system prompt once and reuses it verbatim on every run |
+| `mo_worker` | One process per session: runs the LLM agent loop (via `nah_chat`) with tools `read_file`, `edit_file`, `create_file`, `remove_file`, `bash`, `bash_in_background`, `spawn_subagent`, `load_skill`, `request_mode_change`, `ask_user`; journals the system prompt once and reuses it verbatim on every run. The tool set is chosen per session in the "New session" form: `bash` + the file operations are always available, the rest may be disabled — disabled tools' schemas are not injected into the prompt and the worker refuses to execute them |
 | `frontend` | React 19 + Vite + TS UI (Vite dev server on 3030, proxy `/api → :3031`) |
 
 Workers append chat/tool events to a per-session `journal.jsonl` and update
@@ -131,7 +131,8 @@ cd frontend && npm install && npm run dev
 
 Point the UI at a workdir (an absolute path containing the files the agent
 may touch — it is sandboxed there), pick a model (the first configured one
-is pre-selected), type a message, and watch the session stream live.
+is pre-selected), pick a mode, choose which optional tools the agent may
+use, type a message, and watch the session stream live.
 **Stop** kills the worker and its process group. When a run finishes or is
 stopped, the composer unlocks: follow-up messages resume the same session,
 and the worker rebuilds its context from the journal history.
@@ -275,6 +276,31 @@ it to a user-role message carrying the answers as a JSON object keyed by
 `question_id` (e.g. `{"q1": "Rust"}`), so the model receives the answer —
 the tool's "return value" — and continues where it left off. Subagents
 cannot use the tool; they must ask their parent agent instead.
+
+## Session tools
+
+Every session has a **tool set** chosen once in the "New session" form
+(`GET /api/tools` serves the registry; the form renders one checkbox per
+tool):
+
+* **Always available** — `bash` (and its background variant
+  `bash_in_background`) plus the file operations `read_file`,
+  `edit_file`, `create_file` and `remove_file`. They are shown
+  pre-checked and cannot be disabled: the harness itself is built on them,
+  and the write sandbox / mode system would not work without them.
+* **Toggleable** — `spawn_subagent`, `load_skill`, `request_mode_change`
+  and `ask_user`. Each may be turned off for a session; a disabled tool's
+  **schema is not injected into the prompt**, so the model cannot see or
+  call it, and as defense in depth the worker refuses to execute a muted
+  tool's name even if the model hallucinates it ("tool X is disabled in
+  this session").
+
+The choice is stored on the session row (`tools`, a JSON array of enabled
+tool names) and is fixed for the session's lifetime — like the journaled
+system prompt, it is decided up front and reused on every run. Subagents
+inherit their parent's tool set (a session that banned `ask_user` does not
+want its subagents asking the user either). Sessions created before tool
+selection existed have no restriction (all tools enabled).
 
 ## Subagents
 
@@ -428,7 +454,8 @@ $HOME/.agents/
 | `GET /api/meta` | static gateway metadata: `{cwd}` (gateway startup dir, used as the default session workdir) |
 | `GET /api/models` | configured models from `mo.toml` (`[{nickname, name, base_url, default}]`; first one is `default`) |
 | `GET /api/modes` | built-in session modes: `[{name, label, description, tools, writable}]` (`build`, `plan`, `explore`) |
-| `POST /api/sessions` `{workdir, prompt, model?, mode?}` | create session + spawn worker (`model` = model name from `/api/models`, default when absent; `mode` = mode name from `/api/modes`, `build` when absent) |
+| `GET /api/tools` | the session tool registry for the "New session" checkbox list: `[{name, label, description, fixed}]` — `fixed` (bash + file operations) tools are always available, the rest may be disabled per session |
+| `POST /api/sessions` `{workdir, prompt, model?, mode?, banned_tools?}` | create session + spawn worker (`model` = model name from `/api/models`, default when absent; `mode` = mode name from `/api/modes`, `build` when absent; `banned_tools` = the *toggleable* tools from `/api/tools` to disable for this session — disabled schemas are not injected into the prompt; absent/empty bans nothing, and fixed tools cannot be banned) |
 | `GET /api/sessions` | list root sessions (newest first; subagent sessions are hidden — they are reached through their parent's tool blocks) |
 | `GET /api/sessions/:id` | detail; liveness check flips dead workers to `failed` |
 | `GET /api/sessions/:id/history?after_seq=N` | journal events after `N` |
