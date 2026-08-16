@@ -742,6 +742,11 @@ p {
 .draft-body {
   flex: 1;
   min-height: 0;
+  /* The form (workdir, model, mode, the tool checkbox list, …) may be
+     taller than the viewport on small screens; scroll it so no field is
+     ever clipped, keeping the composer pinned below. Mirrors .timeline. */
+  overflow-y: auto;
+  padding-right: 8px;
   display: flex;
   flex-direction: column;
   gap: 10px;
