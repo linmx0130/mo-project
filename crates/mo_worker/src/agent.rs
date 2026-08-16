@@ -101,7 +101,12 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
         }
     };
     messages.insert(0, system_message(system_prompt));
-    let tools = tools::tool_definitions();
+    // The session's enabled tool set (from the "New session" form): the
+    // schemas of disabled tools are filtered out, so the model can only
+    // call what the user allowed (see `tools::tool_definitions`). The
+    // fixed tools (bash + file operations) are always included; an empty
+    // list is the legacy "all tools" default.
+    let tools = tools::tool_definitions(&config.session.tools);
     let tool_ctx = ToolContext {
         workdir: config.workdir.clone(),
         data_dir: config.data_dir.clone(),

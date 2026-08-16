@@ -23,6 +23,11 @@ export interface Session {
    *  the write sandbox of every run. Switchable via POST /:id/mode when the
    *  session is terminal — switching changes the sandbox, never the prompt. */
   mode: Mode
+  /** The tools enabled for this session (their schemas are injected into
+   *  the prompt). Chosen once in the "New session" form; bash + the file
+   *  operations are always included. An empty list = all tools (legacy
+   *  sessions created before tool selection existed). */
+  tools: string[]
   pid: number | null
   journal_path: string
   created_at: string
@@ -57,6 +62,17 @@ export interface ModeInfo {
   tools: string[]
   /** Where file mutations land: 'codebase' or 'scratch only'. */
   writable: string
+}
+
+/** One session tool (GET /api/tools): rendered as a checkbox in the
+ *  "New session" form. `fixed` tools (bash + file operations) are always
+ *  available and cannot be disabled; the toggleable ones may be turned off
+ *  per session (their schemas are not injected into the prompt). */
+export interface ToolInfo {
+  name: string
+  label: string
+  description: string
+  fixed: boolean
 }
 
 export interface ToolCallInfo {
@@ -211,19 +227,33 @@ export function getModes(): Promise<ModeInfo[]> {
   return http('/api/modes')
 }
 
+/** The session tool registry (GET /api/tools) for the "New session"
+ *  checkbox list: name, label, description, and whether the tool is fixed
+ *  (always available) or toggleable (may be disabled per session). */
+export function getTools(): Promise<ToolInfo[]> {
+  return http('/api/tools')
+}
+
 export function getSession(id: string): Promise<Session> {
   return http(`/api/sessions/${id}`)
 }
 
+/** Create a session. `bannedTools` lists the *toggleable* tools the user
+ *  turned off in the "New session" form; disabled tools' schemas are not
+ *  injected into the prompt and the worker refuses to execute them. Fixed
+ *  tools (bash + file operations) are always available and cannot be
+ *  banned; absent/empty bans nothing (all tools enabled). */
 export function createSession(
   workdir: string,
   prompt: string,
   model?: string,
   mode?: Mode,
+  bannedTools?: string[],
 ): Promise<Session> {
-  const body: Record<string, string> = { workdir, prompt }
+  const body: Record<string, string | string[]> = { workdir, prompt }
   if (model) body.model = model
   if (mode) body.mode = mode
+  if (bannedTools && bannedTools.length > 0) body.banned_tools = bannedTools
   return http('/api/sessions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

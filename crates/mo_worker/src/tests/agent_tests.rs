@@ -71,6 +71,7 @@ fn sample_session(workdir: &std::path::Path, journal_path: &std::path::Path) -> 
         model: "mock-model".to_string(),
         status: SessionStatus::Pending,
         mode: Mode::Build,
+        tools: vec![],
         pid: None,
         journal_path: journal_path.display().to_string(),
         created_at: now.clone(),

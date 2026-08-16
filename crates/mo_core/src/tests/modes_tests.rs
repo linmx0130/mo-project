@@ -3,6 +3,7 @@
 //! to the module's items (private ones included).
 
 use super::*;
+use crate::TOOL_NAMES;
 
 #[test]
 fn every_mode_has_a_registry_entry() {

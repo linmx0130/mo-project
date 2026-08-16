@@ -15,6 +15,7 @@ fn sample_session(id: &str) -> Session {
         model: "test-model".to_string(),
         status: SessionStatus::Pending,
         mode: Mode::Build,
+        tools: vec![],
         pid: None,
         journal_path: format!("/tmp/work/{id}/journal.jsonl"),
         created_at: now.clone(),
@@ -217,4 +218,44 @@ fn migration_adds_mode_column_to_legacy_db() {
     let conn = open(&path).unwrap();
     let fetched = get_session(&conn, "legacy").unwrap().unwrap();
     assert_eq!(fetched.mode, Mode::Build);
+}
+
+/// The enabled-tool list round-trips through the DB as a JSON array.
+#[test]
+fn tools_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open(&dir.path().join("mo.db")).unwrap();
+    let mut session = sample_session("s1");
+    session.tools = crate::tools::resolve_enabled_tools(&[
+        "ask_user".to_string(),
+        "spawn_subagent".to_string(),
+    ])
+    .unwrap();
+    create_session(&conn, &session).unwrap();
+
+    let fetched = get_session(&conn, "s1").unwrap().expect("session exists");
+    assert_eq!(fetched.tools, session.tools);
+    // The fixed tools are always present; the banned toggleable ones are
+    // not.
+    assert!(fetched.tools.contains(&"bash".to_string()));
+    assert!(!fetched.tools.contains(&"ask_user".to_string()));
+    assert!(!fetched.tools.contains(&"spawn_subagent".to_string()));
+}
+
+/// A `NULL` tools column (rows created before tool selection existed)
+/// reads back as an empty list — the worker treats that as "all tools".
+#[test]
+fn null_tools_column_reads_back_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open(&dir.path().join("mo.db")).unwrap();
+    // Insert a row without the tools value (NULL), as legacy code paths
+    // would have done before the column existed.
+    conn.execute(
+        "INSERT INTO sessions (id, parent_id, workdir, prompt, model, status, mode, pid, journal_path, created_at, updated_at, heartbeat_at, error)
+         VALUES ('legacy', NULL, '/tmp', 'old', 'm', 'completed', 'build', NULL, '/tmp/j.jsonl', 't', 't', NULL, NULL)",
+        [],
+    )
+    .unwrap();
+    let fetched = get_session(&conn, "legacy").unwrap().unwrap();
+    assert!(fetched.tools.is_empty(), "NULL tools must read back empty");
 }

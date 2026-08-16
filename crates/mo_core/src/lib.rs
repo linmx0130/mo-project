@@ -5,6 +5,7 @@ pub mod config;
 pub mod db;
 pub mod journal;
 pub mod modes;
+pub mod tools;
 pub mod types;
 
 pub use config::{
@@ -13,8 +14,12 @@ pub use config::{
 pub use db::{DbError, open as open_db};
 pub use journal::{JournalError, JournalWriter, read_events, read_events_after, read_events_tail};
 pub use modes::{
-    MODES, ModeInfo, ModeMarker, TOOL_NAMES, last_mode_marker, mode_change_approved_message,
+    MODES, ModeInfo, ModeMarker, last_mode_marker, mode_change_approved_message,
     mode_change_message,
+};
+pub use tools::{
+    FIXED_TOOLS, TOGGLEABLE_TOOLS, TOOL_NAMES, TOOLS, ToolInfo, is_enabled, is_fixed,
+    is_toggleable, resolve_enabled_tools,
 };
 pub use types::{
     AskUserMarker, AskUserOption, AskUserQuestion, JournalEvent, JournalEventKind, JournalMessage,

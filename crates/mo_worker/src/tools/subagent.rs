@@ -166,6 +166,9 @@ fn create_child_session(
         model: ctx.model_name.clone(),
         status: SessionStatus::Pending,
         mode,
+        // The child inherits the parent's enabled-tool set: a session that
+        // banned e.g. `ask_user` does not want its subagents calling it.
+        tools: ctx.session.tools.clone(),
         pid: None,
         journal_path: journal_path.display().to_string(),
         created_at: now.clone(),

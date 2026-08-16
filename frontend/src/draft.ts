@@ -8,6 +8,11 @@ export interface Draft {
   workdir: string
   model: string
   mode: Mode
+  /** The *toggleable* tools the user turned off for this session (their
+   *  schemas are not injected into the prompt). Fixed tools (bash + file
+   *  operations) are always available and never listed here. An empty list
+   *  = everything enabled. */
+  bannedTools: string[]
   text: string
 }
 
@@ -28,6 +33,12 @@ export function loadDraft(): Draft | null {
         parsed.mode === 'build' || parsed.mode === 'plan' || parsed.mode === 'explore'
           ? parsed.mode
           : 'build',
+      // Drafts saved before tool selection existed carry no list: treat
+      // them as "everything enabled" (an empty ban list). Non-string
+      // entries are dropped defensively.
+      bannedTools: Array.isArray(parsed.bannedTools)
+        ? parsed.bannedTools.filter((t): t is string => typeof t === 'string')
+        : [],
       text: parsed.text,
     }
   } catch {

@@ -32,6 +32,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/meta", get(meta))
         .route("/api/models", get(list_models))
         .route("/api/modes", get(list_modes))
+        .route("/api/tools", get(list_tools))
         .route("/api/sessions", post(create_session).get(list_sessions))
         .route(
             "/api/sessions/{id}",
@@ -108,6 +109,14 @@ async fn list_modes() -> Json<Vec<mo_core::ModeInfo>> {
     Json(mo_core::MODES.to_vec())
 }
 
+/// GET /api/tools — the session tool registry for the "New session"
+/// checkbox list: name, label, description, and whether the tool is
+/// *fixed* (always available: bash + the file operations) or *toggleable*
+/// (the user may disable it per session).
+async fn list_tools() -> Json<Vec<mo_core::ToolInfo>> {
+    Json(mo_core::TOOLS.to_vec())
+}
+
 #[derive(Deserialize)]
 struct CreateSessionRequest {
     workdir: String,
@@ -119,6 +128,12 @@ struct CreateSessionRequest {
     /// The mode frames the system prompt journaled on the first run and
     /// the write sandbox of every run.
     mode: Option<String>,
+    /// The *toggleable* tools (from `GET /api/tools`) the user turned off
+    /// for this session. Disabled tools' schemas are not injected into the
+    /// prompt and the worker refuses to execute them. Fixed tools (bash +
+    /// file operations) are always available and cannot be banned;
+    /// absent/empty bans nothing (all tools enabled).
+    banned_tools: Option<Vec<String>>,
 }
 
 /// POST /api/sessions — validate workdir, insert the session row, spawn the
@@ -174,6 +189,13 @@ async fn create_session(
     // The first user message itself is journaled below, so it stays in the
     // history either way.
     let first_message = payload.prompt;
+    // Resolve the session's tool set: the client sends the *banned*
+    // (toggleable) tools; fixed tools (bash + file operations) are always
+    // included. Stored on the session row as the canonical enabled list —
+    // the worker reads it back to filter the schemas it injects and to
+    // refuse muted tools (see `mo_core::tools`).
+    let tools = mo_core::resolve_enabled_tools(&payload.banned_tools.unwrap_or_default())
+        .map_err(ApiError::bad_request)?;
     let mut session = Session {
         id: id.clone(),
         parent_id: None,
@@ -182,6 +204,7 @@ async fn create_session(
         model: model.name.clone(),
         status: SessionStatus::Pending,
         mode,
+        tools,
         pid: None,
         journal_path: journal_path.display().to_string(),
         created_at: now.clone(),
