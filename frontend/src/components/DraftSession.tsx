@@ -208,6 +208,7 @@ export default function DraftSession({
                   className={
                     tool.fixed ? 'tool-option tool-fixed' : 'tool-option'
                   }
+                  title={tool.description}
                 >
                   <input
                     type="checkbox"
