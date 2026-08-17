@@ -407,6 +407,43 @@ fn history_from_journal(
                     tool_calls: None,
                 });
             }
+            JournalEventKind::PermissionAnswered {
+                tool,
+                operation,
+                path,
+                allowed,
+                ..
+            } => {
+                // The user decided a file-access permission request the
+                // worker journaled for a path outside the auto-allowed
+                // roots (see `tools::permission`). Synthesized as a
+                // user-role message carrying the decision — the tool's
+                // "return value" to the model — so the model retries the
+                // tool call when allowed or finds another way when denied.
+                // The event carries the request's details itself
+                // (self-contained, so the message survives a context
+                // compression that dropped the original request).
+                // (`PermissionRequest` itself is flow metadata and falls
+                // into the default skip.)
+                let verdict = if allowed { "allowed" } else { "denied" };
+                let followup = if allowed {
+                    " Retry the tool call with the same arguments."
+                } else {
+                    " Do not retry this exact request; find another way or \
+                     explain why you cannot proceed."
+                };
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: ChatMessageContentValue::Text(format!(
+                        "{}{} the request {tool} ({operation}) on \"{path}\".{followup}",
+                        crate::prompt::PERMISSION_ANSWER_PREFIX,
+                        verdict
+                    )),
+                    reasoning_content: None,
+                    tool_call_id: None,
+                    tool_calls: None,
+                });
+            }
             JournalEventKind::Message(m) => messages.push(ChatMessage {
                 role: m.role,
                 content: ChatMessageContentValue::Text(m.content),

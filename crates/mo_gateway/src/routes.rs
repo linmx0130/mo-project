@@ -12,8 +12,8 @@ use axum::{
     routing::{get, post},
 };
 use mo_core::{
-    AskUserMarker, JournalEvent, JournalEventKind, JournalMessage, JournalWriter, Mode, Session,
-    SessionStatus, db,
+    AskUserMarker, JournalEvent, JournalEventKind, JournalMessage, JournalWriter, Mode,
+    PermissionMarker, Session, SessionStatus, db,
 };
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
@@ -46,6 +46,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/mode/approve", post(approve_mode_change))
         .route("/api/sessions/{id}/mode/reject", post(reject_mode_change))
         .route("/api/sessions/{id}/ask/answer", post(answer_ask_user))
+        .route(
+            "/api/sessions/{id}/permission/answer",
+            post(answer_permission),
+        )
         .route("/api/sessions/{id}/cancel", post(cancel))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -728,6 +732,111 @@ async fn answer_ask_user(
             JournalWriter::open(Path::new(&journal_path)).map_err(ApiError::internal)?;
         journal
             .append(JournalEventKind::AskUserAnswered { answers })
+            .map_err(ApiError::internal)?;
+    }
+
+    {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::clear_pid(&conn, &id).map_err(ApiError::internal)?;
+        db::update_status(&conn, &id, SessionStatus::Pending, None).map_err(ApiError::internal)?;
+    }
+
+    let mut session = {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::get_session(&conn, &id)
+            .map_err(ApiError::internal)?
+            .expect("session row exists")
+    };
+    spawn_and_patch(&state, &mut session);
+
+    Ok((StatusCode::ACCEPTED, Json(session)))
+}
+
+#[derive(Deserialize)]
+struct AnswerPermissionRequest {
+    /// The id of the pending `permission_request` (`"p1"`, assigned by the
+    /// worker); must match the pending request.
+    request_id: String,
+    /// Whether the user allowed the request (Allow) or denied it (Deny).
+    allowed: bool,
+}
+
+/// POST /api/sessions/:id/permission/answer — the user answered a pending
+/// `permission_request` in the UI (clicked Allow or Deny on a file-access
+/// request for a path outside the auto-allowed roots).
+///
+/// Validates the request id against the pending request, journals a
+/// `PermissionAnswered` event carrying the request's tool / operation /
+/// path plus the decision (self-contained, so the worker's history rebuild
+/// can synthesize the model-facing message even after a context
+/// compression), and respawns the worker — the model then retries the tool
+/// call when allowed or finds another way when denied. The session must be
+/// terminal and the journal's last permission marker must be a pending
+/// request.
+async fn answer_permission(
+    State(state): State<Arc<AppState>>,
+    PathParam(id): PathParam<String>,
+    Json(payload): Json<AnswerPermissionRequest>,
+) -> ApiResult<(StatusCode, Json<Session>)> {
+    let (status, pid, journal_path) = {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        match db::get_session(&conn, &id).map_err(ApiError::internal)? {
+            Some(session) => (session.status, session.pid, session.journal_path),
+            None => return Err(ApiError::not_found("session not found")),
+        }
+    };
+    if status == SessionStatus::Running || status == SessionStatus::Pending {
+        return Err(ApiError::conflict("session is already running"));
+    }
+    if pid.is_some_and(process::is_pid_alive) {
+        return Err(ApiError::conflict("session worker is still shutting down"));
+    }
+    let events = mo_core::read_events(Path::new(&journal_path)).map_err(ApiError::internal)?;
+    // The pending request: the last permission marker is a request, and the
+    // request whose id the answer keys. (Stage 1: one request at a time.)
+    let (pending_id, tool, operation, path) = match mo_core::last_permission_marker(&events) {
+        Some(PermissionMarker::RequestPending) => events
+            .iter()
+            .rev()
+            .find_map(|e| match &e.kind {
+                JournalEventKind::PermissionRequest {
+                    request_id,
+                    tool,
+                    operation,
+                    path,
+                } => Some((
+                    request_id.clone(),
+                    tool.clone(),
+                    operation.clone(),
+                    path.clone(),
+                )),
+                _ => None,
+            })
+            .expect("a pending permission marker implies a permission_request"),
+        _ => {
+            return Err(ApiError::conflict(
+                "no pending permission request to answer",
+            ));
+        }
+    };
+    if payload.request_id != pending_id {
+        return Err(ApiError::bad_request(format!(
+            "unknown request id: {} (the pending request is {pending_id})",
+            payload.request_id
+        )));
+    }
+
+    {
+        let mut journal =
+            JournalWriter::open(Path::new(&journal_path)).map_err(ApiError::internal)?;
+        journal
+            .append(JournalEventKind::PermissionAnswered {
+                request_id: pending_id,
+                tool,
+                operation,
+                path,
+                allowed: payload.allowed,
+            })
             .map_err(ApiError::internal)?;
     }
 

@@ -159,6 +159,34 @@ export type JournalEventKind =
    *  request; the worker respawns and the model receives the answers as a
    *  user message. Rendered as a passive notice row. */
   | { kind: 'ask_user_answered'; answers: Record<string, string> }
+  /** The agent requested user permission to access a file path outside the
+   *  auto-allowed roots (the working directory, the session scratch dir,
+   *  and — for reads — global skill folders). `tool` is the tool name,
+   *  `operation` is 'read' or 'write', `path` is the path as the model
+   *  passed it. While the latest such request is pending (no
+   *  `permission_answered` after it), the frontend freezes the composer
+   *  and shows an Allow / Deny card. */
+  | {
+      kind: 'permission_request'
+      request_id: string
+      tool: string
+      operation: string
+      path: string
+    }
+  /** The user decided a pending `permission_request` (POST
+   *  /:id/permission/answer): `allowed` is true for Allow, false for
+   *  Deny; the event carries the request's tool/operation/path so the
+   *  model-facing message is self-contained. It resolves the request; the
+   *  worker respawns and the model retries the tool call (or finds
+   *  another way). Rendered as a passive notice row. */
+  | {
+      kind: 'permission_answered'
+      request_id: string
+      tool: string
+      operation: string
+      path: string
+      allowed: boolean
+    }
   /** Streamed assistant text/reasoning chunk; the following `message` event
    *  carries the assembled content and replaces the delta-built preview. */
   | { kind: 'message_delta'; content: string; reasoning_content?: string | null }
@@ -309,6 +337,23 @@ export function answerAskUser(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ answers }),
+  })
+}
+
+/** Decide a pending `permission_request` (a file tool asked to access a
+ *  path outside the auto-allowed roots): `requestId` is the request's id
+ *  (`p1`) and `allowed` is true for Allow, false for Deny. The backend
+ *  journals the decision and resumes the run — the model retries the tool
+ *  call when allowed, or finds another way when denied. */
+export function answerPermission(
+  id: string,
+  requestId: string,
+  allowed: boolean,
+): Promise<Session> {
+  return http(`/api/sessions/${id}/permission/answer`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ request_id: requestId, allowed }),
   })
 }
 

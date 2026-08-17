@@ -252,6 +252,57 @@ describe('buildTimeline — tool blocks at turn boundaries', () => {
     }
   })
 
+  it('does not close a streaming sibling while a permission_request event lands', () => {
+    // `permission_request` is journaled mid-execution by a file tool; a
+    // sibling bash block may still legitimately be streaming and must keep
+    // its running badge until a true boundary.
+    const items = buildTimeline([
+      asstMsg('', [{ id: 'call_a', name: 'bash', arguments: '{}' }]),
+      toolStart('call_a'),
+      toolOut('call_a', 'streaming'),
+      ev({
+        kind: 'permission_request',
+        request_id: 'p1',
+        tool: 'read_file',
+        operation: 'read',
+        path: '/etc/hostname',
+      }),
+    ])
+
+    const tool = items.find((i) => i.type === 'tool')
+    expect(tool).toBeDefined()
+    if (tool?.type === 'tool') {
+      expect(tool.block.streaming).toBe(true)
+    }
+    // The permission request itself is rendered as a notice row.
+    const notices = items.filter((i) => i.type === 'event')
+    expect(notices).toHaveLength(1)
+  })
+
+  it('treats a permission_answered event as a true turn boundary', () => {
+    // `permission_answered` is journaled by the gateway between runs: any
+    // stale streaming tool block from an interrupted earlier run is closed.
+    const items = buildTimeline([
+      asstMsg('', [{ id: 'call_a', name: 'bash', arguments: '{}' }]),
+      toolStart('call_a'),
+      toolOut('call_a', 'partial output'),
+      ev({
+        kind: 'permission_answered',
+        request_id: 'p1',
+        tool: 'read_file',
+        operation: 'read',
+        path: '/etc/hostname',
+        allowed: true,
+      }),
+    ])
+
+    const tool = items.find((i) => i.type === 'tool')
+    expect(tool).toBeDefined()
+    if (tool?.type === 'tool') {
+      expect(tool.block.streaming).toBe(false)
+    }
+  })
+
   it('closes a streaming tool block at the user-followup boundary', () => {
     const items = buildTimeline([
       asstMsg('', [{ id: 'call_1', name: 'bash', arguments: '{}' }]),

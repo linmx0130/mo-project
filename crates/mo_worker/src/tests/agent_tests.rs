@@ -895,6 +895,149 @@ fn history_synthesizes_answer_message_from_ask_user_answered() {
     assert_eq!(messages.len(), 5);
 }
 
+/// A `PermissionAnswered` event (the user allowed/denied a file-access
+/// permission request the harness showed them) must appear in the rebuilt
+/// context as a user-role message carrying the decision plus the request's
+/// tool/operation/path — self-contained, so the model knows exactly what to
+/// retry (or not) — while the `PermissionRequest` itself is flow metadata
+/// and never becomes a chat message.
+#[test]
+fn history_synthesizes_decision_message_from_permission_answered() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("journal.jsonl");
+    let mut journal = JournalWriter::open(&path).unwrap();
+    journal.append(user_msg("read the file")).unwrap();
+    journal
+        .append(JournalEventKind::SystemPrompt {
+            content: "You are in Build mode.".to_string(),
+            mode: Mode::Build,
+            model: "mock-model".to_string(),
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::Message(JournalMessage {
+            role: "assistant".to_string(),
+            content: String::new(),
+            reasoning_content: None,
+            tool_call_id: None,
+            tool_calls: Some(vec![ToolCallInfo {
+                id: "call_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: r#"{"path":"/etc/hostname"}"#.to_string(),
+            }]),
+        }))
+        .unwrap();
+    journal
+        .append(JournalEventKind::ToolCallStart {
+            id: "call_read".to_string(),
+            name: "read_file".to_string(),
+            arguments: r#"{"path":"/etc/hostname"}"#.to_string(),
+        })
+        .unwrap();
+    // The tool asked the user (flow metadata, never a chat message)...
+    journal
+        .append(JournalEventKind::PermissionRequest {
+            request_id: "p1".into(),
+            tool: "read_file".into(),
+            operation: "read".into(),
+            path: "/etc/hostname".into(),
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::ToolResult {
+            id: "call_read".to_string(),
+            name: "read_file".to_string(),
+            ok: true,
+            output: "A permission request was sent to the user: ... Stop working now: ..."
+                .to_string(),
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::Message(JournalMessage {
+            role: "assistant".to_string(),
+            content: "I asked the user for permission; waiting.".to_string(),
+            reasoning_content: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }))
+        .unwrap();
+    // The gateway appended the user's decision (Allow).
+    journal
+        .append(JournalEventKind::PermissionAnswered {
+            request_id: "p1".into(),
+            tool: "read_file".into(),
+            operation: "read".into(),
+            path: "/etc/hostname".into(),
+            allowed: true,
+        })
+        .unwrap();
+    drop(journal);
+
+    let (system, messages, _) = history_from_journal(&path).unwrap();
+    assert_eq!(system.as_deref(), Some("You are in Build mode."));
+    // user, assistant(tool call), tool(result), assistant(waiting), user(decision)
+    assert_eq!(messages.len(), 5, "messages: {messages:#?}");
+    assert_eq!(messages[0].role, "user");
+    assert_eq!(messages[1].role, "assistant");
+    assert!(
+        messages[1]
+            .tool_calls
+            .as_ref()
+            .is_some_and(|c| c.len() == 1)
+    );
+    assert_eq!(messages[2].role, "tool");
+    assert!(messages[2].content.to_string().contains("Stop working now"));
+    assert_eq!(messages[3].role, "assistant");
+    assert_eq!(
+        messages[3].content.to_string(),
+        "I asked the user for permission; waiting."
+    );
+    // The last message is the synthesized decision, carrying the tool,
+    // operation and path so the model can retry the exact request.
+    assert_eq!(messages[4].role, "user");
+    let decision = messages[4].content.to_string();
+    assert!(
+        decision.starts_with("[The user decided a file-access permission request:]"),
+        "got: {decision}"
+    );
+    assert!(decision.contains("allowed"), "got: {decision}");
+    assert!(decision.contains("read_file"), "got: {decision}");
+    assert!(decision.contains("/etc/hostname"), "got: {decision}");
+    assert!(decision.contains("Retry the tool call"), "got: {decision}");
+
+    // A denied decision carries the opposite guidance.
+    let path2 = dir.path().join("journal2.jsonl");
+    let mut journal = JournalWriter::open(&path2).unwrap();
+    journal.append(user_msg("write it")).unwrap();
+    journal
+        .append(JournalEventKind::SystemPrompt {
+            content: "You are in Build mode.".to_string(),
+            mode: Mode::Build,
+            model: "mock-model".to_string(),
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::PermissionAnswered {
+            request_id: "p1".into(),
+            tool: "create_file".into(),
+            operation: "write".into(),
+            path: "/tmp/x.txt".into(),
+            allowed: false,
+        })
+        .unwrap();
+    drop(journal);
+    let (_, messages, _) = history_from_journal(&path2).unwrap();
+    assert_eq!(messages.len(), 2, "messages: {messages:#?}");
+    let decision = messages[1].content.to_string();
+    assert!(decision.contains("denied"), "got: {decision}");
+    assert!(decision.contains("create_file"), "got: {decision}");
+    assert!(decision.contains("/tmp/x.txt"), "got: {decision}");
+    assert!(
+        decision.contains("Do not retry this exact request"),
+        "got: {decision}"
+    );
+}
+
 fn user_msg(content: &str) -> JournalEventKind {
     JournalEventKind::Message(JournalMessage {
         role: "user".to_string(),

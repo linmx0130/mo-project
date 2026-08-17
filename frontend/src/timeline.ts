@@ -243,6 +243,7 @@ export function buildTimeline(events: JournalEvent[]): TimelineItem[] {
       }
       case 'mode_change_request':
       case 'ask_user_request':
+      case 'permission_request':
         // Journaled by their tools mid-execution; sibling tools may still
         // be streaming, so only the open message preview is closed.
         closeOpenMessage()

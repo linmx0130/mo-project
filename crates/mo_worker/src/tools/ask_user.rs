@@ -41,8 +41,10 @@ pub fn ask_user(
     // Refuse when a request is already pending: the user has not answered
     // yet, and a second question would just confuse the UI. The journal's
     // last ask-user marker decides: an `AskUserRequest` with no resolving
-    // `AskUserAnswered` after it is still pending. (Stage 1: one question
-    // per call — ask again only after the previous one was answered.)
+    // `AskUserAnswered` after it is still pending. A pending file-access
+    // `PermissionRequest` blocks too (one user-facing card at a time).
+    // (Stage 1: one question per call — ask again only after the previous
+    // one was answered.)
     let events = mo_core::read_events(std::path::Path::new(&ctx.session.journal_path))
         .map_err(|e| format!("failed to read session journal: {e}"))?;
     if matches!(
@@ -52,6 +54,16 @@ pub fn ask_user(
         return Err(
             "a clarification question is already pending — the user has not answered yet. Do \
              not call this tool again; finish your turn and wait for the user's answer."
+                .to_string(),
+        );
+    }
+    if matches!(
+        mo_core::last_permission_marker(&events),
+        Some(mo_core::PermissionMarker::RequestPending)
+    ) {
+        return Err(
+            "a file-access permission request is already pending — the user has not answered \
+             yet. Do not call this tool; finish your turn and wait for the user's decision."
                 .to_string(),
         );
     }

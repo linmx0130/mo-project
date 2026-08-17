@@ -466,6 +466,19 @@ p {
   color: var(--text-h);
 }
 
+/* The requested file path inside the permission-request banner. */
+.permission-path {
+  display: inline-block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
+}
+
 .mode-request-actions {
   display: flex;
   justify-content: flex-end;

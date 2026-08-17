@@ -88,6 +88,31 @@ export function EventRow({ event }: { event: JournalEvent }) {
           </span>
         </div>
       )
+    case 'permission_request':
+      // A file tool asked to access a path outside the auto-allowed roots;
+      // the actionable Allow / Deny card is rendered above the composer
+      // while the request is pending. This is the passive timeline record.
+      return (
+        <div className="mode-change">
+          <span className="badge">→ permission requested</span>
+          <span className="muted">
+            {kind.tool} ({kind.operation}) — {kind.path}
+          </span>
+        </div>
+      )
+    case 'permission_answered':
+      // The user allowed or denied the request; it is resolved and the
+      // decision was sent to the agent.
+      return (
+        <div className="mode-change">
+          <span className={`badge ${kind.allowed ? '' : 'badge-err'}`}>
+            → {kind.allowed ? 'allowed' : 'denied'}
+          </span>
+          <span className="muted">
+            {kind.tool} ({kind.operation}) — {kind.path}
+          </span>
+        </div>
+      )
     case 'handoff':
       // Context compression: the model generated a handoff prompt and the
       // events before it are no longer sent to the model (they stay in the

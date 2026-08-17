@@ -223,6 +223,30 @@ pub fn last_ask_user_marker(events: &[JournalEvent]) -> Option<AskUserMarker> {
     })
 }
 
+/// The journal's *permission marker* — the last event that pins down the
+/// file-access permission-request state, as scanned by the worker's file
+/// tools (refuse to journal a new request while one is pending) and the
+/// gateway's answer endpoint (409 unless a request is pending).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionMarker {
+    /// A `permission_request` with no `permission_answered` after it: the
+    /// request is still waiting for the user's decision.
+    RequestPending,
+    /// A `permission_answered` event: the pending request was answered; no
+    /// request is pending.
+    Answered,
+}
+
+/// Scan journal events (oldest first) for the last permission marker, if
+/// any. Anything else does not resolve a request and is skipped.
+pub fn last_permission_marker(events: &[JournalEvent]) -> Option<PermissionMarker> {
+    events.iter().rev().find_map(|e| match &e.kind {
+        JournalEventKind::PermissionRequest { .. } => Some(PermissionMarker::RequestPending),
+        JournalEventKind::PermissionAnswered { .. } => Some(PermissionMarker::Answered),
+        _ => None,
+    })
+}
+
 /// The journal's *model marker* — the last event that pins down which model
 /// the conversation last ran under, as scanned by the gateway when a
 /// followup arrives to decide whether to inject a `ModelChange` notice.
@@ -391,6 +415,49 @@ pub enum JournalEventKind {
     /// "return value") as a user message on the resumed run.
     AskUserAnswered {
         answers: BTreeMap<String, String>,
+    },
+    /// The worker's request for user permission to access a file path
+    /// outside the session's auto-allowed roots (the working directory,
+    /// the session scratch dir, and — for reads — global skill folders).
+    /// Journaled by the worker when a file tool call (`read_file`,
+    /// `edit_file`, `create_file`, `remove_file`) targets such a path and
+    /// the mode permits asking (reads in any mode; writes in `build` mode
+    /// only — `plan`/`explore` writes outside the scratch dir are denied
+    /// outright, never asked about). The frontend renders it as a
+    /// permission card (Allow / Deny) and freezes the composer while it is
+    /// pending.
+    ///
+    /// `request_id` is assigned by the worker (`p1`) and keys the answer in
+    /// the `PermissionAnswered` event. `tool` is the tool name, `operation`
+    /// is `"read"` or `"write"`, and `path` is the path exactly as the
+    /// model passed it. Readers (the worker's history rebuild) skip this
+    /// event: it is flow metadata for the UI, never a chat message.
+    PermissionRequest {
+        request_id: String,
+        tool: String,
+        operation: String,
+        path: String,
+    },
+    /// The user answered a pending `PermissionRequest`. Journaled by the
+    /// gateway (`POST /api/sessions/:id/permission/answer`) when the user
+    /// clicks Allow or Deny in the UI; it resolves the request (the worker
+    /// respawns and the run continues) and carries `allowed` plus the
+    /// request's `tool` / `operation` / `path` (copied from the pending
+    /// request at answer time, so the event is self-contained even after a
+    /// context compression dropped the request from the model context).
+    ///
+    /// The worker's history rebuild maps this event to a user-role message,
+    /// so the model receives the decision and retries the tool call when
+    /// allowed (or finds another way when denied). The worker also
+    /// remembers the decision per `(tool, path)`, so a retry of an allowed
+    /// path does not prompt again and a retry of a denied path is refused
+    /// outright.
+    PermissionAnswered {
+        request_id: String,
+        tool: String,
+        operation: String,
+        path: String,
+        allowed: bool,
     },
     /// A streamed chunk of an assistant message (token-by-token preview).
     ///

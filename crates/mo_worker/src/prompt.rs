@@ -27,6 +27,14 @@ pub const HANDOFF_USER_PREFIX: &str = "[Context compressed: the messages before 
 /// `ask_user` tool (the tool's "return value").
 pub const ASK_USER_ANSWER_PREFIX: &str = "[The user answered your clarification question:]\n\n";
 
+/// The marker prefix the worker's history rebuild wraps a journaled
+/// `PermissionAnswered` event in when it synthesizes the decision's
+/// user-role message, so the model understands that the text that follows
+/// is the user's decision on the file-access permission request the harness
+/// showed them (allowed → retry the tool call; denied → do not retry).
+pub const PERMISSION_ANSWER_PREFIX: &str =
+    "[The user decided a file-access permission request:]\n\n";
+
 /// The user-role message the worker appends to the context when it asks the
 /// model to generate a handoff prompt (context compression): the model
 /// summarizes the whole conversation so far, and the result is journaled as
@@ -69,9 +77,13 @@ pub fn build_system_prompt(
     prompt.push_str(&mode_framing(mode, workdir, scratch));
     prompt.push_str(&format!("Working directory: {}\n", workdir.display()));
     prompt.push_str(
-        "You may read and write files only inside the working directory, except that \
-         read_file may also read global skill folders (see \"Global skills\" below). \
-         Never attempt to access files or run commands that escape it.\n\n",
+        "Files inside the working directory are freely accessible. read_file may also \
+         read the session scratch directory and global skill folders (see \"Global \
+         skills\" below). Any other path requires the user's approval: the harness \
+         shows a permission request in the UI, and the user's accept or deny arrives as \
+         a user message — retry the tool call only if they accept. Never attempt to \
+         access files or run commands that escape the working directory without \
+         approval.\n\n",
     );
     prompt.push_str(
         "The harness may compress the context mid-task when it nears the model's context \
@@ -218,6 +230,10 @@ fn tool_usage_rules(mode: Mode, scratch: &Path) -> String {
                edit_file.\n\
              - Make precise edits: provide a unique old_string that appears exactly once\n\
                (use replace_all only when every occurrence should change).\n\
+             - A path outside the working directory (and outside the session scratch\n\
+               dir) requires the user's approval: the harness shows a permission request\n\
+               in the UI, and the user's accept or deny arrives as a user message — retry\n\
+               the tool call only if they accept.\n\
              - Use bash for anything outside the file tools: builds, tests, git, etc.\n\
              - Use bash_in_background for commands that run longer than ~2 minutes:\n\
                it returns a process id immediately; check it with action=status and\n\
@@ -236,6 +252,10 @@ fn tool_usage_rules(mode: Mode, scratch: &Path) -> String {
              - create_file / edit_file / remove_file are allowed ONLY under the session\n\
                scratch directory {} (absolute paths); the codebase is read-only and\n\
                modifications there are denied.\n\
+             - Reading a path outside the working directory and the scratch dir shows\n\
+               a permission request to the user in the UI (the answer arrives as a user\n\
+               message); writing outside the scratch dir is denied outright — never\n\
+               asked about.\n\
              - Use bash or bash_in_background for anything outside the file tools\n\
                (builds, tests, git, ...), keeping them read-only.\n\
              - Tool calls in one message run concurrently (up to max_tool_concurrency);\n\

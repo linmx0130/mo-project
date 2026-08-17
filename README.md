@@ -151,7 +151,10 @@ cargo run -p mo_gateway
 The mock responds based on the prompt: prompts containing `subagent` exercise
 `spawn_subagent`, prompts containing `ask_user` ask a clarification question
 via `ask_user` (answer it with `POST /api/sessions/:id/ask/answer` to see the
-run resume), prompts containing `slow` start a long-running `bash sleep`
+run resume), prompts containing `permission` call `read_file` on a path
+outside the workdir, so the worker asks the user for permission (answer it
+with `POST /api/sessions/:id/permission/answer` to see the retry run without
+a second prompt), prompts containing `slow` start a long-running `bash sleep`
 (handy for testing cancel), anything else does `read_file` + `bash`. Final
 answers are replayed as multiple content chunks, so the token-by-token
 streaming path is exercised in smoke tests too.
@@ -186,6 +189,24 @@ would land inside the codebase is denied with an explicit error telling the
 model where it *may* write; writes inside the scratch dir use absolute
 paths. `bash` and `bash_in_background` remain available everywhere — a
 documented soft restriction (they can mutate state), not a hard one.
+
+**File access permissions.** `read_file` / `edit_file` / `create_file` /
+`remove_file` are automatically allowed for paths inside the working
+directory and the session scratch dir (`read_file` also reaches global
+skill folders). A call targeting any *other* path is not silently denied:
+the worker journals a `permission_request` event and tells the model to
+stop and wait, and the frontend shows an **Allow / Deny card** in place of
+the composer. **Allow** (`POST /api/sessions/:id/permission/answer`,
+`{request_id, allowed: true}`) journals a `permission_answered` event and
+respawns the worker; the history rebuild maps it to a user message, so the
+model retries the tool call and it runs (the decision is remembered for
+that exact `(tool, path)` for the rest of the session — no second prompt).
+**Deny** (`allowed: false`) journals the same event with the opposite
+guidance, and a later retry of the same request is refused outright without
+prompting again. Reads ask in every mode; writes ask in `build` mode only —
+in `plan`/`explore` a write outside the scratch dir is denied outright
+(never asked about, per the mode's write sandbox), and subagents never ask
+(their journal has no UI); they report the need to their parent agent.
 
 **Switching modes.** A terminal session's mode can be switched from the
 status-bar picker (`POST /api/sessions/:id/mode`; rejected while the
@@ -466,6 +487,7 @@ $HOME/.agents/
 | `POST /api/sessions/:id/mode/approve` | approve a pending `mode_change_request` (the agent called `request_mode_change`): switch the session's mode to the requested one and continue the run with a single `mode_change` notice (409 unless the journal's last mode marker is a pending request) |
 | `POST /api/sessions/:id/mode/reject` | reject a pending `mode_change_request`: journal a `mode_change_request_declined` marker, no mode switch, nothing sent to the model (409 unless a request is pending) |
 | `POST /api/sessions/:id/ask/answer` `{answers}` | the user answered a pending `ask_user_request` (the agent asked a clarification question via `ask_user`): `answers` is a JSON object keyed by `question_id` whose values are the chosen option's title or the user's typed text; journals an `ask_user_answered` event and resumes the run (409 unless a request is pending) |
+| `POST /api/sessions/:id/permission/answer` `{request_id, allowed}` | the user decided a pending `permission_request` (a file tool asked to access a path outside the working directory / scratch dir / skill folders): `allowed` is `true` for Allow, `false` for Deny; journals a `permission_answered` event (carrying the request's tool / operation / path plus the decision) and resumes the run — the model retries the tool call when allowed (409 unless a request is pending) |
 | `POST /api/sessions/:id/cancel` | mark cancelled, then SIGTERM → SIGKILL the worker process group |
 | `DELETE /api/sessions/:id` | permanently delete a session: stop a running worker, remove the session dir (journal, worker log, ...) from disk, drop the DB row (`204` on success) |
 
@@ -491,6 +513,13 @@ question card while it is pending), `ask_user_answered` (the user answered:
 a JSON object keyed by `question_id` whose values are the chosen option's
 title or the user's typed text — the worker maps it to a user message, so
 the model receives the answers),
+`permission_request` (a file tool asked the user for permission to access a
+path outside the working directory / session scratch dir / skill folders:
+the tool name, `read`|`write` and the path; the frontend shows an Allow /
+Deny card while it is pending), `permission_answered` (the user allowed or
+denied the request: `allowed` plus the request's tool / operation / path —
+the worker maps it to a user message, so the model retries the tool call
+when allowed or finds another way when denied),
 `context_usage` (context length in tokens after each LLM call, from the
 API's `usage.prompt_tokens`), `subagent_started` (a parent worker spawned a
 subagent: child session id + the `spawn_subagent` tool-call id + the

@@ -24,7 +24,40 @@ fn includes_workdir_and_agents_md() {
     let prompt = prompt_for(Mode::Build, &dir, &agents);
     assert!(prompt.contains(&dir.path().display().to_string()));
     assert!(prompt.contains("Use uv for Python."));
-    assert!(prompt.contains("only inside the working directory"));
+    // The sandbox paragraph: files inside the workdir are freely
+    // accessible; paths outside require the user's approval.
+    assert!(prompt.contains("Files inside the working directory"));
+    assert!(prompt.contains("requires the user's approval"));
+}
+
+/// Every mode's system prompt tells the model about the file-access
+/// permission flow: paths outside the allowed roots prompt the user in the
+/// UI, and the decision arrives as a user message (retry only if allowed).
+#[test]
+fn all_modes_mention_permission_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let agents = tempfile::tempdir().unwrap();
+    for mode in [Mode::Build, Mode::Plan, Mode::Explore] {
+        let prompt = prompt_for(mode, &dir, &agents);
+        assert!(
+            prompt.contains("permission request"),
+            "mode {mode}: {prompt}"
+        );
+        assert!(
+            prompt.contains("retry the tool call only if they accept")
+                || prompt.contains("the answer arrives as a user message"),
+            "mode {mode}: {prompt}"
+        );
+    }
+    // Build: outside paths are asked about.
+    let prompt = prompt_for(Mode::Build, &dir, &agents);
+    assert!(prompt.contains("retry the tool call only if they accept"));
+    // Plan/explore: reads outside prompt the user; writes outside the
+    // scratch dir are denied outright.
+    let prompt = prompt_for(Mode::Plan, &dir, &agents);
+    assert!(prompt.contains("denied outright"));
+    assert!(prompt.contains("never"));
+    assert!(prompt.contains("asked about"));
 }
 
 #[test]

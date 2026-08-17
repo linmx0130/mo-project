@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { AskUserQuestion, JournalEvent, Mode, ModelInfo, Session, SessionStatus } from '../api'
 import {
   answerAskUser,
+  answerPermission,
   approveModeChange,
   cancelSession,
   getHistory,
@@ -14,6 +15,7 @@ import {
 } from '../api'
 import AskUserCard from './AskUserCard'
 import Composer from './Composer'
+import PermissionCard from './PermissionCard'
 import StatusBar from './StatusBar'
 import SubagentModal from './SubagentModal'
 import { buildTimeline, isTerminal } from '../timeline'
@@ -270,6 +272,39 @@ export default function SessionView({ session, onStatusChange }: Props) {
     }
     return lastQuestion
   }, [events])
+  // A pending file-access permission request: a file tool asked to read or
+  // write a path outside the auto-allowed roots (journaled as
+  // `permission_request`) and the user has not decided yet. Resolved by a
+  // `permission_answered` event after it. While pending, the composer is
+  // frozen and the Allow / Deny card is shown instead.
+  const pendingPermission = useMemo(() => {
+    let lastRequest: {
+      request_id: string
+      tool: string
+      operation: string
+      path: string
+      seq: number
+    } | null = null
+    let lastAnswerSeq: number | null = null
+    for (const ev of events) {
+      if (ev.kind.kind === 'permission_request') {
+        lastRequest = {
+          request_id: ev.kind.request_id,
+          tool: ev.kind.tool,
+          operation: ev.kind.operation,
+          path: ev.kind.path,
+          seq: ev.seq ?? -1,
+        }
+      } else if (ev.kind.kind === 'permission_answered') {
+        lastAnswerSeq = ev.seq ?? -1
+      }
+    }
+    if (!lastRequest) return null
+    if (lastAnswerSeq !== null && lastAnswerSeq > lastRequest.seq) {
+      return null
+    }
+    return lastRequest
+  }, [events])
   // While any tool is still streaming, re-render once per second so the
   // elapsed badge ticks; stop when everything settles.
   const anyToolStreaming = timeline.some(
@@ -337,6 +372,30 @@ export default function SessionView({ session, onStatusChange }: Props) {
       const updated = await answerAskUser(session.id, answers)
       setStatus(updated.status)
       // Re-arm the SSE stream (the run continues with the answer); the
+      // effect also refetches the history, which now resolves the request.
+      setRunId((r) => r + 1)
+      onStatusChange()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSending(false)
+    }
+  }
+
+  /** Decide the pending file-access permission request (Allow or Deny):
+   *  the backend journals the decision and resumes the run — the model
+   *  retries the tool call when allowed, or finds another way when denied. */
+  const submitPermission = async (allowed: boolean) => {
+    if (!pendingPermission) return
+    setSending(true)
+    try {
+      const updated = await answerPermission(
+        session.id,
+        pendingPermission.request_id,
+        allowed,
+      )
+      setStatus(updated.status)
+      // Re-arm the SSE stream (the run continues with the decision); the
       // effect also refetches the history, which now resolves the request.
       setRunId((r) => r + 1)
       onStatusChange()
@@ -422,6 +481,17 @@ export default function SessionView({ session, onStatusChange }: Props) {
           busy={sending}
           onApprove={() => void approveRequest()}
           onReject={() => void rejectRequest()}
+        />
+      ) : pendingPermission && !running ? (
+        // A file-access request from the agent is awaiting the user's
+        // decision: freeze the input box and show Allow / Deny instead.
+        <PermissionCard
+          tool={pendingPermission.tool}
+          operation={pendingPermission.operation}
+          path={pendingPermission.path}
+          busy={sending}
+          onAllow={() => void submitPermission(true)}
+          onDeny={() => void submitPermission(false)}
         />
       ) : (
         <Composer

@@ -5,6 +5,7 @@ pub mod ask_user;
 pub mod bash;
 pub mod bash_in_background;
 pub mod fs;
+pub mod permission;
 pub mod request_mode_change;
 pub mod skill;
 pub mod subagent;
@@ -70,7 +71,7 @@ pub fn tool_definitions(enabled: &[String]) -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": TOOL_READ_FILE,
-                "description": "Read a UTF-8 text file inside the working directory or inside a global skill folder (the load_skill tool returns skill folder paths). Output is capped at ~1 MB.",
+                "description": "Read a UTF-8 text file inside the working directory, the session scratch dir, or a global skill folder (the load_skill tool returns skill folder paths). Output is capped at ~1 MB. Paths outside those roots require the user's approval: a permission request is shown in the UI, and the user's answer arrives as a user message — retry the call only if they allowed it.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -85,7 +86,7 @@ pub fn tool_definitions(enabled: &[String]) -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": TOOL_EDIT_FILE,
-                "description": "Replace old_string with new_string in a file. The match must be unique unless replace_all is true. Returns the full new file content.",
+                "description": "Replace old_string with new_string in a file. The match must be unique unless replace_all is true. Returns the full new file content. Paths outside the working directory require the user's approval: a permission request is shown in the UI (in plan/explore mode, create/edit/remove are only allowed in the session scratch dir and are otherwise denied without asking).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -103,7 +104,7 @@ pub fn tool_definitions(enabled: &[String]) -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": TOOL_CREATE_FILE,
-                "description": "Create a new file with the given content inside the working directory. The parent directory must already exist and the file must not exist (use edit_file to modify existing files). Returns the content written.",
+                "description": "Create a new file with the given content inside the working directory. The parent directory must already exist and the file must not exist (use edit_file to modify existing files). Returns the content written. Paths outside the working directory require the user's approval: a permission request is shown in the UI (in plan/explore mode, create/edit/remove are only allowed in the session scratch dir and are otherwise denied without asking).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -119,7 +120,7 @@ pub fn tool_definitions(enabled: &[String]) -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": TOOL_REMOVE_FILE,
-                "description": "Remove a regular file inside the working directory. Directories and symlinks are refused. Returns a confirmation.",
+                "description": "Remove a regular file inside the working directory. Directories and symlinks are refused. Returns a confirmation. Paths outside the working directory require the user's approval: a permission request is shown in the UI (in plan/explore mode, create/edit/remove are only allowed in the session scratch dir and are otherwise denied without asking).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -299,24 +300,6 @@ struct LoadSkillArgs {
     name: String,
 }
 
-/// The root a file-mutation tool may write under: the workdir in Build
-/// mode, the session scratch dir otherwise. In non-Build modes a path that
-/// resolves inside the codebase is denied up front with a mode-aware
-/// message (scratch writes use absolute paths under the scratch dir).
-fn write_root_for(ctx: &ToolContext, raw: &str) -> Result<PathBuf, String> {
-    if ctx.session.mode == Mode::Build {
-        return Ok(ctx.workdir.clone());
-    }
-    if fs::resolve_path(&ctx.workdir, raw).is_ok() {
-        return Err(format!(
-            "{} mode: the codebase is read-only; create/edit/remove is only allowed under {} (use an absolute path)",
-            ctx.session.mode.as_str(),
-            ctx.scratch.display()
-        ));
-    }
-    Ok(ctx.scratch.clone())
-}
-
 /// Execute one tool call. Returns the tool output (Ok) or a tool error
 /// (Err) — both are surfaced to the model; only a failed dispatch returns
 /// Err and both are journaled as ToolResult events.
@@ -349,38 +332,75 @@ pub async fn execute_tool(
         TOOL_READ_FILE => {
             let args: ReadFileArgs = serde_json::from_str(arguments)
                 .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
-            // `read_file` may also read global skill folders (and the
-            // scratch dir), so pass those roots as extra allowed roots.
+            // `read_file` may also read global skill folders and the
+            // session scratch dir, so pass those roots as extra allowed
+            // roots (both for the permission policy and the fs call).
             let mut roots: Vec<PathBuf> = crate::skills::discover_skills(&ctx.agents_dir)
                 .into_iter()
                 .map(|s| s.path)
                 .collect();
             roots.push(ctx.scratch.clone());
-            fs::read_file(&ctx.workdir, &args.path, &roots)
+            match permission::read_policy(ctx, &args.path, &roots)? {
+                permission::PathPolicy::Run(resolved) => {
+                    // The path resolved inside an allowed root (or the user
+                    // approved it earlier); run with it in the approved
+                    // list so the containment check passes for that one
+                    // path only.
+                    fs::read_file(&ctx.workdir, &args.path, &roots, &[resolved])
+                }
+                permission::PathPolicy::Ask { operation } => {
+                    permission::ask_permission(ctx, TOOL_READ_FILE, operation, &args.path, on_event)
+                }
+            }
         }
         TOOL_EDIT_FILE => {
             let args: EditFileArgs = serde_json::from_str(arguments)
                 .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
-            let root = write_root_for(ctx, &args.path)?;
-            fs::edit_file(
-                &root,
-                &args.path,
-                &args.old_string,
-                &args.new_string,
-                args.replace_all,
-            )
+            match permission::write_policy(ctx, TOOL_EDIT_FILE, &args.path)? {
+                permission::PathPolicy::Run(resolved) => fs::edit_file(
+                    &ctx.workdir,
+                    &args.path,
+                    &args.old_string,
+                    &args.new_string,
+                    args.replace_all,
+                    &[resolved],
+                ),
+                permission::PathPolicy::Ask { operation } => {
+                    permission::ask_permission(ctx, TOOL_EDIT_FILE, operation, &args.path, on_event)
+                }
+            }
         }
         TOOL_CREATE_FILE => {
             let args: CreateFileArgs = serde_json::from_str(arguments)
                 .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
-            let root = write_root_for(ctx, &args.path)?;
-            fs::create_file(&root, &args.path, &args.content)
+            match permission::write_policy(ctx, TOOL_CREATE_FILE, &args.path)? {
+                permission::PathPolicy::Run(resolved) => {
+                    fs::create_file(&ctx.workdir, &args.path, &args.content, &[resolved])
+                }
+                permission::PathPolicy::Ask { operation } => permission::ask_permission(
+                    ctx,
+                    TOOL_CREATE_FILE,
+                    operation,
+                    &args.path,
+                    on_event,
+                ),
+            }
         }
         TOOL_REMOVE_FILE => {
             let args: RemoveFileArgs = serde_json::from_str(arguments)
                 .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
-            let root = write_root_for(ctx, &args.path)?;
-            fs::remove_file(&root, &args.path)
+            match permission::write_policy(ctx, TOOL_REMOVE_FILE, &args.path)? {
+                permission::PathPolicy::Run(resolved) => {
+                    fs::remove_file(&ctx.workdir, &args.path, &[resolved])
+                }
+                permission::PathPolicy::Ask { operation } => permission::ask_permission(
+                    ctx,
+                    TOOL_REMOVE_FILE,
+                    operation,
+                    &args.path,
+                    on_event,
+                ),
+            }
         }
         TOOL_BASH => {
             let args: BashArgs = serde_json::from_str(arguments)

@@ -770,6 +770,179 @@ async fn answer_ask_user_rejects_bad_answers() {
     );
 }
 
+fn permission_request() -> JournalEventKind {
+    JournalEventKind::PermissionRequest {
+        request_id: "p1".to_string(),
+        tool: "read_file".to_string(),
+        operation: "read".to_string(),
+        path: "/etc/hostname".to_string(),
+    }
+}
+
+/// POST the user's decision on a pending `permission_request` with a JSON
+/// body.
+async fn post_permission_answer(
+    app: &Arc<AppState>,
+    id: &str,
+    request_id: &str,
+    allowed: bool,
+) -> (StatusCode, serde_json::Value) {
+    let router = create_router(app.clone());
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/sessions/{id}/permission/answer"))
+        .header("content-type", "application/json")
+        .body(Body::from(format!(
+            r#"{{"request_id":"{request_id}","allowed":{allowed}}}"#
+        )))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
+/// The journal of a terminal session where a file tool requested access to
+/// a path outside the allowed roots and the user has not decided yet.
+fn pending_permission_journal(session: &Session) {
+    append_kinds(
+        &session.journal_path,
+        &[
+            user_msg("read the file"),
+            system_prompt(Mode::Build),
+            assistant_msg("let me read it"),
+            permission_request(),
+        ],
+    );
+}
+
+/// Answering a pending permission request (Allow or Deny) journals a
+/// `PermissionAnswered` event carrying the decision plus the request's
+/// tool/operation/path, and respawns the worker (session back to pending).
+#[tokio::test]
+async fn answer_permission_journals_decision_and_respawns() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    pending_permission_journal(&session);
+
+    // Allow.
+    let (status, body) = post_permission_answer(&app.state, "s1", "p1", true).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["status"], "pending", "body: {body}");
+    assert!(
+        body["pid"].is_number(),
+        "worker should be respawned: {body}"
+    );
+
+    let kinds = read_kinds(&app, "s1");
+    assert_eq!(kinds.len(), 5, "kinds: {kinds:#?}");
+    match &kinds[4] {
+        JournalEventKind::PermissionAnswered {
+            request_id,
+            tool,
+            operation,
+            path,
+            allowed,
+        } => {
+            assert_eq!(request_id, "p1");
+            assert_eq!(tool, "read_file");
+            assert_eq!(operation, "read");
+            assert_eq!(path, "/etc/hostname");
+            assert!(*allowed);
+        }
+        other => panic!("expected permission_answered at seq 4, got: {other:?}"),
+    }
+
+    // A second answer (the request is resolved) is a conflict.
+    let (status, _) = post_permission_answer(&app.state, "s1", "p1", false).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+/// Deny journals the same event with `allowed: false`.
+#[tokio::test]
+async fn answer_permission_denies() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    pending_permission_journal(&session);
+
+    let (status, _) = post_permission_answer(&app.state, "s1", "p1", false).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let kinds = read_kinds(&app, "s1");
+    match &kinds[4] {
+        JournalEventKind::PermissionAnswered { allowed, .. } => {
+            assert!(!allowed);
+        }
+        other => panic!("expected permission_answered, got: {other:?}"),
+    }
+}
+
+/// Answering with no pending request (or an already-resolved one) is a
+/// conflict; a mismatched request id is a bad request.
+#[tokio::test]
+async fn answer_permission_validates_state_and_request_id() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+
+    // No request ever made -> conflict.
+    append_kinds(&session.journal_path, &[user_msg("hi")]);
+    let (status, _) = post_permission_answer(&app.state, "s1", "p1", true).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // A request that was already answered is not pending -> conflict.
+    append_kinds(
+        &session.journal_path,
+        &[
+            permission_request(),
+            JournalEventKind::PermissionAnswered {
+                request_id: "p1".to_string(),
+                tool: "read_file".to_string(),
+                operation: "read".to_string(),
+                path: "/etc/hostname".to_string(),
+                allowed: true,
+            },
+        ],
+    );
+    let (status, _) = post_permission_answer(&app.state, "s1", "p1", true).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // A pending request with a mismatched id is a bad request.
+    append_kinds(&session.journal_path, &[permission_request()]);
+    let (status, body) = post_permission_answer(&app.state, "s1", "p9", true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body.to_string().contains("unknown request id"),
+        "body: {body}"
+    );
+    // Nothing new was journaled (the pending request is still the last
+    // event — no answer was appended).
+    let kinds = read_kinds(&app, "s1");
+    assert_eq!(kinds.len(), 4, "kinds: {kinds:#?}");
+    assert!(
+        matches!(
+            kinds.last(),
+            Some(JournalEventKind::PermissionRequest { .. })
+        ),
+        "no answer may be journaled: {kinds:#?}"
+    );
+}
+
+/// Answering while the session is running is refused.
+#[tokio::test]
+async fn answer_permission_while_running_conflicts() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    pending_permission_journal(&session);
+    {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::update_status(&conn, "s1", SessionStatus::Running, None).unwrap();
+    }
+    let (status, _) = post_permission_answer(&app.state, "s1", "p1", true).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
 async fn post_model_switch(
     app: &Arc<AppState>,
     id: &str,
