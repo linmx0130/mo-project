@@ -89,6 +89,27 @@ export interface AskUserOption {
   option_text: string
 }
 
+/** One item of a batched file-access permission request: a file tool call
+ *  whose path is outside the auto-allowed roots, held until the user
+ *  decides. `call_id` links the item to the tool call in the timeline;
+ *  `tool` / `operation` / `path` drive the permission card. */
+export interface PermissionRequestItem {
+  call_id: string
+  tool: string
+  operation: string
+  path: string
+}
+
+/** One decision of a batched permission answer: whether the user allowed or
+ *  denied the `PermissionRequestItem` with the same `call_id`. */
+export interface PermissionDecision {
+  call_id: string
+  tool: string
+  operation: string
+  path: string
+  allowed: boolean
+}
+
 /** One clarification question (the `ask_user` tool). Stage 1 supports one
  *  question per call; `question_id` is assigned by the worker (`q1`) and
  *  keys the answer in the `ask_user_answered` answers object. */
@@ -159,6 +180,39 @@ export type JournalEventKind =
    *  request; the worker respawns and the model receives the answers as a
    *  user message. Rendered as a passive notice row. */
   | { kind: 'ask_user_answered'; answers: Record<string, string> }
+  /** The agent requested user permission to access file paths outside the
+   *  auto-allowed roots (the working directory, the session scratch dir,
+   *  and — for reads — global skill folders). One message's file-tool calls
+   *  that need approval are combined into a single request: `items` lists
+   *  every held call (tool, operation, path). While the latest such request
+   *  is pending (no `permission_answered` after it), the frontend freezes
+   *  the composer and shows an Allow / Deny card listing every path. The
+   *  legacy single-item shape (`tool` / `operation` / `path`, pre-batch
+   *  journals) is also parsed. */
+  | {
+      kind: 'permission_request'
+      request_id: string
+      tool?: string
+      operation?: string
+      path?: string
+      items?: PermissionRequestItem[]
+    }
+  /** The user decided a pending `permission_request` (POST
+   *  /:id/permission/answer): `decisions` carries one Allow/Deny per held
+   *  call, each with the item's tool/operation/path (self-contained). It
+   *  resolves the request; the worker respawns and the held calls re-run —
+   *  allowed calls return their real result, denied calls a denial error.
+   *  Rendered as a passive notice row. The legacy single-item shape
+   *  (`tool` / `operation` / `path` / `allowed`) is also parsed. */
+  | {
+      kind: 'permission_answered'
+      request_id: string
+      tool?: string
+      operation?: string
+      path?: string
+      allowed?: boolean
+      decisions?: PermissionDecision[]
+    }
   /** Streamed assistant text/reasoning chunk; the following `message` event
    *  carries the assembled content and replaces the delta-built preview. */
   | { kind: 'message_delta'; content: string; reasoning_content?: string | null }
@@ -309,6 +363,25 @@ export function answerAskUser(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ answers }),
+  })
+}
+
+/** Decide a pending `permission_request` (file tools asked to access paths
+ *  outside the auto-allowed roots): `requestId` is the request's id (`p1`)
+ *  and `decisions` maps each held call's id to Allow (true) / Deny (false)
+ *  — every item of the batched request must be decided. The backend journals
+ *  the decisions and resumes the run; the held calls then complete (allowed
+ *  → real result, denied → denial error). Legacy single-item requests are
+ *  answered with `allowed` instead. */
+export function answerPermission(
+  id: string,
+  requestId: string,
+  body: { decisions?: Record<string, boolean>; allowed?: boolean },
+): Promise<Session> {
+  return http(`/api/sessions/${id}/permission/answer`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ request_id: requestId, ...body }),
   })
 }
 

@@ -466,6 +466,84 @@ p {
   color: var(--text-h);
 }
 
+/* The requested file path inside the permission-request banner. */
+.permission-path {
+  display: inline-block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
+}
+
+/* The per-path rows of a batched permission request (one row per held
+   file-tool call, each with its own Allow / Deny buttons). */
+.permission-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.permission-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--bg);
+}
+
+.permission-row-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.permission-row-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.permission-row-actions .send,
+.permission-row-actions .stop {
+  border-radius: 6px;
+  padding: 3px 12px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.permission-row-actions .send {
+  background: var(--accent-bg);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+}
+
+.permission-row-actions .stop {
+  background: transparent;
+  border: 1px solid var(--status-failed);
+  color: var(--status-failed);
+}
+
+.permission-row-actions .send:disabled,
+.permission-row-actions .stop:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.permission-hint {
+  align-self: flex-end;
+  font-size: 0.85em;
+}
+
 .mode-request-actions {
   display: flex;
   justify-content: flex-end;

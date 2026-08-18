@@ -682,3 +682,262 @@ async fn execute_tool_refuses_disabled_tools() {
     .await;
     assert!(out.is_ok(), "legacy sessions keep every tool: {out:?}");
 }
+
+/// A `read_file` call targeting an existing file outside the workdir (and
+/// outside the scratch dir) journals a `PermissionRequest` through the
+/// event sink and returns stop-and-wait guidance — in any mode.
+#[tokio::test]
+async fn read_outside_journals_permission_request_and_returns_guidance() {
+    for mode in [Mode::Build, Mode::Plan] {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = request_ctx(&dir, mode, None);
+        std::fs::write(dir.path().join("secret.txt"), "secret\n").unwrap();
+        let outside = dir.path().join("secret.txt").display().to_string();
+        let args = format!(r#"{{"path":"{outside}"}}"#);
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<JournalEventKind>::new()));
+        let on_event = {
+            let events = std::sync::Arc::clone(&events);
+            move |kind: JournalEventKind| {
+                events.lock().unwrap_or_else(|e| e.into_inner()).push(kind);
+            }
+        };
+        let out = execute_tool(&ctx, TOOL_READ_FILE, &args, "c1", &on_event)
+            .await
+            .unwrap();
+        assert!(out.contains("permission request was sent"), "got: {out}");
+        assert!(out.contains("Stop working now"), "got: {out}");
+        let events = events.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(events.len(), 1, "events: {events:#?}");
+        match &events[0] {
+            JournalEventKind::PermissionRequest {
+                request_id,
+                tool: Some(tool),
+                operation: Some(operation),
+                path: Some(path),
+                items,
+            } => {
+                assert_eq!(request_id, "p1");
+                assert_eq!(tool, TOOL_READ_FILE);
+                assert_eq!(operation, "read");
+                assert_eq!(path, &outside);
+                // The fallback journals the legacy single-item shape: no
+                // batched items (the batched flow holds calls before
+                // execution instead of reaching this per-call path).
+                assert!(items.is_empty(), "items: {items:#?}");
+            }
+            other => panic!("expected permission_request, got: {other:?}"),
+        }
+    }
+}
+
+/// A build-mode write outside the workdir and scratch dir asks the user;
+/// a plan-mode write to the same path is denied outright — never asked.
+#[tokio::test]
+async fn write_outside_asks_in_build_but_is_denied_in_plan() {
+    // Build: the write asks the user.
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = request_ctx(&dir, Mode::Build, None);
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<JournalEventKind>::new()));
+    let on_event = {
+        let events = std::sync::Arc::clone(&events);
+        move |kind: JournalEventKind| {
+            events.lock().unwrap_or_else(|e| e.into_inner()).push(kind);
+        }
+    };
+    let out = execute_tool(
+        &ctx,
+        TOOL_CREATE_FILE,
+        r#"{"path":"/tmp/outside.txt","content":"x"}"#,
+        "c1",
+        &on_event,
+    )
+    .await
+    .unwrap();
+    assert!(out.contains("permission request was sent"), "got: {out}");
+    {
+        let events = events.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(events.len(), 1, "events: {events:#?}");
+        assert!(matches!(
+            &events[0],
+            JournalEventKind::PermissionRequest { operation: Some(op), .. } if op == "write"
+        ));
+    }
+    // The guard is dropped: the Plan branch below awaits execute_tool again.
+
+    // Plan: the same write is denied without any request.
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = request_ctx(&dir, Mode::Plan, None);
+    let no_event = |_: JournalEventKind| {};
+    let err = execute_tool(
+        &ctx,
+        TOOL_CREATE_FILE,
+        r#"{"path":"/tmp/outside.txt","content":"x"}"#,
+        "c2",
+        &no_event,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("denied"), "got: {err}");
+    assert!(
+        err.contains(&ctx.scratch.display().to_string()),
+        "got: {err}"
+    );
+    assert!(
+        mo_core::read_events(std::path::Path::new(&ctx.session.journal_path))
+            .unwrap()
+            .is_empty(),
+        "plan-mode outside write must not journal anything"
+    );
+}
+
+/// A subagent cannot ask the user for permission: the request is shown in
+/// the UI, which only root sessions have.
+#[tokio::test]
+async fn subagent_read_outside_is_rejected_not_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = request_ctx(&dir, Mode::Build, Some("parent-1".to_string()));
+    std::fs::write(dir.path().join("secret.txt"), "x\n").unwrap();
+    let outside = dir.path().join("secret.txt").display().to_string();
+    let args = format!(r#"{{"path":"{outside}"}}"#);
+    let no_event = |_: JournalEventKind| {};
+    let err = execute_tool(&ctx, TOOL_READ_FILE, &args, "c1", &no_event)
+        .await
+        .unwrap_err();
+    assert!(err.contains("subagents cannot ask the user"), "got: {err}");
+}
+
+/// After the user allowed a request, a retry of the same `(tool, path)`
+/// runs without prompting again — the decision is remembered.
+#[tokio::test]
+async fn allowed_retry_reads_file_without_asking_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = request_ctx(&dir, Mode::Build, None);
+    std::fs::write(dir.path().join("secret.txt"), "secret content\n").unwrap();
+    let outside = dir.path().join("secret.txt").display().to_string();
+    let mut journal =
+        mo_core::JournalWriter::open(std::path::Path::new(&ctx.session.journal_path)).unwrap();
+    journal
+        .append(JournalEventKind::PermissionAnswered {
+            request_id: "p1".into(),
+            tool: Some(TOOL_READ_FILE.into()),
+            operation: Some("read".into()),
+            path: Some(outside.clone()),
+            allowed: Some(true),
+            decisions: Vec::new(),
+        })
+        .unwrap();
+    drop(journal);
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<JournalEventKind>::new()));
+    let on_event = {
+        let events = std::sync::Arc::clone(&events);
+        move |kind: JournalEventKind| {
+            events.lock().unwrap_or_else(|e| e.into_inner()).push(kind);
+        }
+    };
+    let args = format!(r#"{{"path":"{outside}"}}"#);
+    let out = execute_tool(&ctx, TOOL_READ_FILE, &args, "c1", &on_event)
+        .await
+        .unwrap();
+    assert!(out.contains("secret content"), "got: {out}");
+    assert!(
+        events.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        "an allowed retry must not journal a new permission request"
+    );
+}
+
+/// After the user denied a request, a retry of the same `(tool, path)` is
+/// refused outright — no second prompt.
+#[tokio::test]
+async fn denied_retry_is_refused_without_asking_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = request_ctx(&dir, Mode::Build, None);
+    std::fs::write(dir.path().join("secret.txt"), "x\n").unwrap();
+    let outside = dir.path().join("secret.txt").display().to_string();
+    let mut journal =
+        mo_core::JournalWriter::open(std::path::Path::new(&ctx.session.journal_path)).unwrap();
+    journal
+        .append(JournalEventKind::PermissionAnswered {
+            request_id: "p1".into(),
+            tool: Some(TOOL_READ_FILE.into()),
+            operation: Some("read".into()),
+            path: Some(outside.clone()),
+            allowed: Some(false),
+            decisions: Vec::new(),
+        })
+        .unwrap();
+    drop(journal);
+
+    let no_event = |_: JournalEventKind| {};
+    let args = format!(r#"{{"path":"{outside}"}}"#);
+    let err = execute_tool(&ctx, TOOL_READ_FILE, &args, "c1", &no_event)
+        .await
+        .unwrap_err();
+    assert!(err.contains("denied permission"), "got: {err}");
+}
+
+/// One pending user-facing request at a time: a pending clarification
+/// question blocks a permission request, and a pending permission request
+/// blocks another one.
+#[tokio::test]
+async fn pending_requests_block_new_permission_requests() {
+    // A pending ask_user question blocks the permission request.
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = request_ctx(&dir, Mode::Build, None);
+    std::fs::write(dir.path().join("secret.txt"), "x\n").unwrap();
+    let outside = dir.path().join("secret.txt").display().to_string();
+    let args = format!(r#"{{"path":"{outside}"}}"#);
+    let mut journal =
+        mo_core::JournalWriter::open(std::path::Path::new(&ctx.session.journal_path)).unwrap();
+    journal
+        .append(JournalEventKind::AskUserRequest {
+            question: mo_core::AskUserQuestion {
+                question_id: "q1".into(),
+                question_title: "t".into(),
+                question_text: "q".into(),
+                options: vec![],
+            },
+        })
+        .unwrap();
+    drop(journal);
+    let no_event = |_: JournalEventKind| {};
+    let err = execute_tool(&ctx, TOOL_READ_FILE, &args, "c1", &no_event)
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("clarification question is already pending"),
+        "got: {err}"
+    );
+
+    // A pending permission request blocks another one.
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = request_ctx(&dir, Mode::Build, None);
+    std::fs::write(dir.path().join("other.txt"), "x\n").unwrap();
+    let other = dir.path().join("other.txt").display().to_string();
+    let mut journal =
+        mo_core::JournalWriter::open(std::path::Path::new(&ctx.session.journal_path)).unwrap();
+    journal
+        .append(JournalEventKind::PermissionRequest {
+            request_id: "p1".into(),
+            tool: None,
+            operation: None,
+            path: None,
+            items: vec![mo_core::PermissionRequestItem {
+                call_id: "call_0".into(),
+                tool: TOOL_READ_FILE.into(),
+                operation: "read".into(),
+                path: "/etc/a".into(),
+                arguments: r#"{"path":"/etc/a"}"#.into(),
+            }],
+        })
+        .unwrap();
+    drop(journal);
+    let args = format!(r#"{{"path":"{other}"}}"#);
+    let err = execute_tool(&ctx, TOOL_READ_FILE, &args, "c1", &no_event)
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("file-access permission request is already pending"),
+        "got: {err}"
+    );
+}

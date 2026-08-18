@@ -131,6 +131,252 @@ fn last_ask_user_marker_scans_from_end() {
     );
 }
 
+/// Both permission events survive a serde round-trip with the expected JSON
+/// shape (snake_case kind tags, `allowed` as a boolean).
+#[test]
+fn permission_events_round_trip() {
+    let request = event(JournalEventKind::PermissionRequest {
+        request_id: "p1".to_string(),
+        tool: Some("read_file".to_string()),
+        operation: Some("read".to_string()),
+        path: Some("/etc/hostname".to_string()),
+        items: Vec::new(),
+    });
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["kind"]["kind"], "permission_request");
+    assert_eq!(json["kind"]["request_id"], "p1");
+    assert_eq!(json["kind"]["tool"], "read_file");
+    assert_eq!(json["kind"]["operation"], "read");
+    assert_eq!(json["kind"]["path"], "/etc/hostname");
+    let back: JournalEvent = serde_json::from_value(json).unwrap();
+    assert_eq!(back, request);
+
+    let answered = event(JournalEventKind::PermissionAnswered {
+        request_id: "p1".to_string(),
+        tool: Some("read_file".to_string()),
+        operation: Some("read".to_string()),
+        path: Some("/etc/hostname".to_string()),
+        allowed: Some(true),
+        decisions: Vec::new(),
+    });
+    let json = serde_json::to_value(&answered).unwrap();
+    assert_eq!(json["kind"]["kind"], "permission_answered");
+    assert_eq!(json["kind"]["allowed"], true);
+    let back: JournalEvent = serde_json::from_value(json).unwrap();
+    assert_eq!(back, answered);
+}
+
+/// A batched permission request/answer round-trips with the expected JSON
+/// shape: `items` (one entry per held call) and `decisions` (one per item).
+#[test]
+fn batched_permission_events_round_trip() {
+    let request = event(JournalEventKind::PermissionRequest {
+        request_id: "p1".to_string(),
+        tool: None,
+        operation: None,
+        path: None,
+        items: vec![
+            PermissionRequestItem {
+                call_id: "call_1".into(),
+                tool: "read_file".into(),
+                operation: "read".into(),
+                path: "/etc/a".into(),
+                arguments: r#"{"path":"/etc/a"}"#.into(),
+            },
+            PermissionRequestItem {
+                call_id: "call_2".into(),
+                tool: "create_file".into(),
+                operation: "write".into(),
+                path: "/tmp/b".into(),
+                arguments: r#"{"path":"/tmp/b","content":"x"}"#.into(),
+            },
+        ],
+    });
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["kind"]["kind"], "permission_request");
+    assert_eq!(json["kind"]["request_id"], "p1");
+    assert_eq!(json["kind"]["items"].as_array().unwrap().len(), 2);
+    assert_eq!(json["kind"]["items"][0]["call_id"], "call_1");
+    assert_eq!(json["kind"]["items"][0]["tool"], "read_file");
+    assert_eq!(json["kind"]["items"][1]["path"], "/tmp/b");
+    // The legacy single-item fields are absent on batched events.
+    assert!(json["kind"].get("tool").is_none());
+    let back: JournalEvent = serde_json::from_value(json).unwrap();
+    assert_eq!(back, request);
+
+    let answered = event(JournalEventKind::PermissionAnswered {
+        request_id: "p1".to_string(),
+        tool: None,
+        operation: None,
+        path: None,
+        allowed: None,
+        decisions: vec![
+            PermissionDecision {
+                call_id: "call_1".into(),
+                tool: "read_file".into(),
+                operation: "read".into(),
+                path: "/etc/a".into(),
+                allowed: true,
+            },
+            PermissionDecision {
+                call_id: "call_2".into(),
+                tool: "create_file".into(),
+                operation: "write".into(),
+                path: "/tmp/b".into(),
+                allowed: false,
+            },
+        ],
+    });
+    let json = serde_json::to_value(&answered).unwrap();
+    assert_eq!(json["kind"]["kind"], "permission_answered");
+    assert_eq!(json["kind"]["decisions"].as_array().unwrap().len(), 2);
+    assert_eq!(json["kind"]["decisions"][0]["allowed"], true);
+    assert_eq!(json["kind"]["decisions"][1]["allowed"], false);
+    assert!(json["kind"].get("allowed").is_none());
+    let back: JournalEvent = serde_json::from_value(json).unwrap();
+    assert_eq!(back, answered);
+}
+
+/// Journals written before permission batching (single-item requests and
+/// answers, no `items` / `decisions` fields) must still deserialize: the
+/// legacy fields are kept and the new collections default to empty.
+#[test]
+fn legacy_permission_events_parse() {
+    let request: JournalEvent = serde_json::from_str(
+        r#"{"seq":0,"ts":"2026-01-01T00:00:00Z","kind":{"kind":"permission_request","request_id":"p1","tool":"read_file","operation":"read","path":"/etc/hostname"}}"#,
+    )
+    .unwrap();
+    match request.kind {
+        JournalEventKind::PermissionRequest {
+            request_id,
+            tool,
+            operation,
+            path,
+            items,
+        } => {
+            assert_eq!(request_id, "p1");
+            assert_eq!(tool.as_deref(), Some("read_file"));
+            assert_eq!(operation.as_deref(), Some("read"));
+            assert_eq!(path.as_deref(), Some("/etc/hostname"));
+            assert!(items.is_empty());
+        }
+        other => panic!("expected permission_request, got: {other:?}"),
+    }
+
+    let answered: JournalEvent = serde_json::from_str(
+        r#"{"seq":0,"ts":"2026-01-01T00:00:00Z","kind":{"kind":"permission_answered","request_id":"p1","tool":"read_file","operation":"read","path":"/etc/hostname","allowed":true}}"#,
+    )
+    .unwrap();
+    match answered.kind {
+        JournalEventKind::PermissionAnswered {
+            tool,
+            path,
+            allowed,
+            decisions,
+            ..
+        } => {
+            assert_eq!(tool.as_deref(), Some("read_file"));
+            assert_eq!(path.as_deref(), Some("/etc/hostname"));
+            assert_eq!(allowed, Some(true));
+            assert!(decisions.is_empty());
+        }
+        other => panic!("expected permission_answered, got: {other:?}"),
+    }
+}
+
+/// `last_permission_marker` scans from the end: a request with no answer
+/// after it is pending; an answered event resolves it; unrelated events
+/// (ask-user markers, messages) are skipped and do not interfere.
+#[test]
+fn last_permission_marker_scans_from_end() {
+    // No marker at all.
+    let events = vec![event(JournalEventKind::Message(JournalMessage {
+        role: "user".into(),
+        content: "hi".into(),
+        reasoning_content: None,
+        tool_call_id: None,
+        tool_calls: None,
+    }))];
+    assert_eq!(last_permission_marker(&events), None);
+
+    // A request with nothing after it is pending — even with an ask-user
+    // marker in between (the two markers are independent).
+    let events = vec![
+        event(JournalEventKind::PermissionRequest {
+            request_id: "p1".into(),
+            tool: Some("read_file".into()),
+            operation: Some("read".into()),
+            path: Some("/etc/passwd".into()),
+            items: Vec::new(),
+        }),
+        event(JournalEventKind::AskUserRequest {
+            question: question(),
+        }),
+    ];
+    assert_eq!(
+        last_permission_marker(&events),
+        Some(PermissionMarker::RequestPending)
+    );
+
+    // An answer after the request resolves it — batched shape included.
+    let events = vec![
+        event(JournalEventKind::PermissionRequest {
+            request_id: "p1".into(),
+            tool: None,
+            operation: None,
+            path: None,
+            items: vec![PermissionRequestItem {
+                call_id: "call_1".into(),
+                tool: "read_file".into(),
+                operation: "read".into(),
+                path: "/etc/passwd".into(),
+                arguments: r#"{"path":"/etc/passwd"}"#.into(),
+            }],
+        }),
+        event(JournalEventKind::PermissionAnswered {
+            request_id: "p1".into(),
+            tool: None,
+            operation: None,
+            path: None,
+            allowed: None,
+            decisions: vec![PermissionDecision {
+                call_id: "call_1".into(),
+                tool: "read_file".into(),
+                operation: "read".into(),
+                path: "/etc/passwd".into(),
+                allowed: true,
+            }],
+        }),
+    ];
+    assert_eq!(
+        last_permission_marker(&events),
+        Some(PermissionMarker::Answered)
+    );
+
+    // A request after a resolved one is pending again.
+    let events = vec![
+        event(JournalEventKind::PermissionAnswered {
+            request_id: "p1".into(),
+            tool: Some("read_file".into()),
+            operation: Some("read".into()),
+            path: Some("/etc/passwd".into()),
+            allowed: Some(false),
+            decisions: Vec::new(),
+        }),
+        event(JournalEventKind::PermissionRequest {
+            request_id: "p1".into(),
+            tool: Some("write".into()),
+            operation: Some("write".into()),
+            path: Some("/tmp/x".into()),
+            items: Vec::new(),
+        }),
+    ];
+    assert_eq!(
+        last_permission_marker(&events),
+        Some(PermissionMarker::RequestPending)
+    );
+}
+
 /// The `ModelChange` event survives a serde round-trip with the expected
 /// JSON shape (`model_change`, `from` and `to` model names).
 #[test]

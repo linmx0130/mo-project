@@ -7,6 +7,7 @@ use std::sync::Mutex;
 
 use axum::body::Body;
 use axum::http::Request;
+use mo_core::PermissionRequestItem;
 use tower::ServiceExt;
 
 /// A gateway under test: real AppState + DB in a tempdir, with a
@@ -768,6 +769,332 @@ async fn answer_ask_user_rejects_bad_answers() {
             .any(|k| matches!(k, JournalEventKind::AskUserAnswered { .. })),
         "no answer may be journaled: {kinds:#?}"
     );
+}
+
+fn permission_request() -> JournalEventKind {
+    JournalEventKind::PermissionRequest {
+        request_id: "p1".to_string(),
+        tool: None,
+        operation: None,
+        path: None,
+        items: vec![PermissionRequestItem {
+            call_id: "call_1".to_string(),
+            tool: "read_file".to_string(),
+            operation: "read".to_string(),
+            path: "/etc/hostname".to_string(),
+            arguments: r#"{"path":"/etc/hostname"}"#.to_string(),
+        }],
+    }
+}
+
+/// A pre-batch single-item request (no `items` field): journals written
+/// before permission batching.
+fn legacy_permission_request() -> JournalEventKind {
+    JournalEventKind::PermissionRequest {
+        request_id: "p1".to_string(),
+        tool: Some("read_file".to_string()),
+        operation: Some("read".to_string()),
+        path: Some("/etc/hostname".to_string()),
+        items: Vec::new(),
+    }
+}
+
+fn permission_answered(allowed: bool) -> JournalEventKind {
+    JournalEventKind::PermissionAnswered {
+        request_id: "p1".to_string(),
+        tool: None,
+        operation: None,
+        path: None,
+        allowed: None,
+        decisions: vec![PermissionDecision {
+            call_id: "call_1".to_string(),
+            tool: "read_file".to_string(),
+            operation: "read".to_string(),
+            path: "/etc/hostname".to_string(),
+            allowed,
+        }],
+    }
+}
+
+/// POST the user's decisions on a pending `permission_request` with a JSON
+/// body. `decisions` maps each held call's id to Allow/Deny (the batched
+/// contract); pass `allowed` instead for the legacy single-item contract.
+async fn post_permission_answer(
+    app: &Arc<AppState>,
+    id: &str,
+    request_id: &str,
+    decisions: Option<&BTreeMap<String, bool>>,
+    allowed: Option<bool>,
+) -> (StatusCode, serde_json::Value) {
+    let router = create_router(app.clone());
+    let mut body = serde_json::json!({ "request_id": request_id });
+    if let Some(decisions) = decisions {
+        body["decisions"] = serde_json::to_value(decisions).unwrap();
+    }
+    if let Some(allowed) = allowed {
+        body["allowed"] = serde_json::json!(allowed);
+    }
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/sessions/{id}/permission/answer"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
+/// The journal of a terminal session where file tools requested access to
+/// paths outside the allowed roots (one batched request with two items)
+/// and the user has not decided yet.
+fn pending_permission_journal(session: &Session) {
+    append_kinds(
+        &session.journal_path,
+        &[
+            user_msg("read the file"),
+            system_prompt(Mode::Build),
+            assistant_msg("let me read it"),
+            JournalEventKind::PermissionRequest {
+                request_id: "p1".to_string(),
+                tool: None,
+                operation: None,
+                path: None,
+                items: vec![
+                    PermissionRequestItem {
+                        call_id: "call_1".to_string(),
+                        tool: "read_file".to_string(),
+                        operation: "read".to_string(),
+                        path: "/etc/hostname".to_string(),
+                        arguments: r#"{"path":"/etc/hostname"}"#.to_string(),
+                    },
+                    PermissionRequestItem {
+                        call_id: "call_2".to_string(),
+                        tool: "read_file".to_string(),
+                        operation: "read".to_string(),
+                        path: "/etc/passwd".to_string(),
+                        arguments: r#"{"path":"/etc/passwd"}"#.to_string(),
+                    },
+                ],
+            },
+        ],
+    );
+}
+
+/// Answering a pending batched permission request (Allow / Deny per path)
+/// journals a `PermissionAnswered` carrying one `PermissionDecision` per
+/// item, and respawns the worker (session back to pending).
+#[tokio::test]
+async fn answer_permission_journals_decision_and_respawns() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    pending_permission_journal(&session);
+
+    // Allow call_1, deny call_2.
+    let decisions = BTreeMap::from([("call_1".to_string(), true), ("call_2".to_string(), false)]);
+    let (status, body) =
+        post_permission_answer(&app.state, "s1", "p1", Some(&decisions), None).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["status"], "pending", "body: {body}");
+    assert!(
+        body["pid"].is_number(),
+        "worker should be respawned: {body}"
+    );
+
+    let kinds = read_kinds(&app, "s1");
+    assert_eq!(kinds.len(), 5, "kinds: {kinds:#?}");
+    match &kinds[4] {
+        JournalEventKind::PermissionAnswered {
+            request_id,
+            decisions,
+            ..
+        } => {
+            assert_eq!(request_id, "p1");
+            assert_eq!(decisions.len(), 2, "decisions: {decisions:#?}");
+            assert_eq!(decisions[0].call_id, "call_1");
+            assert_eq!(decisions[0].tool, "read_file");
+            assert_eq!(decisions[0].operation, "read");
+            assert_eq!(decisions[0].path, "/etc/hostname");
+            assert!(decisions[0].allowed);
+            assert_eq!(decisions[1].call_id, "call_2");
+            assert_eq!(decisions[1].path, "/etc/passwd");
+            assert!(!decisions[1].allowed);
+        }
+        other => panic!("expected permission_answered at seq 4, got: {other:?}"),
+    }
+
+    // A second answer (the request is resolved) is a conflict.
+    let (status, _) = post_permission_answer(&app.state, "s1", "p1", Some(&decisions), None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+/// Deny journals the same event with `allowed: false` per decision.
+#[tokio::test]
+async fn answer_permission_denies() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    pending_permission_journal(&session);
+
+    let decisions = BTreeMap::from([("call_1".to_string(), false), ("call_2".to_string(), false)]);
+    let (status, _) = post_permission_answer(&app.state, "s1", "p1", Some(&decisions), None).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let kinds = read_kinds(&app, "s1");
+    match &kinds[4] {
+        JournalEventKind::PermissionAnswered { decisions, .. } => {
+            assert!(decisions.iter().all(|d| !d.allowed));
+        }
+        other => panic!("expected permission_answered, got: {other:?}"),
+    }
+}
+
+/// Answering with no pending request (or an already-resolved one) is a
+/// conflict; a mismatched request id is a bad request; batched decisions
+/// must cover exactly the pending items (missing or unknown call ids are
+/// bad requests).
+#[tokio::test]
+async fn answer_permission_validates_state_and_request_id() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+
+    // No request ever made -> conflict.
+    append_kinds(&session.journal_path, &[user_msg("hi")]);
+    let decisions = BTreeMap::from([("call_1".to_string(), true)]);
+    let (status, _) = post_permission_answer(&app.state, "s1", "p1", Some(&decisions), None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // A request that was already answered is not pending -> conflict.
+    append_kinds(
+        &session.journal_path,
+        &[permission_request(), permission_answered(true)],
+    );
+    let (status, _) = post_permission_answer(&app.state, "s1", "p1", Some(&decisions), None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // A pending request with a mismatched id is a bad request.
+    append_kinds(&session.journal_path, &[permission_request()]);
+    let (status, body) =
+        post_permission_answer(&app.state, "s1", "p9", Some(&decisions), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body.to_string().contains("unknown request id"),
+        "body: {body}"
+    );
+    // Nothing new was journaled (the pending request is still the last
+    // event — no answer was appended).
+    let kinds = read_kinds(&app, "s1");
+    assert_eq!(kinds.len(), 4, "kinds: {kinds:#?}");
+    assert!(
+        matches!(
+            kinds.last(),
+            Some(JournalEventKind::PermissionRequest { .. })
+        ),
+        "no answer may be journaled: {kinds:#?}"
+    );
+
+    // A pending request whose decisions miss an item is a bad request.
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    pending_permission_journal(&session);
+    let partial = BTreeMap::from([("call_1".to_string(), true)]);
+    let (status, body) = post_permission_answer(&app.state, "s1", "p1", Some(&partial), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body.to_string().contains("missing decision for call"),
+        "body: {body}"
+    );
+
+    // Unknown call ids are rejected too.
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    pending_permission_journal(&session);
+    let unknown = BTreeMap::from([
+        ("call_1".to_string(), true),
+        ("call_2".to_string(), false),
+        ("call_9".to_string(), true),
+    ]);
+    let (status, body) = post_permission_answer(&app.state, "s1", "p1", Some(&unknown), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.to_string().contains("unknown call id"), "body: {body}");
+
+    // An empty decisions object is rejected (every path must be decided).
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    pending_permission_journal(&session);
+    let empty = BTreeMap::new();
+    let (status, body) = post_permission_answer(&app.state, "s1", "p1", Some(&empty), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body.to_string().contains("missing decisions"),
+        "body: {body}"
+    );
+}
+
+/// Legacy single-item requests (pre-batch journals) keep the old
+/// `allowed` contract.
+#[tokio::test]
+async fn answer_permission_legacy_single_item_allowed_contract() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    append_kinds(
+        &session.journal_path,
+        &[
+            user_msg("read the file"),
+            system_prompt(Mode::Build),
+            assistant_msg("let me read it"),
+            legacy_permission_request(),
+        ],
+    );
+    let (status, body) = post_permission_answer(&app.state, "s1", "p1", None, Some(true)).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["status"], "pending", "body: {body}");
+    let kinds = read_kinds(&app, "s1");
+    match &kinds[4] {
+        JournalEventKind::PermissionAnswered {
+            tool,
+            operation,
+            path,
+            allowed,
+            decisions,
+            ..
+        } => {
+            assert_eq!(tool.as_deref(), Some("read_file"));
+            assert_eq!(operation.as_deref(), Some("read"));
+            assert_eq!(path.as_deref(), Some("/etc/hostname"));
+            assert_eq!(*allowed, Some(true));
+            assert!(decisions.is_empty(), "decisions: {decisions:#?}");
+        }
+        other => panic!("expected legacy permission_answered, got: {other:?}"),
+    }
+
+    // A legacy request without `allowed` is a bad request.
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    append_kinds(
+        &session.journal_path,
+        &[user_msg("read"), legacy_permission_request()],
+    );
+    let (status, body) = post_permission_answer(&app.state, "s1", "p1", None, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.to_string().contains("missing allowed"), "body: {body}");
+}
+
+/// Answering while the session is running is refused.
+#[tokio::test]
+async fn answer_permission_while_running_conflicts() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    pending_permission_journal(&session);
+    {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::update_status(&conn, "s1", SessionStatus::Running, None).unwrap();
+    }
+    let decisions = BTreeMap::from([("call_1".to_string(), true)]);
+    let (status, _) = post_permission_answer(&app.state, "s1", "p1", Some(&decisions), None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
 }
 
 async fn post_model_switch(

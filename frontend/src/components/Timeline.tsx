@@ -88,6 +88,53 @@ export function EventRow({ event }: { event: JournalEvent }) {
           </span>
         </div>
       )
+    case 'permission_request':
+      // File tools asked to access paths outside the auto-allowed roots;
+      // the actionable Allow / Deny card is rendered above the composer
+      // while the request is pending. This is the passive timeline record.
+      return (
+        <div className="mode-change">
+          <span className="badge">→ permission requested</span>
+          <span className="muted">
+            {kind.items && kind.items.length > 0
+              ? `${kind.items.length} file access request${
+                  kind.items.length === 1 ? '' : 's'
+                }: ${kind.items
+                  .map((i) => `${i.operation} ${i.path}`)
+                  .join(' · ')}`
+              : `${kind.tool} (${kind.operation}) — ${kind.path}`}
+          </span>
+        </div>
+      )
+    case 'permission_answered':
+      // The user allowed or denied the pending request (per path); it is
+      // resolved and the held calls completed.
+      return (
+        <div className="mode-change">
+          {kind.decisions && kind.decisions.length > 0 ? (
+            <>
+              <span className="badge">
+                → {kind.decisions.filter((d) => d.allowed).length} allowed ·{' '}
+                {kind.decisions.filter((d) => !d.allowed).length} denied
+              </span>
+              <span className="muted">
+                {kind.decisions
+                  .map((d) => `${d.allowed ? 'allowed' : 'denied'} ${d.path}`)
+                  .join(' · ')}
+              </span>
+            </>
+          ) : (
+            <>
+              <span className={`badge ${kind.allowed ? '' : 'badge-err'}`}>
+                → {kind.allowed ? 'allowed' : 'denied'}
+              </span>
+              <span className="muted">
+                {kind.tool} ({kind.operation}) — {kind.path}
+              </span>
+            </>
+          )}
+        </div>
+      )
     case 'handoff':
       // Context compression: the model generated a handoff prompt and the
       // events before it are no longer sent to the model (they stay in the

@@ -9,7 +9,7 @@ use std::sync::{
 };
 
 use axum::{Router, routing::post};
-use mo_core::{Mode, SessionStatus, db, open_db};
+use mo_core::{Mode, PermissionDecision, SessionStatus, db, open_db};
 use serde_json::{Value, json};
 
 fn delta_role(role: &str) -> Value {
@@ -893,6 +893,770 @@ fn history_synthesizes_answer_message_from_ask_user_answered() {
     assert!(answer.contains("\"q1\": \"Rust\""), "got: {answer}");
     // The AskUserRequest event never became a chat message on its own.
     assert_eq!(messages.len(), 5);
+}
+
+/// A *legacy* `PermissionAnswered` event (single-item, pre-batch journals)
+/// still appears in the rebuilt context as a user-role message carrying the
+/// decision plus the request's tool/operation/path — self-contained, so the
+/// model knows exactly what to retry (or not) — while the
+/// `PermissionRequest` itself is flow metadata and never becomes a chat
+/// message. Batched answers are handled differently (the resume delivers
+/// the held calls' real outcomes as tool results — see
+/// `history_skips_batched_permission_answer`).
+#[test]
+fn history_synthesizes_decision_message_from_legacy_permission_answered() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("journal.jsonl");
+    let mut journal = JournalWriter::open(&path).unwrap();
+    journal.append(user_msg("read the file")).unwrap();
+    journal
+        .append(JournalEventKind::SystemPrompt {
+            content: "You are in Build mode.".to_string(),
+            mode: Mode::Build,
+            model: "mock-model".to_string(),
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::Message(JournalMessage {
+            role: "assistant".to_string(),
+            content: String::new(),
+            reasoning_content: None,
+            tool_call_id: None,
+            tool_calls: Some(vec![ToolCallInfo {
+                id: "call_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: r#"{"path":"/etc/hostname"}"#.to_string(),
+            }]),
+        }))
+        .unwrap();
+    journal
+        .append(JournalEventKind::ToolCallStart {
+            id: "call_read".to_string(),
+            name: "read_file".to_string(),
+            arguments: r#"{"path":"/etc/hostname"}"#.to_string(),
+        })
+        .unwrap();
+    // The tool asked the user (flow metadata, never a chat message)...
+    journal
+        .append(JournalEventKind::PermissionRequest {
+            request_id: "p1".into(),
+            tool: Some("read_file".into()),
+            operation: Some("read".into()),
+            path: Some("/etc/hostname".into()),
+            items: Vec::new(),
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::ToolResult {
+            id: "call_read".to_string(),
+            name: "read_file".to_string(),
+            ok: true,
+            output: "A permission request was sent to the user: ... Stop working now: ..."
+                .to_string(),
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::Message(JournalMessage {
+            role: "assistant".to_string(),
+            content: "I asked the user for permission; waiting.".to_string(),
+            reasoning_content: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }))
+        .unwrap();
+    // The gateway appended the user's decision (Allow) — legacy single-item
+    // shape, which the history rebuild still synthesizes into a user-role
+    // decision message (backward compatibility for pre-batch journals).
+    journal
+        .append(JournalEventKind::PermissionAnswered {
+            request_id: "p1".into(),
+            tool: Some("read_file".into()),
+            operation: Some("read".into()),
+            path: Some("/etc/hostname".into()),
+            allowed: Some(true),
+            decisions: Vec::new(),
+        })
+        .unwrap();
+    drop(journal);
+
+    let (system, messages, _) = history_from_journal(&path).unwrap();
+    assert_eq!(system.as_deref(), Some("You are in Build mode."));
+    // user, assistant(tool call), tool(result), assistant(waiting), user(decision)
+    assert_eq!(messages.len(), 5, "messages: {messages:#?}");
+    assert_eq!(messages[0].role, "user");
+    assert_eq!(messages[1].role, "assistant");
+    assert!(
+        messages[1]
+            .tool_calls
+            .as_ref()
+            .is_some_and(|c| c.len() == 1)
+    );
+    assert_eq!(messages[2].role, "tool");
+    assert!(messages[2].content.to_string().contains("Stop working now"));
+    assert_eq!(messages[3].role, "assistant");
+    assert_eq!(
+        messages[3].content.to_string(),
+        "I asked the user for permission; waiting."
+    );
+    // The last message is the synthesized decision, carrying the tool,
+    // operation and path so the model can retry the exact request.
+    assert_eq!(messages[4].role, "user");
+    let decision = messages[4].content.to_string();
+    assert!(
+        decision.starts_with("[The user decided a file-access permission request:]"),
+        "got: {decision}"
+    );
+    assert!(decision.contains("allowed"), "got: {decision}");
+    assert!(decision.contains("read_file"), "got: {decision}");
+    assert!(decision.contains("/etc/hostname"), "got: {decision}");
+    assert!(decision.contains("Retry the tool call"), "got: {decision}");
+
+    // A denied decision carries the opposite guidance.
+    let path2 = dir.path().join("journal2.jsonl");
+    let mut journal = JournalWriter::open(&path2).unwrap();
+    journal.append(user_msg("write it")).unwrap();
+    journal
+        .append(JournalEventKind::SystemPrompt {
+            content: "You are in Build mode.".to_string(),
+            mode: Mode::Build,
+            model: "mock-model".to_string(),
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::PermissionAnswered {
+            request_id: "p1".into(),
+            tool: Some("create_file".into()),
+            operation: Some("write".into()),
+            path: Some("/tmp/x.txt".into()),
+            allowed: Some(false),
+            decisions: Vec::new(),
+        })
+        .unwrap();
+    drop(journal);
+    let (_, messages, _) = history_from_journal(&path2).unwrap();
+    assert_eq!(messages.len(), 2, "messages: {messages:#?}");
+    let decision = messages[1].content.to_string();
+    assert!(decision.contains("denied"), "got: {decision}");
+    assert!(decision.contains("create_file"), "got: {decision}");
+    assert!(decision.contains("/tmp/x.txt"), "got: {decision}");
+    assert!(
+        decision.contains("Do not retry this exact request"),
+        "got: {decision}"
+    );
+}
+
+/// A *batched* `PermissionAnswered` (with `decisions`) is NOT synthesized
+/// into a user-role message: the resume delivers the held calls' real
+/// outcomes as ordinary `tool_result` messages (see
+/// `resume_held_permission_calls_delivers_outcomes`), so a decision message
+/// would be redundant — the model simply sees the results.
+#[test]
+fn history_skips_batched_permission_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("journal.jsonl");
+    let mut journal = JournalWriter::open(&path).unwrap();
+    journal.append(user_msg("read both files")).unwrap();
+    journal
+        .append(JournalEventKind::SystemPrompt {
+            content: "You are in Build mode.".to_string(),
+            mode: Mode::Build,
+            model: "mock-model".to_string(),
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::Message(JournalMessage {
+            role: "assistant".to_string(),
+            content: String::new(),
+            reasoning_content: None,
+            tool_call_id: None,
+            tool_calls: Some(vec![
+                ToolCallInfo {
+                    id: "call_a".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: r#"{"path":"/etc/a"}"#.to_string(),
+                },
+                ToolCallInfo {
+                    id: "call_b".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: r#"{"path":"/etc/b"}"#.to_string(),
+                },
+            ]),
+        }))
+        .unwrap();
+    journal
+        .append(JournalEventKind::ToolCallStart {
+            id: "call_a".to_string(),
+            name: "read_file".to_string(),
+            arguments: r#"{"path":"/etc/a"}"#.to_string(),
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::ToolCallStart {
+            id: "call_b".to_string(),
+            name: "read_file".to_string(),
+            arguments: r#"{"path":"/etc/b"}"#.to_string(),
+        })
+        .unwrap();
+    // The batched request + the user's per-item decisions.
+    journal
+        .append(JournalEventKind::PermissionRequest {
+            request_id: "p1".into(),
+            tool: None,
+            operation: None,
+            path: None,
+            items: vec![
+                mo_core::PermissionRequestItem {
+                    call_id: "call_a".into(),
+                    tool: "read_file".into(),
+                    operation: "read".into(),
+                    path: "/etc/a".into(),
+                    arguments: r#"{"path":"/etc/a"}"#.into(),
+                },
+                mo_core::PermissionRequestItem {
+                    call_id: "call_b".into(),
+                    tool: "read_file".into(),
+                    operation: "read".into(),
+                    path: "/etc/b".into(),
+                    arguments: r#"{"path":"/etc/b"}"#.into(),
+                },
+            ],
+        })
+        .unwrap();
+    // The resume delivered the outcomes as ordinary tool results.
+    journal
+        .append(JournalEventKind::ToolResult {
+            id: "call_a".to_string(),
+            name: "read_file".to_string(),
+            ok: true,
+            output: "content of a".to_string(),
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::ToolResult {
+            id: "call_b".to_string(),
+            name: "read_file".to_string(),
+            ok: false,
+            output: "the user denied permission for read_file /etc/b".to_string(),
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::PermissionAnswered {
+            request_id: "p1".into(),
+            tool: None,
+            operation: None,
+            path: None,
+            allowed: None,
+            decisions: vec![
+                mo_core::PermissionDecision {
+                    call_id: "call_a".into(),
+                    tool: "read_file".into(),
+                    operation: "read".into(),
+                    path: "/etc/a".into(),
+                    allowed: true,
+                },
+                mo_core::PermissionDecision {
+                    call_id: "call_b".into(),
+                    tool: "read_file".into(),
+                    operation: "read".into(),
+                    path: "/etc/b".into(),
+                    allowed: false,
+                },
+            ],
+        })
+        .unwrap();
+    drop(journal);
+
+    let (system, messages, _) = history_from_journal(&path).unwrap();
+    assert_eq!(system.as_deref(), Some("You are in Build mode."));
+    // user, assistant(tool calls), tool(a), tool(b) — no decision message.
+    assert_eq!(messages.len(), 4, "messages: {messages:#?}");
+    assert_eq!(messages[0].role, "user");
+    assert_eq!(messages[1].role, "assistant");
+    assert_eq!(messages[2].role, "tool");
+    assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_a"));
+    assert!(messages[2].content.to_string().contains("content of a"));
+    assert_eq!(messages[3].role, "tool");
+    assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_b"));
+    assert!(
+        messages[3]
+            .content
+            .to_string()
+            .contains("denied permission"),
+        "got: {}",
+        messages[3].content
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|m| m.role == "user" && m.content.to_string().contains("decided a file-access")),
+        "batched decisions must not become user messages: {messages:#?}"
+    );
+}
+
+/// The resume step re-runs a held permission batch whose answer landed:
+/// allowed calls produce their real result, denied calls the
+/// remembered-denial error — both journaled as ordinary `ToolResult`s so
+/// the history rebuild carries them to the model in the original call
+/// order, with no decision message in between.
+#[tokio::test]
+async fn resume_held_permission_calls_delivers_outcomes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, outside) = tool_ctx(&dir);
+    std::fs::write(outside.join("a.txt"), "content of A\n").unwrap();
+    std::fs::write(outside.join("b.txt"), "content of B\n").unwrap();
+    let a = outside.join("a.txt").display().to_string();
+    let b = outside.join("b.txt").display().to_string();
+
+    let mut journal = JournalWriter::open(std::path::Path::new(&ctx.session.journal_path)).unwrap();
+    journal.append(user_msg("read a and b")).unwrap();
+    journal
+        .append(JournalEventKind::Message(JournalMessage {
+            role: "assistant".to_string(),
+            content: String::new(),
+            reasoning_content: None,
+            tool_call_id: None,
+            tool_calls: Some(vec![
+                ToolCallInfo {
+                    id: "call_a".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: format!(r#"{{"path":"{a}"}}"#),
+                },
+                ToolCallInfo {
+                    id: "call_b".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: format!(r#"{{"path":"{b}"}}"#),
+                },
+            ]),
+        }))
+        .unwrap();
+    journal
+        .append(JournalEventKind::ToolCallStart {
+            id: "call_a".to_string(),
+            name: "read_file".to_string(),
+            arguments: format!(r#"{{"path":"{a}"}}"#),
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::ToolCallStart {
+            id: "call_b".to_string(),
+            name: "read_file".to_string(),
+            arguments: format!(r#"{{"path":"{b}"}}"#),
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::PermissionRequest {
+            request_id: "p1".into(),
+            tool: None,
+            operation: None,
+            path: None,
+            items: vec![
+                mo_core::PermissionRequestItem {
+                    call_id: "call_a".into(),
+                    tool: "read_file".into(),
+                    operation: "read".into(),
+                    path: a.clone(),
+                    arguments: format!(r#"{{"path":"{a}"}}"#),
+                },
+                mo_core::PermissionRequestItem {
+                    call_id: "call_b".into(),
+                    tool: "read_file".into(),
+                    operation: "read".into(),
+                    path: b.clone(),
+                    arguments: format!(r#"{{"path":"{b}"}}"#),
+                },
+            ],
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::PermissionAnswered {
+            request_id: "p1".into(),
+            tool: None,
+            operation: None,
+            path: None,
+            allowed: None,
+            decisions: vec![
+                mo_core::PermissionDecision {
+                    call_id: "call_a".into(),
+                    tool: "read_file".into(),
+                    operation: "read".into(),
+                    path: a.clone(),
+                    allowed: true,
+                },
+                mo_core::PermissionDecision {
+                    call_id: "call_b".into(),
+                    tool: "read_file".into(),
+                    operation: "read".into(),
+                    path: b.clone(),
+                    allowed: false,
+                },
+            ],
+        })
+        .unwrap();
+    drop(journal);
+
+    let mut journal = JournalWriter::open(std::path::Path::new(&ctx.session.journal_path)).unwrap();
+    resume_held_permission_calls(&ctx, &mut journal)
+        .await
+        .unwrap();
+
+    // Both held calls got their outcomes journaled, in request order.
+    let events = mo_core::read_events(std::path::Path::new(&ctx.session.journal_path)).unwrap();
+    let results: Vec<&JournalEventKind> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            JournalEventKind::ToolResult { .. } => Some(&e.kind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 2, "results: {results:#?}");
+    match &results[0] {
+        JournalEventKind::ToolResult {
+            id,
+            name,
+            ok,
+            output,
+        } => {
+            assert_eq!(id, "call_a");
+            assert_eq!(name, "read_file");
+            assert!(*ok);
+            assert!(output.contains("content of A"), "got: {output}");
+        }
+        other => panic!("expected tool_result, got: {other:?}"),
+    }
+    match &results[1] {
+        JournalEventKind::ToolResult {
+            id,
+            name,
+            ok,
+            output,
+        } => {
+            assert_eq!(id, "call_b");
+            assert_eq!(name, "read_file");
+            assert!(!*ok);
+            assert!(output.contains("denied permission"), "got: {output}");
+            assert!(output.contains(&b), "got: {output}");
+        }
+        other => panic!("expected tool_result, got: {other:?}"),
+    }
+
+    // The rebuilt context: user, assistant(tool calls), the two results —
+    // no synthesized decision message. Idempotency: a second resume run
+    // journals nothing new.
+    let (_, messages, _) =
+        history_from_journal(std::path::Path::new(&ctx.session.journal_path)).unwrap();
+    assert_eq!(messages.len(), 4, "messages: {messages:#?}");
+    assert_eq!(messages[1].role, "assistant");
+    assert_eq!(messages[2].role, "tool");
+    assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_a"));
+    assert_eq!(messages[3].role, "tool");
+    assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_b"));
+    let before = mo_core::read_events(std::path::Path::new(&ctx.session.journal_path))
+        .unwrap()
+        .len();
+    let mut journal = JournalWriter::open(std::path::Path::new(&ctx.session.journal_path)).unwrap();
+    resume_held_permission_calls(&ctx, &mut journal)
+        .await
+        .unwrap();
+    let after = mo_core::read_events(std::path::Path::new(&ctx.session.journal_path))
+        .unwrap()
+        .len();
+    assert_eq!(before, after, "a second resume must journal nothing");
+}
+
+/// A `ToolContext` for the resume test: a build-mode root session whose
+/// workdir and scratch live under `dir`; `outside` (returned) is a sibling
+/// directory whose files need user permission to read.
+fn tool_ctx(dir: &tempfile::TempDir) -> (ToolContext, std::path::PathBuf) {
+    let workdir = dir.path().join("work");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let scratch = dir.path().join("data/sessions/s/tmp");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let scratch = scratch.canonicalize().unwrap();
+    let journal = dir.path().join("data/sessions/s/journal.jsonl");
+    std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+    let ctx = ToolContext {
+        workdir,
+        data_dir: dir.path().join("data"),
+        agents_dir: dir.path().join("agents"),
+        session: Session {
+            id: "s".into(),
+            parent_id: None,
+            workdir: dir.path().join("work").display().to_string(),
+            prompt: "p".into(),
+            model: "m".into(),
+            status: SessionStatus::Running,
+            mode: Mode::Build,
+            tools: vec![],
+            pid: None,
+            journal_path: journal.display().to_string(),
+            created_at: "now".into(),
+            updated_at: "now".into(),
+            heartbeat_at: None,
+            error: None,
+        },
+        scratch,
+        subagent_depth: 0,
+        max_tool_concurrency: 8,
+        model_base_url: "http://localhost:1".into(),
+        model_name: "m".into(),
+        auth_token: None,
+        context_window: None,
+        context_compression_threshold: mo_core::config::DEFAULT_CONTEXT_COMPRESSION_THRESHOLD,
+    };
+    (ctx, outside)
+}
+
+/// End-to-end batched permission flow against a mock LLM server:
+/// request 1 emits TWO `read_file` calls on paths outside the sandbox; the
+/// worker holds them, journals ONE batched `PermissionRequest` and ends the
+/// run — no final answer, no results, nothing fed back to the model. After
+/// the (simulated) user answer, a second `run_agent` resumes: the held
+/// calls re-execute (allowed → file content, denied → denial error), and
+/// the mock's request 2 sees the outcomes as ordinary tool messages in call
+/// order.
+#[tokio::test]
+async fn e2e_batched_permission_flow_holds_then_delivers_outcomes() {
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path().join("work");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("a.txt"), "content of A\n").unwrap();
+    std::fs::write(outside.join("b.txt"), "content of B\n").unwrap();
+    let a = outside.join("a.txt").display().to_string();
+    let b = outside.join("b.txt").display().to_string();
+    let data_dir = dir.path().join("data");
+    let agents_dir = dir.path().join("agents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+
+    let conn = open_db(&data_dir.join("mo.db")).unwrap();
+    let session = sample_session(
+        &workdir,
+        &data_dir.join("sessions").join("e2e").join("journal.jsonl"),
+    );
+    db::create_session(&conn, &session).unwrap();
+    drop(conn);
+
+    // Mock LLM server: request 1 (first run) issues the two outside reads;
+    // request 2 (resumed run) must already carry both outcomes as tool
+    // messages — the model never saw the permission flow itself.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let args_a = format!(r#"{{"path":"{a}"}}"#);
+    let args_b = format!(r#"{{"path":"{b}"}}"#);
+    let router = Router::new()
+        .route(
+            "/chat/completions",
+            post(
+                move |calls: axum::extract::State<Arc<AtomicUsize>>,
+                      body: axum::extract::Json<Value>| async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    if n == 1 {
+                        // Resumed run: the held calls' outcomes are in the
+                        // context as ordinary tool messages, in call order,
+                        // with no synthesized decision message in between.
+                        let msgs = body["messages"].as_array().unwrap();
+                        let tail: Vec<&Value> = msgs.iter().rev().take(3).collect();
+                        assert_eq!(tail[2]["role"], "assistant");
+                        assert_eq!(tail[2]["tool_calls"][0]["id"], "call_1", "msgs: {msgs:#?}");
+                        assert_eq!(tail[1]["role"], "tool");
+                        assert_eq!(tail[1]["tool_call_id"], "call_1");
+                        let out_a = tail[1]["content"].as_str().unwrap();
+                        assert!(
+                            out_a.contains("content of A"),
+                            "allowed call must return the file content: {out_a}"
+                        );
+                        assert!(
+                            !out_a.contains("permission request was sent"),
+                            "permission chatter must not reach the model: {out_a}"
+                        );
+                        assert_eq!(tail[0]["role"], "tool");
+                        assert_eq!(tail[0]["tool_call_id"], "call_2");
+                        let out_b = tail[0]["content"].as_str().unwrap();
+                        assert!(
+                            out_b.contains("denied permission"),
+                            "denied call must return the denial error: {out_b}"
+                        );
+                        assert!(
+                            !msgs.iter().any(|m| {
+                                m["role"] == "user"
+                                    && m["content"]
+                                        .as_str()
+                                        .is_some_and(|c| c.contains("decided a file-access"))
+                            }),
+                            "no synthesized decision message: {msgs:#?}"
+                        );
+                    }
+                    let body = if n == 0 {
+                        sse_payload_with_usage(
+                            &[
+                                delta_role("assistant"),
+                                delta_tool_call(0, "call_1", "read_file", &args_a),
+                                delta_tool_call(1, "call_2", "read_file", &args_b),
+                            ],
+                            40,
+                            6,
+                        )
+                    } else {
+                        sse_payload_with_usage(
+                            &[delta_role("assistant"), delta_content("read A, denied B")],
+                            60,
+                            3,
+                        )
+                    };
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        body,
+                    )
+                },
+            ),
+        )
+        .with_state(calls.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let agent_cfg = AgentConfig {
+        session: session.clone(),
+        workdir: workdir.clone(),
+        data_dir: data_dir.clone(),
+        agents_dir,
+        model_base_url: format!("http://{addr}"),
+        model_name: "mock-model".to_string(),
+        auth_token: None,
+        context_window: Some(4096),
+        subagent_depth: 0,
+        max_tool_concurrency: 8,
+        context_compression_threshold: 0.75,
+    };
+    let journal_path = std::path::Path::new(&session.journal_path);
+
+    // First run: the model asks for two outside reads.
+    let mut journal = JournalWriter::open(journal_path).unwrap();
+    journal
+        .append(JournalEventKind::Message(JournalMessage {
+            role: "user".to_string(),
+            content: "read a.txt and b.txt".to_string(),
+            reasoning_content: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }))
+        .unwrap();
+    run_agent(agent_cfg.clone(), &mut journal).await.unwrap();
+
+    let events = mo_core::read_events(journal_path).unwrap();
+    let kinds: Vec<&JournalEventKind> = events.iter().map(|e| &e.kind).collect();
+    // user, SystemPrompt, ContextUsage, assistant(tool calls),
+    // ToolCallStart x2, batched PermissionRequest — and NOTHING after:
+    // no tool results, no final answer, no decision message.
+    assert_eq!(kinds.len(), 7, "events: {events:#?}");
+    assert!(
+        matches!(kinds[3], JournalEventKind::Message(m) if m.role == "assistant" && m.tool_calls.as_ref().is_some_and(|t| t.len() == 2))
+    );
+    assert!(matches!(kinds[4], JournalEventKind::ToolCallStart { id, .. } if id == "call_1"));
+    assert!(matches!(kinds[5], JournalEventKind::ToolCallStart { id, .. } if id == "call_2"));
+    match &kinds[6] {
+        JournalEventKind::PermissionRequest {
+            request_id, items, ..
+        } => {
+            assert_eq!(request_id, "p1");
+            assert_eq!(items.len(), 2, "one batched request with both items");
+            assert_eq!(items[0].call_id, "call_1");
+            assert_eq!(items[0].path, a);
+            assert_eq!(items[1].call_id, "call_2");
+            assert_eq!(items[1].path, b);
+        }
+        other => panic!("expected the batched permission_request, got: {other:?}"),
+    }
+    assert!(
+        !kinds
+            .iter()
+            .any(|k| matches!(k, JournalEventKind::ToolResult { .. })),
+        "no tool result may be journaled before the user decides: {kinds:#?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the run must end after the request"
+    );
+
+    // The gateway journals the user's per-path decision, then the worker
+    // respawns: the resume re-runs the held calls and the model continues.
+    let mut journal = JournalWriter::open(journal_path).unwrap();
+    journal
+        .append(JournalEventKind::PermissionAnswered {
+            request_id: "p1".into(),
+            tool: None,
+            operation: None,
+            path: None,
+            allowed: None,
+            decisions: vec![
+                PermissionDecision {
+                    call_id: "call_1".into(),
+                    tool: "read_file".into(),
+                    operation: "read".into(),
+                    path: a.clone(),
+                    allowed: true,
+                },
+                PermissionDecision {
+                    call_id: "call_2".into(),
+                    tool: "read_file".into(),
+                    operation: "read".into(),
+                    path: b.clone(),
+                    allowed: false,
+                },
+            ],
+        })
+        .unwrap();
+    run_agent(agent_cfg, &mut journal).await.unwrap();
+
+    // The journal now carries the held calls' results (after the answer)
+    // and the final answer; the model context saw only those outcomes.
+    let events = mo_core::read_events(journal_path).unwrap();
+    let kinds: Vec<&JournalEventKind> = events.iter().map(|e| &e.kind).collect();
+    let result_positions: Vec<usize> = kinds
+        .iter()
+        .enumerate()
+        .filter_map(|(i, k)| matches!(k, JournalEventKind::ToolResult { .. }).then_some(i))
+        .collect();
+    assert_eq!(result_positions.len(), 2, "kinds: {kinds:#?}");
+    let answered_seq = events
+        .iter()
+        .find(|e| matches!(e.kind, JournalEventKind::PermissionAnswered { .. }))
+        .unwrap()
+        .seq;
+    assert!(
+        result_positions.iter().all(|i| *i as u64 > answered_seq),
+        "held results must land after the answer: {kinds:#?}"
+    );
+    match &kinds[result_positions[0]] {
+        JournalEventKind::ToolResult { id, ok, output, .. } => {
+            assert_eq!(id, "call_1");
+            assert!(*ok);
+            assert!(output.contains("content of A"), "got: {output}");
+        }
+        other => panic!("expected tool_result, got: {other:?}"),
+    }
+    match &kinds[result_positions[1]] {
+        JournalEventKind::ToolResult { id, ok, output, .. } => {
+            assert_eq!(id, "call_2");
+            assert!(!*ok);
+            assert!(output.contains("denied permission"), "got: {output}");
+        }
+        other => panic!("expected tool_result, got: {other:?}"),
+    }
+    assert!(
+        kinds.iter().any(|k| matches!(
+            k,
+            JournalEventKind::Message(m)
+                if m.role == "assistant" && m.content.contains("read A, denied B")
+        )),
+        "the resumed run must finish with a final answer: {kinds:#?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "exactly two LLM calls");
 }
 
 fn user_msg(content: &str) -> JournalEventKind {

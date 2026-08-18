@@ -22,6 +22,7 @@ use crate::tools::{self, ToolContext};
 /// Backoff schedule for LLM request failures: 5s / 15s / 30s.
 const RETRY_DELAYS_SECS: [u64; 3] = [5, 15, 30];
 
+#[derive(Clone)]
 pub struct AgentConfig {
     pub session: Session,
     pub workdir: PathBuf,
@@ -63,6 +64,29 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
     let scratch = scratch
         .canonicalize()
         .context("failed to resolve session scratch dir")?;
+
+    let tool_ctx = ToolContext {
+        workdir: config.workdir.clone(),
+        data_dir: config.data_dir.clone(),
+        agents_dir: config.agents_dir.clone(),
+        session: config.session.clone(),
+        scratch: scratch.clone(),
+        subagent_depth: config.subagent_depth,
+        max_tool_concurrency: config.max_tool_concurrency,
+        model_base_url: config.model_base_url.clone(),
+        model_name: config.model_name.clone(),
+        auth_token: config.auth_token.clone(),
+        context_window: config.context_window,
+        context_compression_threshold: config.context_compression_threshold,
+    };
+
+    // Complete any held permission batch the user answered while this
+    // session was terminal: journal the held calls' real outcomes *before*
+    // the history rebuild, so the resumed model context carries them as
+    // ordinary tool results (allowed calls return their actual result,
+    // denied calls a denial error) — the permission flow stays invisible to
+    // the model. Idempotent: a session with no answered batch does nothing.
+    resume_held_permission_calls(&tool_ctx, journal).await?;
 
     // The conversation context is the journal history: user messages are
     // journaled by the gateway before the worker is spawned, and assistant /
@@ -107,20 +131,6 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
     // fixed tools (bash + file operations) are always included; an empty
     // list is the legacy "all tools" default.
     let tools = tools::tool_definitions(&config.session.tools);
-    let tool_ctx = ToolContext {
-        workdir: config.workdir.clone(),
-        data_dir: config.data_dir.clone(),
-        agents_dir: config.agents_dir.clone(),
-        session: config.session.clone(),
-        scratch: scratch.clone(),
-        subagent_depth: config.subagent_depth,
-        max_tool_concurrency: config.max_tool_concurrency,
-        model_base_url: config.model_base_url.clone(),
-        model_name: config.model_name.clone(),
-        auth_token: config.auth_token.clone(),
-        context_window: config.context_window,
-        context_compression_threshold: config.context_compression_threshold,
-    };
 
     // Compression is attempted once per "epoch" (until it succeeds): a
     // failed handoff generation is not retried every iteration, because the
@@ -252,11 +262,61 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
                 }
             };
 
+            // Pre-flight the message's calls: those targeting paths outside
+            // the allowed roots are *held* for a single batched permission
+            // request — one card in the UI listing every path, instead of a
+            // per-call request with "already pending" errors for the
+            // siblings. Nothing is sent to the LLM until the user decides:
+            // the run ends right after the request is journaled, and the
+            // held calls' real outcomes are delivered on the resumed run
+            // (see `resume_held_permission_calls`). The calls that need no
+            // permission still execute concurrently below — their results
+            // are journaled (the UI shows them) but not fed to the model.
+            let held: Vec<mo_core::PermissionRequestItem> = tool_calls
+                .iter()
+                .filter_map(|tc| {
+                    match tools::preflight(
+                        &tool_ctx,
+                        &tc.function.name,
+                        &tc.function.arguments,
+                        &tc.id,
+                    ) {
+                        tools::Preflight::Permission(item) => Some(item),
+                        _ => None,
+                    }
+                })
+                .collect();
+            let hold = if held.is_empty() {
+                false
+            } else {
+                match tools::permission::ask_permission_batch(&tool_ctx, &held, &sink) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        // Only reachable for subagents (their journal has no
+                        // UI) or a pathological pending conflict: fall back
+                        // to normal execution — the per-call
+                        // `ask_permission` then surfaces the refusal as an
+                        // ordinary tool error.
+                        tracing::warn!(
+                            session = %config.session.id,
+                            "permission batch refused, falling back to per-call execution: {e}"
+                        );
+                        false
+                    }
+                }
+            };
+            let held_ids: std::collections::HashSet<&str> =
+                held.iter().map(|i| i.call_id.as_str()).collect();
+            let to_run: Vec<&ToolCallRequest> = tool_calls
+                .iter()
+                .filter(|tc| !(hold && held_ids.contains(tc.id.as_str())))
+                .collect();
+
             // `buffer_unordered(n)` polls up to `n` tool futures at once;
             // per-call timeouts (bash's 120s) only start once a call is
             // actually polled. Each future journals its own `ToolResult` as
             // it completes.
-            let results: Vec<(String, String)> = futures_util::stream::iter(tool_calls.iter())
+            let results: Vec<(String, String)> = futures_util::stream::iter(to_run.iter())
                 .map(|tc| async {
                     let (ok, output) = match tools::execute_tool(
                         &tool_ctx,
@@ -281,6 +341,16 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
                 .buffer_unordered(config.max_tool_concurrency.max(1))
                 .collect()
                 .await;
+
+            if hold {
+                // The user must decide first: end the run without feeding
+                // anything back to the model. The safe calls' results are
+                // already in the journal (the UI shows them); the held
+                // calls' outcomes land here on the resumed run, before the
+                // history rebuild.
+                return Ok(());
+            }
+
             let by_id: HashMap<&str, &str> = results
                 .iter()
                 .map(|(id, output)| (id.as_str(), output.as_str()))
@@ -302,6 +372,83 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
         messages.push(assistant);
         messages.extend(tool_messages);
     }
+}
+
+/// Complete any *held* permission batch whose answer landed while the
+/// session was terminal: re-run the batch's file-tool calls and journal
+/// their `ToolResult`s *before* the history rebuild, so the resumed model
+/// context carries them as ordinary tool results — allowed calls return
+/// their real outcome (file content, edit confirmation, ...), denied calls
+/// return the remembered-denial error. This is what makes the permission
+/// flow transparent to the model: it never sees the request, only the
+/// results, and never has to "retry" the calls itself.
+///
+/// Re-running goes through `execute_tool` with the item's original
+/// arguments, so the remembered `(tool, path)` decisions (journaled by the
+/// answer) route each call: allowed → runs with the path in the approved
+/// list; denied → the policy refuses with the denial error. Idempotent: an
+/// item whose call id already has a `ToolResult` after the answer is
+/// skipped, and a session with no answered batch does nothing. The held
+/// calls are always file tools, so the no-op event sink is safe (they emit
+/// no non-result journal events).
+async fn resume_held_permission_calls(
+    ctx: &ToolContext,
+    journal: &mut JournalWriter,
+) -> Result<()> {
+    let events = mo_core::read_events(Path::new(&ctx.session.journal_path))
+        .context("failed to read session journal")?;
+    // The most recent batched answer and the request it resolves.
+    let Some((answered_seq, request_id)) = events.iter().rev().find_map(|e| match &e.kind {
+        JournalEventKind::PermissionAnswered {
+            request_id,
+            decisions,
+            ..
+        } if !decisions.is_empty() => Some((e.seq, request_id.clone())),
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+    let Some(request_items) = events.iter().rev().find_map(|e| match &e.kind {
+        JournalEventKind::PermissionRequest {
+            request_id: rid,
+            items,
+            ..
+        } if rid == &request_id && !items.is_empty() && e.seq < answered_seq => Some(items.clone()),
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+    let noop = |_: JournalEventKind| {};
+    for item in &request_items {
+        // Skip items already executed (a prior resume finished them, or a
+        // safe sibling that happened to share the call id — defense in
+        // depth for the mock-replay case).
+        let has_result = events.iter().any(|e| {
+            matches!(&e.kind, JournalEventKind::ToolResult { id, .. } if id == &item.call_id && e.seq > answered_seq)
+        });
+        if has_result {
+            continue;
+        }
+        let (ok, output) =
+            match tools::execute_tool(ctx, &item.tool, &item.arguments, &item.call_id, &noop).await
+            {
+                Ok(output) => (true, output),
+                Err(err) => (false, err),
+            };
+        tracing::debug!(
+            session = %ctx.session.id,
+            call = %item.call_id,
+            ok,
+            "resumed held permission call"
+        );
+        journal.append(JournalEventKind::ToolResult {
+            id: item.call_id.clone(),
+            name: item.tool.clone(),
+            ok,
+            output,
+        })?;
+    }
+    Ok(())
 }
 
 /// Rebuild the chat context from a session journal, returning the journaled
@@ -401,6 +548,44 @@ fn history_from_journal(
                         "{}{}",
                         crate::prompt::ASK_USER_ANSWER_PREFIX,
                         json
+                    )),
+                    reasoning_content: None,
+                    tool_call_id: None,
+                    tool_calls: None,
+                });
+            }
+            JournalEventKind::PermissionAnswered {
+                tool: Some(tool),
+                operation: Some(operation),
+                path: Some(path),
+                allowed: Some(allowed),
+                ..
+            } => {
+                // Legacy (pre-batch) shape: the user decided a single
+                // file-access permission request the harness showed them.
+                // Synthesized as a user-role message carrying the decision —
+                // the tool's "return value" to the model — so the model
+                // retries the tool call when allowed or finds another way
+                // when denied. Kept exactly as before so journals written
+                // before batching resume correctly. Batched answers
+                // (`decisions`) are NOT synthesized here: the resume
+                // delivers the held calls' real outcomes as ordinary tool
+                // results (see `resume_held_permission_calls`), so a
+                // decision message would be redundant. (`PermissionRequest`
+                // itself is flow metadata and falls into the default skip.)
+                let verdict = if allowed { "allowed" } else { "denied" };
+                let followup = if allowed {
+                    " Retry the tool call with the same arguments."
+                } else {
+                    " Do not retry this exact request; find another way or \
+                     explain why you cannot proceed."
+                };
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: ChatMessageContentValue::Text(format!(
+                        "{}{} the request {tool} ({operation}) on \"{path}\".{followup}",
+                        crate::prompt::PERMISSION_ANSWER_PREFIX,
+                        verdict
                     )),
                     reasoning_content: None,
                     tool_call_id: None,
