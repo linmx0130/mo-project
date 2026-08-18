@@ -13,11 +13,11 @@ workers each get their own sequence):
     test answers it via POST /api/sessions/:id/ask/answer); the resumed
     connection sees the answer as a user message and gives the final answer
   * prompt contains "permission" -> request 1 calls read_file on a path
-    outside the workdir (/etc/hosts), so the worker asks the user via a
-    permission request (the smoke test answers it via POST
-    /api/sessions/:id/permission/answer); the resumed connection sees the
-    decision as a user message, retries read_file (no second prompt — the
-    decision is remembered), and gives the final answer
+    outside the workdir (/etc/hosts), so the worker holds it and journals a
+    single batched permission request (the smoke test answers it via POST
+    /api/sessions/:id/permission/answer); the resumed connection already
+    carries the held call's outcome as an ordinary tool result and gives
+    the final answer
   * prompt contains "slow"     -> request 1 asks for `bash sleep 60`
                                  (use this to test cancel)
   * otherwise                  -> read_file greeting.txt, then
@@ -122,37 +122,23 @@ class Handler(BaseHTTPRequestHandler):
                 "The user answered my clarification question. "
                 "Everything works."
             )
-        elif any(
-            "The user decided a file-access permission request" in m.get("content", "")
-            for m in user_msgs
-        ):
-            # The resumed run after the user decided a permission request
-            # (Allow / Deny on a read_file call for a path outside the
-            # workdir). The model retries read_file; the worker remembers
-            # the decision and runs it without prompting again.
-            if n == 0:
-                deltas = [
-                    {"role": "assistant"},
-                    {
-                        "tool_calls": [
-                            {
-                                "index": 0,
-                                "id": "call_perm_retry",
-                                "type": "function",
-                                "function": {
-                                    "name": "read_file",
-                                    "arguments": '{"path": "/etc/hosts"}',
-                                },
-                            }
-                        ]
-                    },
-                ]
-            else:
-                deltas = [{"role": "assistant"}] + stream_text(
-                    "The user allowed me to read /etc/hosts and I read it."
-                )
         elif "permission" in prompt:
-            if n == 0:
+            # The first run issues one read_file on a path outside the
+            # workdir (/etc/hosts). The worker holds it, journals a single
+            # batched permission_request and ends the run — nothing is sent
+            # back to the model. The resumed connection already carries the
+            # held call's real outcome (the file content) as an ordinary
+            # tool result, so the model replies with the final answer
+            # right away; a fresh request (no outcome yet) issues the call.
+            tool_msgs = [m.get("content", "") for m in body.get("messages", []) if m.get("role") == "tool"]
+            if n == 0 and any(
+                "/etc/hosts" in c and ("127.0.0.1" in c or "localhost" in c)
+                for c in tool_msgs
+            ):
+                deltas = [{"role": "assistant"}] + stream_text(
+                    "The user allowed my file access requests; I read /etc/hosts."
+                )
+            elif n == 0:
                 deltas = [
                     {"role": "assistant"},
                     {
@@ -171,8 +157,7 @@ class Handler(BaseHTTPRequestHandler):
                 ]
             else:
                 deltas = [{"role": "assistant"}] + stream_text(
-                    "I sent a file-access permission request to the user "
-                    "and will continue once they decide."
+                    "The user allowed me to read /etc/hosts and I read it."
                 )
         elif "ask_user" in prompt:
             if n == 0:
