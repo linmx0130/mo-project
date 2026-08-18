@@ -62,6 +62,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !columns.iter().any(|c| c == "tools") {
         conn.execute_batch("ALTER TABLE sessions ADD COLUMN tools TEXT;")?;
     }
+    // Sessions created before skill selection existed have no `skills`
+    // column; add it (`NULL` = no forced skills, the legacy behavior) so
+    // every row round-trips through `Session`.
+    if !columns.iter().any(|c| c == "skills") {
+        conn.execute_batch("ALTER TABLE sessions ADD COLUMN skills TEXT;")?;
+    }
     Ok(())
 }
 
@@ -77,8 +83,8 @@ fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
 
 pub fn create_session(conn: &Connection, session: &Session) -> Result<()> {
     conn.execute(
-        "INSERT INTO sessions (id, parent_id, workdir, prompt, model, status, mode, tools, pid, journal_path, created_at, updated_at, heartbeat_at, error)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        "INSERT INTO sessions (id, parent_id, workdir, prompt, model, status, mode, tools, skills, pid, journal_path, created_at, updated_at, heartbeat_at, error)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             session.id,
             session.parent_id,
@@ -88,6 +94,7 @@ pub fn create_session(conn: &Connection, session: &Session) -> Result<()> {
             session.status.as_str(),
             session.mode.as_str(),
             serde_json::to_string(&session.tools).unwrap_or_default(),
+            serde_json::to_string(&session.skills).unwrap_or_default(),
             session.pid.map(|p| p as i64),
             session.journal_path,
             session.created_at,
@@ -102,7 +109,7 @@ pub fn create_session(conn: &Connection, session: &Session) -> Result<()> {
 pub fn get_session(conn: &Connection, id: &str) -> Result<Option<Session>> {
     let row = conn
         .query_row(
-            "SELECT id, parent_id, workdir, prompt, model, status, mode, tools, pid, journal_path, created_at, updated_at, heartbeat_at, error
+            "SELECT id, parent_id, workdir, prompt, model, status, mode, tools, skills, pid, journal_path, created_at, updated_at, heartbeat_at, error
              FROM sessions WHERE id = ?1",
             params![id],
             row_to_session,
@@ -117,7 +124,7 @@ pub fn get_session(conn: &Connection, id: &str) -> Result<Option<Session>> {
 /// (see the frontend's subagent modal).
 pub fn list_sessions(conn: &Connection) -> Result<Vec<Session>> {
     let mut stmt = conn.prepare(
-        "SELECT id, parent_id, workdir, prompt, model, status, mode, tools, pid, journal_path, created_at, updated_at, heartbeat_at, error
+        "SELECT id, parent_id, workdir, prompt, model, status, mode, tools, skills, pid, journal_path, created_at, updated_at, heartbeat_at, error
          FROM sessions WHERE parent_id IS NULL ORDER BY created_at DESC",
     )?;
     let rows = stmt
@@ -131,7 +138,7 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<Session>> {
 /// stopped and cleaned up with it.
 pub fn list_children(conn: &Connection, parent_id: &str) -> Result<Vec<Session>> {
     let mut stmt = conn.prepare(
-        "SELECT id, parent_id, workdir, prompt, model, status, mode, tools, pid, journal_path, created_at, updated_at, heartbeat_at, error
+        "SELECT id, parent_id, workdir, prompt, model, status, mode, tools, skills, pid, journal_path, created_at, updated_at, heartbeat_at, error
          FROM sessions WHERE parent_id = ?1 ORDER BY created_at ASC",
     )?;
     let rows = stmt
@@ -245,7 +252,14 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         .as_deref()
         .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
         .unwrap_or_default();
-    let pid: Option<i64> = row.get(8)?;
+    // The forced-skill list is a JSON array; `NULL` (rows created before
+    // skill selection existed) means "no forced skills" → empty list.
+    let skills: Option<String> = row.get(8)?;
+    let skills = skills
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        .unwrap_or_default();
+    let pid: Option<i64> = row.get(9)?;
     Ok(Session {
         id: row.get(0)?,
         parent_id: row.get(1)?,
@@ -255,12 +269,13 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         status,
         mode,
         tools,
+        skills,
         pid: pid.map(|p| p as u32),
-        journal_path: row.get(9)?,
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
-        heartbeat_at: row.get(12)?,
-        error: row.get(13)?,
+        journal_path: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+        heartbeat_at: row.get(13)?,
+        error: row.get(14)?,
     })
 }
 

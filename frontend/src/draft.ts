@@ -13,6 +13,10 @@ export interface Draft {
    *  operations) are always available and never listed here. An empty list
    *  = everything enabled. */
   bannedTools: string[]
+  /** The skills the user force-loaded for this session: their full
+   *  SKILL.md contents are injected into the system prompt at the first
+   *  run. An empty list = no forced skills. */
+  skills: string[]
   text: string
 }
 
@@ -38,6 +42,11 @@ export function loadDraft(): Draft | null {
       // entries are dropped defensively.
       bannedTools: Array.isArray(parsed.bannedTools)
         ? parsed.bannedTools.filter((t): t is string => typeof t === 'string')
+        : [],
+      // Drafts saved before skill selection existed carry no list: no
+      // forced skills. Non-string entries are dropped defensively.
+      skills: Array.isArray(parsed.skills)
+        ? parsed.skills.filter((s): s is string => typeof s === 'string')
         : [],
       text: parsed.text,
     }

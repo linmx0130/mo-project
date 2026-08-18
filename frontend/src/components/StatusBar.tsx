@@ -1,4 +1,4 @@
-import type { Mode, ModelInfo, SessionStatus } from '../api'
+import type { Mode, ModelInfo, SessionStatus, SkillInfo } from '../api'
 
 interface Props {
   status: SessionStatus
@@ -24,6 +24,14 @@ interface Props {
    *  model and receives the full journal history. */
   modelEnabled: boolean
   onSwitchModel: (model: string) => void
+  /** The discovered global skills (GET /api/skills), for the skill
+   *  picker. */
+  skills: SkillInfo[]
+  /** True when the skill picker may be used (the session is not running);
+   *  picking a skill sends its full SKILL.md to the session as a new user
+   *  message and the worker respawns. */
+  skillEnabled: boolean
+  onLoadSkill: (name: string) => void
 }
 
 const nf = new Intl.NumberFormat('en-US')
@@ -31,11 +39,13 @@ const nf = new Intl.NumberFormat('en-US')
 /** The session status bar pinned to the bottom of the session view.
  *
  *  Shows the mode picker (badge + switcher) with the model picker
- *  (badge-like select) side-by-side, the session status badge, and the
- *  context length in tokens (from the LLM API's `usage.prompt_tokens`,
- *  journaled by the worker as `context_usage` events). When a context
- *  window is configured the length is rendered against it with a thin
- *  progress bar; additional status items can be appended as siblings. */
+ *  (badge-like select) and the skill picker (load a skill — its SKILL.md
+ *  is sent to the session as a new user message) side-by-side, the session
+ *  status badge, and the context length in tokens (from the LLM API's
+ *  `usage.prompt_tokens`, journaled by the worker as `context_usage`
+ *  events). When a context window is configured the length is rendered
+ *  against it with a thin progress bar; additional status items can be
+ *  appended as siblings. */
 export default function StatusBar({
   status,
   tokens,
@@ -47,6 +57,9 @@ export default function StatusBar({
   model,
   modelEnabled,
   onSwitchModel,
+  skills,
+  skillEnabled,
+  onLoadSkill,
 }: Props) {
   const pct =
     tokens !== null && contextWindow !== null && contextWindow > 0
@@ -91,6 +104,28 @@ export default function StatusBar({
               </option>
             ))
           )}
+        </select>
+      </label>
+      <label
+        className="skill-switch"
+        title="Load a skill — its full SKILL.md is sent to the session as a new user message and the worker respawns (a one-off load; unlike the skills chosen in the New session form, it is not persisted)"
+      >
+        <select
+          className="mode-select skill-select"
+          value=""
+          onChange={(e) => {
+            if (e.target.value) onLoadSkill(e.target.value)
+          }}
+          disabled={!skillEnabled || skills.length === 0}
+        >
+          <option value="" disabled>
+            {skills.length === 0 ? 'no skills' : 'Load a skill…'}
+          </option>
+          {skills.map((s) => (
+            <option key={s.name} value={s.name}>
+              {s.name}
+            </option>
+          ))}
         </select>
       </label>
       <span className={`badge badge-${status}`}>{status}</span>

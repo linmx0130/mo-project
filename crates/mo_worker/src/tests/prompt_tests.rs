@@ -13,7 +13,7 @@ fn scratch(dir: &tempfile::TempDir) -> std::path::PathBuf {
 }
 
 fn prompt_for(mode: Mode, dir: &tempfile::TempDir, agents: &tempfile::TempDir) -> String {
-    build_system_prompt(dir.path(), agents.path(), 0, mode, &scratch(dir))
+    build_system_prompt(dir.path(), agents.path(), 0, mode, &scratch(dir), &[])
 }
 
 #[test]
@@ -64,7 +64,14 @@ fn all_modes_mention_permission_requests() {
 fn no_agents_md_is_fine() {
     let dir = tempfile::tempdir().unwrap();
     let agents = tempfile::tempdir().unwrap();
-    let prompt = build_system_prompt(dir.path(), agents.path(), 2, Mode::Build, &scratch(&dir));
+    let prompt = build_system_prompt(
+        dir.path(),
+        agents.path(),
+        2,
+        Mode::Build,
+        &scratch(&dir),
+        &[],
+    );
     assert!(prompt.contains("subagent (nesting depth 2)"));
 }
 
@@ -75,7 +82,14 @@ fn no_agents_md_is_fine() {
 fn depth_zero_is_not_framed_as_subagent() {
     let dir = tempfile::tempdir().unwrap();
     let agents = tempfile::tempdir().unwrap();
-    let prompt = build_system_prompt(dir.path(), agents.path(), 0, Mode::Build, &scratch(&dir));
+    let prompt = build_system_prompt(
+        dir.path(),
+        agents.path(),
+        0,
+        Mode::Build,
+        &scratch(&dir),
+        &[],
+    );
     assert!(
         !prompt.contains("spawned by another agent"),
         "a root session must not be framed as a subagent: {prompt}"
@@ -91,7 +105,14 @@ fn depth_zero_is_not_framed_as_subagent() {
 fn depth_one_is_framed_as_subagent() {
     let dir = tempfile::tempdir().unwrap();
     let agents = tempfile::tempdir().unwrap();
-    let prompt = build_system_prompt(dir.path(), agents.path(), 1, Mode::Build, &scratch(&dir));
+    let prompt = build_system_prompt(
+        dir.path(),
+        agents.path(),
+        1,
+        Mode::Build,
+        &scratch(&dir),
+        &[],
+    );
     assert!(
         prompt.contains("You are a subagent (nesting depth 1) spawned by another agent."),
         "got: {prompt}"
@@ -162,6 +183,125 @@ fn skill_without_frontmatter_falls_back_to_dir_name() {
     assert!(prompt.contains("Description: (no description)"));
     // The body is not inlined into the system prompt.
     assert!(!prompt.contains("# Just instructions"));
+}
+
+/// Force-loading a skill inlines its FULL SKILL.md into the system prompt
+/// (a "forced skills" section before the on-demand listing) and takes it
+/// out of the load-on-demand list — the model never needs `load_skill` for
+/// it. Non-forced skills stay listed on demand with metadata only.
+#[test]
+fn forced_skills_inline_full_body_and_leave_on_demand_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let agents = tempfile::tempdir().unwrap();
+    // Two skills: one forced, one on-demand.
+    let forced_dir = agents.path().join("forced-skill");
+    std::fs::create_dir_all(&forced_dir).unwrap();
+    std::fs::write(
+        forced_dir.join("SKILL.md"),
+        "---\nname: forced-skill\ndescription: A forced skill.\n---\n# Forced body text\n",
+    )
+    .unwrap();
+    let on_demand_dir = agents.path().join("on-demand-skill");
+    std::fs::create_dir_all(&on_demand_dir).unwrap();
+    std::fs::write(
+        on_demand_dir.join("SKILL.md"),
+        "---\nname: on-demand-skill\ndescription: An on-demand skill.\n---\n# On-demand body text\n",
+    )
+    .unwrap();
+
+    let prompt = build_system_prompt(
+        dir.path(),
+        agents.path(),
+        0,
+        Mode::Build,
+        &scratch(&dir),
+        &["forced-skill".to_string()],
+    );
+    // The forced skill's full body is inlined under its own section.
+    assert!(prompt.contains("Forced skills"));
+    assert!(prompt.contains("# Forced body text"));
+    assert!(prompt.contains("Description: A forced skill."));
+    // The forced skill is NOT in the load-on-demand list...
+    let on_demand_section = prompt
+        .split("Global skills available from")
+        .nth(1)
+        .unwrap_or("");
+    assert!(!on_demand_section.contains("forced-skill"));
+    // ...but the other skill still is, metadata only.
+    assert!(on_demand_section.contains("### on-demand-skill"));
+    assert!(on_demand_section.contains("Description: An on-demand skill."));
+    assert!(!on_demand_section.contains("# On-demand body text"));
+    // The forced-skill section precedes the on-demand list.
+    assert!(
+        prompt.find("Forced skills").unwrap()
+            < prompt
+                .find("Global skills available from")
+                .unwrap_or(usize::MAX)
+    );
+}
+
+/// A forced skill that no longer exists on disk (deleted after the session
+/// was created) is skipped defensively — the prompt still builds and the
+/// other skills behave normally.
+#[test]
+fn forced_skill_that_disappeared_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let agents = tempfile::tempdir().unwrap();
+    let skill = agents.path().join("real-skill");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: real-skill\ndescription: Real.\n---\n# Real body\n",
+    )
+    .unwrap();
+    let prompt = build_system_prompt(
+        dir.path(),
+        agents.path(),
+        0,
+        Mode::Build,
+        &scratch(&dir),
+        &["real-skill".to_string(), "ghost-skill".to_string()],
+    );
+    // The existing forced skill is inlined; the ghost is not mentioned.
+    assert!(prompt.contains("Forced skills"));
+    assert!(prompt.contains("# Real body"));
+    assert!(!prompt.contains("ghost-skill"));
+    // The real skill is out of the on-demand list (it is forced).
+    let on_demand_section = prompt
+        .split("Global skills available from")
+        .nth(1)
+        .unwrap_or("");
+    assert!(!on_demand_section.contains("real-skill"));
+}
+
+/// When every discovered skill is forced, the load-on-demand section (and
+/// its load_skill blurb) is omitted entirely — nothing is left to load.
+#[test]
+fn all_skills_forced_omits_on_demand_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let agents = tempfile::tempdir().unwrap();
+    let skill = agents.path().join("only-skill");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: only-skill\ndescription: Only.\n---\n# Only body\n",
+    )
+    .unwrap();
+    let prompt = build_system_prompt(
+        dir.path(),
+        agents.path(),
+        0,
+        Mode::Build,
+        &scratch(&dir),
+        &["only-skill".to_string()],
+    );
+    assert!(prompt.contains("Forced skills"));
+    assert!(prompt.contains("# Only body"));
+    assert!(!prompt.contains("Global skills available from"));
+    // The on-demand blurb (which teaches the load_skill tool) is gone; the
+    // only remaining mention is the forced-section header telling the model
+    // not to call load_skill for already-loaded skills.
+    assert!(!prompt.contains("Load a skill on demand by calling the load_skill tool"));
 }
 
 #[test]

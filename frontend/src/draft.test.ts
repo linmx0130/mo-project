@@ -1,8 +1,8 @@
 // Tests for the "New session" draft persistence (src/draft.ts), in
-// particular the `bannedTools` field added for per-session tool selection:
-// saved drafts round-trip it, drafts saved before the field existed default
-// to an empty ban list (everything enabled), and malformed entries are
-// dropped defensively.
+// particular the `bannedTools` field added for per-session tool selection
+// and the `skills` field added for forced skill loading: saved drafts
+// round-trip them, drafts saved before the fields existed default to
+// empty lists, and malformed entries are dropped defensively.
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { clearDraft, loadDraft, saveDraft } from './draft'
 
@@ -30,6 +30,7 @@ describe('loadDraft / saveDraft', () => {
       model: 'm',
       mode: 'build' as const,
       bannedTools: [],
+      skills: [],
       text: 'hello',
     }
     saveDraft(draft)
@@ -43,7 +44,22 @@ describe('loadDraft / saveDraft', () => {
       model: 'm',
       mode: 'plan' as const,
       bannedTools: ['ask_user', 'spawn_subagent'],
+      skills: ['j-space'],
       text: 'plan this',
+    }
+    saveDraft(draft)
+    expect(loadDraft()).toEqual(draft)
+  })
+
+  it('round-trips the force-loaded skills list', () => {
+    stubStorage()
+    const draft = {
+      workdir: '/work',
+      model: 'm',
+      mode: 'build' as const,
+      bannedTools: [],
+      skills: ['j-space', 'operate-android-devices-with-bochi'],
+      text: 'hi',
     }
     saveDraft(draft)
     expect(loadDraft()).toEqual(draft)
@@ -61,6 +77,30 @@ describe('loadDraft / saveDraft', () => {
       model: 'm',
       mode: 'build',
       bannedTools: [],
+      skills: [],
+      text: 'hi',
+    })
+  })
+
+  it('drafts saved before skill selection existed default to no forced skills', () => {
+    const store = stubStorage()
+    // The pre-skill-selection draft shape: bannedTools yes, skills no.
+    store.set(
+      'mo-new-session-draft',
+      JSON.stringify({
+        workdir: '/w',
+        model: 'm',
+        mode: 'build',
+        bannedTools: ['ask_user'],
+        text: 'hi',
+      }),
+    )
+    expect(loadDraft()).toEqual({
+      workdir: '/w',
+      model: 'm',
+      mode: 'build',
+      bannedTools: ['ask_user'],
+      skills: [],
       text: 'hi',
     })
   })
@@ -96,6 +136,39 @@ describe('loadDraft / saveDraft', () => {
     expect(loadDraft()?.bannedTools).toEqual([])
   })
 
+  it('drops non-string entries from a hand-edited skills list', () => {
+    const store = stubStorage()
+    store.set(
+      'mo-new-session-draft',
+      JSON.stringify({
+        workdir: '/w',
+        model: 'm',
+        mode: 'build',
+        bannedTools: [],
+        skills: ['j-space', 42, null, 'bochi'],
+        text: 'hi',
+      }),
+    )
+    const draft = loadDraft()
+    expect(draft?.skills).toEqual(['j-space', 'bochi'])
+  })
+
+  it('a non-array skills (older malformed shape) resets to empty', () => {
+    const store = stubStorage()
+    store.set(
+      'mo-new-session-draft',
+      JSON.stringify({
+        workdir: '/w',
+        model: 'm',
+        mode: 'build',
+        bannedTools: [],
+        skills: 'j-space',
+        text: 'hi',
+      }),
+    )
+    expect(loadDraft()?.skills).toEqual([])
+  })
+
   it('clearDraft removes the stored entry', () => {
     const store = stubStorage()
     saveDraft({
@@ -103,6 +176,7 @@ describe('loadDraft / saveDraft', () => {
       model: 'm',
       mode: 'build',
       bannedTools: ['ask_user'],
+      skills: ['j-space'],
       text: 'hi',
     })
     expect(store.has('mo-new-session-draft')).toBe(true)

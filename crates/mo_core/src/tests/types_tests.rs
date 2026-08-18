@@ -516,3 +516,36 @@ fn last_model_marker_scans_from_end() {
     })];
     assert_eq!(last_model_marker(&events), None);
 }
+
+/// A session JSON payload written before skill selection existed (no
+/// `skills` field) deserializes with an empty forced-skill list — legacy
+/// sessions keep working without one.
+#[test]
+fn session_skills_defaults_to_empty() {
+    let json = serde_json::json!({
+        "id": "s1",
+        "parent_id": null,
+        "workdir": "/tmp",
+        "prompt": "do it",
+        "model": "mock",
+        "status": "completed",
+        "mode": "build",
+        "tools": [],
+        "pid": null,
+        "journal_path": "/tmp/j.jsonl",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "heartbeat_at": null,
+        "error": null
+    });
+    let session: Session = serde_json::from_value(json).unwrap();
+    assert!(session.skills.is_empty(), "legacy sessions have no skills");
+
+    // With a `skills` field, it round-trips as given.
+    let mut with_skills = session;
+    with_skills.skills = vec!["j-space".to_string(), "bochi".to_string()];
+    let json = serde_json::to_value(&with_skills).unwrap();
+    assert_eq!(json["skills"][0], "j-space");
+    let back: Session = serde_json::from_value(json).unwrap();
+    assert_eq!(back.skills, with_skills.skills);
+}

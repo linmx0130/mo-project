@@ -29,6 +29,7 @@ fn make_ctx(dir: &tempfile::TempDir, mode: Mode, parent_id: Option<String>) -> T
             status: mo_core::SessionStatus::Running,
             mode,
             tools: vec![],
+            skills: vec![],
             pid: None,
             journal_path: journal.display().to_string(),
             created_at: "now".into(),

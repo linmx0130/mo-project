@@ -28,6 +28,11 @@ export interface Session {
    *  operations are always included. An empty list = all tools (legacy
    *  sessions created before tool selection existed). */
   tools: string[]
+  /** The skills force-loaded for this session (chosen in the "New
+   *  session" form): their full SKILL.md contents are injected into the
+   *  system prompt at the first run. An empty list = no forced skills
+   *  (legacy sessions created before skill selection existed). */
+  skills: string[]
   pid: number | null
   journal_path: string
   created_at: string
@@ -73,6 +78,14 @@ export interface ToolInfo {
   label: string
   description: string
   fixed: boolean
+}
+
+/** One discovered global skill (GET /api/skills): frontmatter name +
+ *  description, for the "New session" skill checkbox list and the
+ *  status-bar "load skill" picker. */
+export interface SkillInfo {
+  name: string
+  description: string
 }
 
 export interface ToolCallInfo {
@@ -288,6 +301,13 @@ export function getTools(): Promise<ToolInfo[]> {
   return http('/api/tools')
 }
 
+/** The discovered global skills (GET /api/skills) for the "New session"
+ *  skill checkbox list and the status-bar "load skill" picker: name +
+ *  description. */
+export function getSkills(): Promise<SkillInfo[]> {
+  return http('/api/skills')
+}
+
 export function getSession(id: string): Promise<Session> {
   return http(`/api/sessions/${id}`)
 }
@@ -296,18 +316,23 @@ export function getSession(id: string): Promise<Session> {
  *  turned off in the "New session" form; disabled tools' schemas are not
  *  injected into the prompt and the worker refuses to execute them. Fixed
  *  tools (bash + file operations) are always available and cannot be
- *  banned; absent/empty bans nothing (all tools enabled). */
+ *  banned; absent/empty bans nothing (all tools enabled). `skills` lists
+ *  the skills the user force-loaded for this session: their full SKILL.md
+ *  contents are injected into the system prompt at the first run.
+ *  Absent/empty force-loads nothing. */
 export function createSession(
   workdir: string,
   prompt: string,
   model?: string,
   mode?: Mode,
   bannedTools?: string[],
+  skills?: string[],
 ): Promise<Session> {
   const body: Record<string, string | string[]> = { workdir, prompt }
   if (model) body.model = model
   if (mode) body.mode = mode
   if (bannedTools && bannedTools.length > 0) body.banned_tools = bannedTools
+  if (skills && skills.length > 0) body.skills = skills
   return http('/api/sessions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -392,6 +417,18 @@ export function postMessage(id: string, content: string): Promise<Session> {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ content }),
+  })
+}
+
+/** Load a skill into a terminal session from the status bar: the backend
+ *  journals the skill's full SKILL.md as a new user message and respawns
+ *  the worker — exactly like a followup, but nothing is persisted on the
+ *  session row (unlike the skills chosen in the "New session" form). */
+export function loadSkill(id: string, name: string): Promise<Session> {
+  return http(`/api/sessions/${id}/skills/load`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
   })
 }
 

@@ -7,6 +7,10 @@
 //! `SKILL.md` plus the absolute path of the skill folder, so the agent can
 //! also read reference files, scripts, and other resources bundled with the
 //! skill.
+//!
+//! Shared by the gateway (the skill list for the UI and the status-bar
+//! "load skill" endpoint) and the worker (the system prompt's on-demand
+//! listing and forced-skill inlining, plus the `load_skill` tool).
 
 use std::path::{Path, PathBuf};
 
@@ -17,6 +21,25 @@ pub struct Skill {
     pub name: String,
     pub description: String,
     pub path: PathBuf,
+}
+
+/// The marker prefix the gateway wraps a status-bar skill load in when it
+/// journals the skill's `SKILL.md` as a user message, so the model
+/// understands that the pasted file is the user force-loading a skill (the
+/// same pattern as the worker's handoff / answer prefixes).
+pub const SKILL_LOAD_USER_PREFIX: &str = "[The user loaded the skill \"%s\" — its SKILL.md \
+     instructions follow. Treat them as active and follow them.]\n\n";
+
+/// The user-role message the gateway journals when the user loads a skill
+/// from the status bar: the skill's full `SKILL.md` content wrapped in a
+/// marker so the model understands what it is (see
+/// `SKILL_LOAD_USER_PREFIX`).
+pub fn skill_load_message(name: &str, content: &str) -> String {
+    format!(
+        "{}{}",
+        SKILL_LOAD_USER_PREFIX.replace("%s", name),
+        content.trim()
+    )
 }
 
 /// Find every global skill under `agents_dir`. Both layouts are supported:
@@ -103,7 +126,7 @@ pub fn parse_skill_md(dir_name: &str, content: &str) -> (String, String) {
     (name, description)
 }
 
-// Unit tests live in `mo_worker/src/tests/skills_tests.rs` (see AGENTS.md).
+// Unit tests live in `mo_core/src/tests/skills_tests.rs` (see AGENTS.md).
 #[cfg(test)]
 #[path = "tests/skills_tests.rs"]
 mod tests;

@@ -62,12 +62,19 @@ pub fn handoff_instruction() -> String {
 /// Explore = investigate only) and `scratch` is the session scratch dir
 /// (`<data_dir>/sessions/<id>/tmp`) where non-Build modes may create/edit/
 /// remove files — the codebase stays read-only for them.
+///
+/// `forced_skills` are the skills the user force-loaded in the "New
+/// session" form (`Session::skills`): their full `SKILL.md` contents are
+/// inlined into the prompt so the model has them from the start (and they
+/// are left out of the on-demand listing — no need to `load_skill` them).
+/// A forced skill that no longer exists on disk is skipped defensively.
 pub fn build_system_prompt(
     workdir: &Path,
     agents_dir: &Path,
     subagent_depth: u32,
     mode: Mode,
     scratch: &Path,
+    forced_skills: &[String],
 ) -> String {
     let mut prompt = String::new();
     prompt.push_str(
@@ -114,17 +121,58 @@ pub fn build_system_prompt(
     }
 
     // Global skills: `<agents_dir>/<skill>/SKILL.md` and
-    // `<agents_dir>/skills/<skill>/SKILL.md`. Only the frontmatter name +
-    // description go into the system prompt; the model pulls the full
+    // `<agents_dir>/skills/<skill>/SKILL.md`. Skills the user force-loaded
+    // in the "New session" form (`forced_skills`) have their FULL SKILL.md
+    // inlined right here — the model has them from the start and never
+    // needs the `load_skill` tool for them. Every other skill is listed by
+    // frontmatter name + description only; the model pulls the full
     // instructions on demand via the `load_skill` tool, which also returns
     // the skill folder path so `read_file` can reach bundled resources.
-    let skills = crate::skills::discover_skills(agents_dir);
-    if !skills.is_empty() {
+    let skills = mo_core::skills::discover_skills(agents_dir);
+    let forced: Vec<String> = forced_skills
+        .iter()
+        .filter_map(|name| {
+            let skill = mo_core::skills::find_skill(agents_dir, name)?;
+            let content = std::fs::read_to_string(skill.path.join("SKILL.md")).ok()?;
+            Some((skill, content))
+        })
+        .map(|(skill, content)| {
+            format!(
+                "### {}\nDescription: {}\n{}",
+                skill.name,
+                if skill.description.is_empty() {
+                    "(no description)"
+                } else {
+                    &skill.description
+                },
+                content.trim()
+            )
+        })
+        .collect();
+    if !forced.is_empty() {
+        prompt.push_str(
+            "Forced skills (the user loaded these for this session — their full \
+             instructions are part of this system prompt, so follow them and do not \
+             call load_skill for them):\n",
+        );
+        for section in &forced {
+            prompt.push_str(section);
+            prompt.push_str("\n\n");
+        }
+    }
+    // The on-demand listing: only the skills that are NOT already loaded.
+    // When every skill is forced, the section (and its load_skill blurb)
+    // is omitted entirely.
+    let on_demand: Vec<&mo_core::skills::Skill> = skills
+        .iter()
+        .filter(|s| !forced_skills.iter().any(|f| f == &s.name))
+        .collect();
+    if !on_demand.is_empty() {
         prompt.push_str(&format!(
-            "Global skills available from {}:\n",
+            "Global skills available from {} (load on demand):\n",
             agents_dir.display()
         ));
-        for skill in &skills {
+        for skill in &on_demand {
             prompt.push_str(&format!("### {}\n", skill.name));
             prompt.push_str(&format!(
                 "Description: {}\n",

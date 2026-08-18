@@ -205,6 +205,7 @@ fn insert_stalled_session(data_dir: &Path, id: &str) {
         status: SessionStatus::Running,
         mode: Mode::Build,
         tools: vec![],
+        skills: vec![],
         pid: Some(std::process::id()),
         journal_path: data_dir
             .join("sessions")
@@ -278,6 +279,7 @@ async fn fresh_heartbeat_is_not_flagged_stalled() {
         status: SessionStatus::Running,
         mode: Mode::Build,
         tools: vec![],
+        skills: vec![],
         pid: Some(std::process::id()),
         journal_path: _dir
             .path()
@@ -778,6 +780,7 @@ fn insert_child_session(
         status,
         mode: Mode::Build,
         tools: vec![],
+        skills: vec![],
         pid: None,
         journal_path: data_dir
             .join("sessions")

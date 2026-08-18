@@ -169,6 +169,10 @@ fn create_child_session(
         // The child inherits the parent's enabled-tool set: a session that
         // banned e.g. `ask_user` does not want its subagents calling it.
         tools: ctx.session.tools.clone(),
+        // The child inherits the parent's force-loaded skills too: a
+        // session whose user loaded skills wants its subagents working
+        // under the same instructions.
+        skills: ctx.session.skills.clone(),
         pid: None,
         journal_path: journal_path.display().to_string(),
         created_at: now.clone(),
