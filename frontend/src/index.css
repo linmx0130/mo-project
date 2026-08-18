@@ -777,7 +777,10 @@ p {
    a badge-like select sharing the mode-select look, tinted with the
    accent. Picking a skill sends its full SKILL.md to the session as a new
    user message and respawns the worker (a one-off load — unlike the skills
-   chosen in the New session form, it is not persisted). */
+   chosen in the New session form, it is not persisted). The select has a
+   fixed width so a skill with a long name does not stretch the status bar:
+   the closed select truncates the name with an ellipsis (the open
+   dropdown still lists the full names). */
 .skill-switch {
   display: flex;
   align-items: center;
@@ -786,6 +789,8 @@ p {
 
 .skill-select {
   color: var(--status-completed);
+  width: 160px;
+  text-overflow: ellipsis;
 }
 
 .mode-select {
