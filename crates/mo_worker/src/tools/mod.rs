@@ -86,7 +86,7 @@ pub fn tool_definitions(enabled: &[String]) -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": TOOL_EDIT_FILE,
-                "description": "Replace old_string with new_string in a file. The match must be unique unless replace_all is true. Returns the full new file content. Paths outside the working directory require the user's approval in the UI; the call is held until the user decides and then completes (or returns a denial error) like any other result. In plan/explore mode, create/edit/remove are only allowed in the session scratch dir and are otherwise denied without asking.",
+                "description": "Replace old_string with new_string in a file. The match must be unique unless replace_all is true. Returns a short confirmation on success — use read_file to inspect the changed content. Paths outside the working directory require the user's approval in the UI; the call is held until the user decides and then completes (or returns a denial error) like any other result. In plan/explore mode, create/edit/remove are only allowed in the session scratch dir and are otherwise denied without asking.",
                 "parameters": {
                     "type": "object",
                     "properties": {

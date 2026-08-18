@@ -75,7 +75,7 @@ Files: `crates/mo_worker/src/{main.rs,config.rs,agent.rs,tools/mod.rs,tools/{fs.
   4. On LLM error: retry with backoff (3 tries, 5s/15s/30s) → then `update_status(failed, error)`, exit 1.
 - **Tools** (OpenAI nested tool JSON; args validated with serde):
   - `read_file(path)` → full UTF-8 file content (cap ~1 MB with explicit truncation note in output).
-  - `edit_file(path, old_string, new_string)` → exact-replacement edit (unique match required; `replace_all` flag optional); returns **full new file content** (per requirement 3).
+  - `edit_file(path, old_string, new_string)` → exact-replacement edit (unique match required; `replace_all` flag optional); returns a short confirmation (the model can `read_file` to inspect the result).
   - `bash(command)` → run via `sh -c` in workdir, 120s timeout, returns full stdout+stderr+exit code (cap ~1 MB).
   - `spawn_subagent(prompt)` → inserts a new session row (`parent_id` = self, same workdir, depth+1 via env), spawns `mo_worker` child process (same exe path), polls child session row (2s interval) until terminal, reads final assistant message from child journal, returns it as the tool result. Refused when depth ≥ cap.
   - Path safety (`tools/fs.rs`): all paths resolved against workdir, canonicalized, rejected if they escape the workdir root.
