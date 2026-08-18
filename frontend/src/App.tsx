@@ -67,6 +67,7 @@ function App() {
           model: '',
           mode: 'build',
           bannedTools: [],
+          skills: [],
           text: '',
         }
         return { ...base, ...patch }

@@ -33,6 +33,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/models", get(list_models))
         .route("/api/modes", get(list_modes))
         .route("/api/tools", get(list_tools))
+        .route("/api/skills", get(list_skills))
         .route("/api/sessions", post(create_session).get(list_sessions))
         .route(
             "/api/sessions/{id}",
@@ -41,6 +42,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/history", get(history))
         .route("/api/sessions/{id}/events", get(sse::events))
         .route("/api/sessions/{id}/messages", post(send_message))
+        .route("/api/sessions/{id}/skills/load", post(load_skill))
         .route("/api/sessions/{id}/mode", post(switch_mode))
         .route("/api/sessions/{id}/model", post(switch_model))
         .route("/api/sessions/{id}/mode/approve", post(approve_mode_change))
@@ -121,6 +123,30 @@ async fn list_tools() -> Json<Vec<mo_core::ToolInfo>> {
     Json(mo_core::TOOLS.to_vec())
 }
 
+/// One discovered global skill (GET /api/skills): frontmatter name +
+/// description, for the "New session" skill checkbox list and the
+/// status-bar "load skill" picker.
+#[derive(Serialize)]
+struct SkillInfo {
+    name: String,
+    description: String,
+}
+
+/// GET /api/skills — every global skill under the agents dir (both
+/// layouts, sorted by name, deduplicated), for the "New session" skill
+/// selection and the status-bar skill picker.
+async fn list_skills(State(state): State<Arc<AppState>>) -> Json<Vec<SkillInfo>> {
+    Json(
+        mo_core::skills::discover_skills(&state.agents_dir)
+            .into_iter()
+            .map(|s| SkillInfo {
+                name: s.name,
+                description: s.description,
+            })
+            .collect(),
+    )
+}
+
 #[derive(Deserialize)]
 struct CreateSessionRequest {
     workdir: String,
@@ -138,6 +164,11 @@ struct CreateSessionRequest {
     /// file operations) are always available and cannot be banned;
     /// absent/empty bans nothing (all tools enabled).
     banned_tools: Option<Vec<String>>,
+    /// The skills (from `GET /api/skills`) the user force-loaded for this
+    /// session: their full `SKILL.md` contents are injected into the
+    /// system prompt at the first run. Every name must be a discovered
+    /// skill; absent/empty force-loads nothing.
+    skills: Option<Vec<String>>,
 }
 
 /// POST /api/sessions — validate workdir, insert the session row, spawn the
@@ -200,6 +231,19 @@ async fn create_session(
     // refuse muted tools (see `mo_core::tools`).
     let tools = mo_core::resolve_enabled_tools(&payload.banned_tools.unwrap_or_default())
         .map_err(ApiError::bad_request)?;
+    // Resolve the force-loaded skills: every name must be a discovered
+    // global skill (the worker inlines their full SKILL.md into the system
+    // prompt at the first run). Deduplicated preserving order, so a
+    // repeated name never inlines the same skill twice.
+    let mut skills: Vec<String> = Vec::new();
+    for name in payload.skills.unwrap_or_default() {
+        if mo_core::skills::find_skill(&state.agents_dir, &name).is_none() {
+            return Err(ApiError::bad_request(format!("unknown skill: {name}")));
+        }
+        if !skills.iter().any(|s| s == &name) {
+            skills.push(name);
+        }
+    }
     let mut session = Session {
         id: id.clone(),
         parent_id: None,
@@ -209,6 +253,7 @@ async fn create_session(
         status: SessionStatus::Pending,
         mode,
         tools,
+        skills,
         pid: None,
         journal_path: journal_path.display().to_string(),
         created_at: now.clone(),
@@ -292,16 +337,52 @@ async fn send_message(
     if payload.content.trim().is_empty() {
         return Err(ApiError::bad_request("message must not be empty"));
     }
-    let (status, pid, journal_path, mode, model) = {
+    ensure_followup_allowed(&state, &id)?;
+    journal_followup_and_spawn(&state, &id, &payload.content).await
+}
+
+#[derive(Deserialize)]
+struct LoadSkillRequest {
+    /// Skill name from `GET /api/skills`; must match a discovered skill.
+    name: String,
+}
+
+/// POST /api/sessions/:id/skills/load — the user force-loads a skill from
+/// the status bar: the skill's full `SKILL.md` is journaled as a new user
+/// message (wrapped in a marker so the model understands it is the user
+/// loading a skill) and the worker respawns, exactly like a followup
+/// message. The load is a one-off message — it is *not* persisted on the
+/// session row (unlike the skills chosen in the "New session" form, which
+/// are injected into the system prompt).
+async fn load_skill(
+    State(state): State<Arc<AppState>>,
+    PathParam(id): PathParam<String>,
+    Json(payload): Json<LoadSkillRequest>,
+) -> ApiResult<(StatusCode, Json<Session>)> {
+    if payload.name.trim().is_empty() {
+        return Err(ApiError::bad_request("skill name must not be empty"));
+    }
+    let skill = mo_core::skills::find_skill(&state.agents_dir, &payload.name)
+        .ok_or_else(|| ApiError::bad_request(format!("skill not found: {}", payload.name)))?;
+    let content = std::fs::read_to_string(skill.path.join("SKILL.md"))
+        .map_err(|e| ApiError::internal(format!("failed to read skill {}: {e}", payload.name)))?;
+    ensure_followup_allowed(&state, &id)?;
+    journal_followup_and_spawn(
+        &state,
+        &id,
+        &mo_core::skills::skill_load_message(&skill.name, &content),
+    )
+    .await
+}
+
+/// Validate that a session may accept a followup (a new user message or a
+/// status-bar skill load): it must exist, be terminal, and its dead worker
+/// must be fully reaped. Shared by `send_message` and `load_skill`.
+fn ensure_followup_allowed(state: &AppState, id: &str) -> ApiResult<()> {
+    let (status, pid) = {
         let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
-        match db::get_session(&conn, &id).map_err(ApiError::internal)? {
-            Some(session) => (
-                session.status,
-                session.pid,
-                session.journal_path,
-                session.mode,
-                session.model,
-            ),
+        match db::get_session(&conn, id).map_err(ApiError::internal)? {
+            Some(session) => (session.status, session.pid),
             None => return Err(ApiError::not_found("session not found")),
         }
     };
@@ -313,6 +394,26 @@ async fn send_message(
     if pid.is_some_and(process::is_pid_alive) {
         return Err(ApiError::conflict("session worker is still shutting down"));
     }
+    Ok(())
+}
+
+/// Journal a followup user message (with the mode/model-change notices
+/// injected when the session's mode or model was switched since the last
+/// run), reset the session to `pending`, and spawn a fresh worker — the
+/// shared tail of `send_message` (followup messages) and `load_skill`
+/// (status-bar skill loads).
+async fn journal_followup_and_spawn(
+    state: &AppState,
+    id: &str,
+    content: &str,
+) -> ApiResult<(StatusCode, Json<Session>)> {
+    let (journal_path, mode, model) = {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        match db::get_session(&conn, id).map_err(ApiError::internal)? {
+            Some(session) => (session.journal_path, session.mode, session.model),
+            None => return Err(ApiError::not_found("session not found")),
+        }
+    };
 
     // Journal the user message; the worker's context is rebuilt from the
     // journal, so this is what continues the conversation.
@@ -344,7 +445,7 @@ async fn send_message(
             // same deterministic path the worker creates and canonicalizes
             // on the first run) — embedded in the message text so the model
             // is told where it *may* write.
-            let scratch = state.data_dir.join("sessions").join(&id).join("tmp");
+            let scratch = state.data_dir.join("sessions").join(id).join("tmp");
             let scratch = scratch.canonicalize().unwrap_or(scratch);
             journal
                 .append(JournalEventKind::ModeChange {
@@ -383,7 +484,7 @@ async fn send_message(
         journal
             .append(JournalEventKind::Message(JournalMessage {
                 role: "user".to_string(),
-                content: payload.content.clone(),
+                content: content.to_string(),
                 reasoning_content: None,
                 tool_call_id: None,
                 tool_calls: None,
@@ -398,17 +499,17 @@ async fn send_message(
         // The title is untouched: followups never rename a session (new
         // sessions get their title from the gateway-side generator at
         // creation).
-        db::clear_pid(&conn, &id).map_err(ApiError::internal)?;
-        db::update_status(&conn, &id, SessionStatus::Pending, None).map_err(ApiError::internal)?;
+        db::clear_pid(&conn, id).map_err(ApiError::internal)?;
+        db::update_status(&conn, id, SessionStatus::Pending, None).map_err(ApiError::internal)?;
     }
 
     let mut session = {
         let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
-        db::get_session(&conn, &id)
+        db::get_session(&conn, id)
             .map_err(ApiError::internal)?
             .expect("session row exists")
     };
-    spawn_and_patch(&state, &mut session);
+    spawn_and_patch(state, &mut session);
 
     Ok((StatusCode::ACCEPTED, Json(session)))
 }

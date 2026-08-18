@@ -141,6 +141,15 @@ pub struct Session {
     /// means "all tools" — the legacy default for sessions created before
     /// tool selection existed.
     pub tools: Vec<String>,
+    /// The skills force-loaded for this session (skill names chosen in the
+    /// "New session" form's skill list). Their full `SKILL.md` contents are
+    /// injected into the system prompt at the first run (and again after a
+    /// context compression), so the model has them from the start — no
+    /// `load_skill` call needed. `#[serde(default)]` keeps rows/journals
+    /// written before skill selection existed parseable; an empty list
+    /// means "no forced skills".
+    #[serde(default)]
+    pub skills: Vec<String>,
     pub pid: Option<u32>,
     pub journal_path: String,
     pub created_at: String,

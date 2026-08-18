@@ -82,6 +82,7 @@ fn insert_session(state: &AppState, id: &str, mode: Mode) -> Session {
         status: SessionStatus::Completed,
         mode,
         tools: vec![],
+        skills: vec![],
         pid: None,
         journal_path: state
             .data_dir
@@ -1603,4 +1604,300 @@ async fn create_session_rejects_bad_bans() {
     // Nothing was created.
     let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
     assert!(db::list_sessions(&conn).unwrap().is_empty());
+}
+
+/// Write a skill into the test app's agents dir (both layouts work; the
+/// helper defaults to the top-level layout).
+fn write_skill(app: &TestApp, rel_dir: &str, name: &str, description: &str, body: &str) {
+    let dir = app.state.agents_dir.join(rel_dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let content = format!("---\nname: {name}\ndescription: {description}\n---\n{body}\n");
+    std::fs::write(dir.join("SKILL.md"), content).unwrap();
+}
+
+/// POST a status-bar skill load with a JSON body.
+async fn post_skill_load(
+    app: &Arc<AppState>,
+    id: &str,
+    body: &str,
+) -> (StatusCode, serde_json::Value) {
+    let router = create_router(app.clone());
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/sessions/{id}/skills/load"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
+/// GET /api/skills serves every discovered global skill (both layouts,
+/// sorted by name) for the "New session" skill list and the status-bar
+/// skill picker: name + description.
+#[tokio::test]
+async fn list_skills_serves_discovered_skills() {
+    let app = test_app();
+    write_skill(
+        &app,
+        "beta-skill",
+        "beta-skill",
+        "Does beta.",
+        "# Beta body",
+    );
+    write_skill(
+        &app,
+        "skills/alpha-skill",
+        "alpha-skill",
+        "Does alpha.",
+        "# Alpha body",
+    );
+    let router = create_router(app.state.clone());
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/skills")
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let skills = value.as_array().expect("a JSON array");
+    let names: Vec<&str> = skills.iter().map(|s| s["name"].as_str().unwrap()).collect();
+    // Sorted by name; metadata only — the SKILL.md bodies are not served
+    // here (the worker reads them from disk when building the prompt).
+    assert_eq!(names, ["alpha-skill", "beta-skill"]);
+    assert_eq!(skills[0]["description"], "Does alpha.");
+    assert_eq!(skills[1]["description"], "Does beta.");
+    assert!(!skills[0].to_string().contains("# Alpha body"));
+
+    // An agents dir with no skills serves an empty list.
+    let app = test_app();
+    let router = create_router(app.state.clone());
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/skills")
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value.as_array().expect("a JSON array").len(), 0);
+}
+
+/// Creating a session with `skills` stores the force-loaded skill names on
+/// the session row (and echoes them in the response); the worker later
+/// inlines their full SKILL.md into the system prompt.
+#[tokio::test]
+async fn create_session_with_skills_stores_them() {
+    let app = test_app();
+    write_skill(&app, "j-space", "j-space", "Thinks harder.", "# J body");
+    write_skill(
+        &app,
+        "skills/bochi",
+        "bochi",
+        "Drives Android devices.",
+        "# Bochi body",
+    );
+    let workdir = app.state.cwd.display().to_string();
+    let body =
+        format!(r#"{{"workdir":"{workdir}","prompt":"do it","skills":["j-space","bochi"]}}"#);
+    let (status, value) = post_create_session(&app.state, &body).await;
+    assert_eq!(status, StatusCode::CREATED, "body: {value}");
+    let id = value["id"].as_str().unwrap().to_string();
+    let skills: Vec<String> = value["skills"]
+        .as_array()
+        .expect("skills array")
+        .iter()
+        .map(|s| s.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(skills, ["j-space", "bochi"]);
+
+    // The DB row carries the same list (the worker reads it back when
+    // building the system prompt).
+    let row = {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::get_session(&conn, &id).unwrap().unwrap()
+    };
+    assert_eq!(row.skills, skills);
+}
+
+/// Without `skills` no skill is force-loaded (the default); duplicates in
+/// the request are deduplicated.
+#[tokio::test]
+async fn create_session_defaults_to_no_skills_and_dedupes() {
+    let app = test_app();
+    write_skill(&app, "alpha", "alpha", "Does alpha.", "# Alpha body");
+    let workdir = app.state.cwd.display().to_string();
+
+    let body = format!(r#"{{"workdir":"{workdir}","prompt":"do it"}}"#);
+    let (status, value) = post_create_session(&app.state, &body).await;
+    assert_eq!(status, StatusCode::CREATED, "body: {value}");
+    assert_eq!(
+        value["skills"].as_array().expect("skills array").len(),
+        0,
+        "body: {value}"
+    );
+
+    let body = format!(r#"{{"workdir":"{workdir}","prompt":"do it","skills":["alpha","alpha"]}}"#);
+    let (status, value) = post_create_session(&app.state, &body).await;
+    assert_eq!(status, StatusCode::CREATED, "body: {value}");
+    let skills: Vec<String> = value["skills"]
+        .as_array()
+        .expect("skills array")
+        .iter()
+        .map(|s| s.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(skills, ["alpha"], "duplicates must be dropped: {skills:?}");
+}
+
+/// An unknown skill name in `skills` is a bad request — no session is
+/// created.
+#[tokio::test]
+async fn create_session_rejects_unknown_skills() {
+    let app = test_app();
+    let workdir = app.state.cwd.display().to_string();
+    let body = format!(r#"{{"workdir":"{workdir}","prompt":"do it","skills":["ghost-skill"]}}"#);
+    let (status, value) = post_create_session(&app.state, &body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {value}");
+    assert!(value.to_string().contains("unknown skill"), "body: {value}");
+    let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(db::list_sessions(&conn).unwrap().is_empty());
+}
+
+/// The status-bar skill load: the skill's full SKILL.md is journaled as a
+/// new user message (wrapped in the load marker) and the worker respawns —
+/// exactly like a followup, but nothing is persisted on the session row.
+#[tokio::test]
+async fn load_skill_journals_skill_message_and_respawns() {
+    let app = test_app();
+    write_skill(&app, "j-space", "j-space", "Thinks harder.", "# J body");
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    append_kinds(
+        &session.journal_path,
+        &[
+            user_msg("hi"),
+            system_prompt(Mode::Build),
+            assistant_msg("done"),
+        ],
+    );
+
+    let (status, body) = post_skill_load(&app.state, "s1", r#"{"name":"j-space"}"#).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
+    assert_eq!(body["status"], "pending", "body: {body}");
+    assert!(
+        body["pid"].is_number(),
+        "worker should be respawned: {body}"
+    );
+
+    let kinds = read_kinds(&app, "s1");
+    assert_eq!(kinds.len(), 4, "kinds: {kinds:#?}");
+    match &kinds[3] {
+        JournalEventKind::Message(m) if m.role == "user" => {
+            assert!(
+                m.content.contains("[The user loaded the skill \"j-space\""),
+                "content: {}",
+                m.content
+            );
+            assert!(m.content.contains("Treat them as active and follow them."));
+            assert!(m.content.contains("# J body"), "content: {}", m.content);
+        }
+        other => panic!("expected the skill-load user message at seq 3, got: {other:?}"),
+    }
+    // The load is a one-off message: the session row's skills are untouched.
+    let row = {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::get_session(&conn, "s1").unwrap().unwrap()
+    };
+    assert!(row.skills.is_empty(), "row skills: {:?}", row.skills);
+}
+
+/// Unknown skill -> 400, empty name -> 400, unknown session -> 404, and a
+/// running session -> 409; nothing is journaled on a rejected load.
+#[tokio::test]
+async fn load_skill_rejects_unknown_empty_running() {
+    let app = test_app();
+    write_skill(&app, "alpha", "alpha", "Does alpha.", "# Alpha body");
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    append_kinds(
+        &session.journal_path,
+        &[
+            user_msg("hi"),
+            system_prompt(Mode::Build),
+            assistant_msg("done"),
+        ],
+    );
+
+    let (status, value) = post_skill_load(&app.state, "s1", r#"{"name":"ghost"}"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {value}");
+    assert!(
+        value.to_string().contains("skill not found"),
+        "body: {value}"
+    );
+
+    let (status, _) = post_skill_load(&app.state, "s1", r#"{"name":"  "}"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) = post_skill_load(&app.state, "nope", r#"{"name":"alpha"}"#).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::update_status(&conn, "s1", SessionStatus::Running, None).unwrap();
+    }
+    let (status, _) = post_skill_load(&app.state, "s1", r#"{"name":"alpha"}"#).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Nothing was journaled by any of the rejected loads.
+    let kinds = read_kinds(&app, "s1");
+    assert_eq!(kinds.len(), 3, "kinds: {kinds:#?}");
+    assert!(
+        !kinds
+            .iter()
+            .any(|k| matches!(k, JournalEventKind::Message(m) if m.role == "user" && m.content.contains("Alpha body"))),
+        "kinds: {kinds:#?}"
+    );
+}
+
+/// The status-bar skill load goes through the same followup path as a
+/// message: a mode switched since the last run still injects the single
+/// mode-change notice right before the loaded skill.
+#[tokio::test]
+async fn load_skill_injects_mode_change_when_switched() {
+    let app = test_app();
+    write_skill(&app, "alpha", "alpha", "Does alpha.", "# Alpha body");
+    let session = insert_session(&app.state, "s1", Mode::Plan);
+    append_kinds(
+        &session.journal_path,
+        &[
+            user_msg("hi"),
+            system_prompt(Mode::Build),
+            assistant_msg("done"),
+        ],
+    );
+
+    let (status, _) = post_skill_load(&app.state, "s1", r#"{"name":"alpha"}"#).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let kinds = read_kinds(&app, "s1");
+    assert_eq!(kinds.len(), 5, "kinds: {kinds:#?}");
+    match &kinds[3] {
+        JournalEventKind::ModeChange { mode, .. } => assert_eq!(*mode, Mode::Plan),
+        other => panic!("expected the mode-change notice at seq 3, got: {other:?}"),
+    }
+    match &kinds[4] {
+        JournalEventKind::Message(m) if m.role == "user" => {
+            assert!(m.content.contains("# Alpha body"), "content: {}", m.content);
+        }
+        other => panic!("expected the skill-load user message at seq 4, got: {other:?}"),
+    }
 }

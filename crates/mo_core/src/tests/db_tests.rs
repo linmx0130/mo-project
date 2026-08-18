@@ -16,6 +16,7 @@ fn sample_session(id: &str) -> Session {
         status: SessionStatus::Pending,
         mode: Mode::Build,
         tools: vec![],
+        skills: vec![],
         pid: None,
         journal_path: format!("/tmp/work/{id}/journal.jsonl"),
         created_at: now.clone(),
@@ -258,4 +259,78 @@ fn null_tools_column_reads_back_empty() {
     .unwrap();
     let fetched = get_session(&conn, "legacy").unwrap().unwrap();
     assert!(fetched.tools.is_empty(), "NULL tools must read back empty");
+}
+
+/// The forced-skill list round-trips through the DB as a JSON array.
+#[test]
+fn skills_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open(&dir.path().join("mo.db")).unwrap();
+    let mut session = sample_session("s1");
+    session.skills = vec!["j-space".to_string(), "bochi".to_string()];
+    create_session(&conn, &session).unwrap();
+
+    let fetched = get_session(&conn, "s1").unwrap().expect("session exists");
+    assert_eq!(fetched.skills, session.skills);
+}
+
+/// A `NULL` skills column (rows created before skill selection existed)
+/// reads back as an empty list — no skill is force-loaded.
+#[test]
+fn null_skills_column_reads_back_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open(&dir.path().join("mo.db")).unwrap();
+    // Insert a row without the skills value (NULL), as legacy code paths
+    // would have done before the column existed.
+    conn.execute(
+        "INSERT INTO sessions (id, parent_id, workdir, prompt, model, status, mode, tools, pid, journal_path, created_at, updated_at, heartbeat_at, error)
+         VALUES ('legacy', NULL, '/tmp', 'old', 'm', 'completed', 'build', NULL, NULL, '/tmp/j.jsonl', 't', 't', NULL, NULL)",
+        [],
+    )
+    .unwrap();
+    let fetched = get_session(&conn, "legacy").unwrap().unwrap();
+    assert!(
+        fetched.skills.is_empty(),
+        "NULL skills must read back empty"
+    );
+}
+
+/// A database created before skill selection existed (no `skills` column)
+/// is migrated in place: the column is added and existing rows read back
+/// with no forced skills.
+#[test]
+fn migration_adds_skills_column_to_legacy_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mo.db");
+    // Create a pre-skills-schema DB by hand (no skills column) with one row.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY, parent_id TEXT NULL, workdir TEXT NOT NULL,
+                    prompt TEXT NOT NULL, model TEXT NOT NULL, status TEXT NOT NULL,
+                    mode TEXT NOT NULL, tools TEXT, pid INTEGER NULL, journal_path TEXT NOT NULL,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    heartbeat_at TEXT NULL, error TEXT NULL
+                );
+                INSERT INTO sessions (id, workdir, prompt, model, status, mode, tools, journal_path, created_at, updated_at)
+                VALUES ('legacy', '/tmp', 'old session', 'm', 'completed', 'build', NULL, '/tmp/j.jsonl', 't', 't');",
+            )
+            .unwrap();
+    }
+    // Opening through `open` migrates it: the skills column appears and the
+    // legacy row reads back with no forced skills.
+    let conn = open(&path).unwrap();
+    let fetched = get_session(&conn, "legacy").unwrap().unwrap();
+    assert!(
+        fetched.skills.is_empty(),
+        "legacy rows have no forced skills"
+    );
+    assert_eq!(fetched.mode, Mode::Build);
+
+    // Re-opening is idempotent (no duplicate column error).
+    drop(conn);
+    let conn = open(&path).unwrap();
+    let fetched = get_session(&conn, "legacy").unwrap().unwrap();
+    assert!(fetched.skills.is_empty());
 }

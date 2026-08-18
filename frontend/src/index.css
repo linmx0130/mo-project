@@ -773,6 +773,21 @@ p {
   color: var(--status-pending);
 }
 
+/* Skill picker in the status bar, side-by-side with the model picker:
+   a badge-like select sharing the mode-select look, tinted with the
+   accent. Picking a skill sends its full SKILL.md to the session as a new
+   user message and respawns the worker (a one-off load — unlike the skills
+   chosen in the New session form, it is not persisted). */
+.skill-switch {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.skill-select {
+  color: var(--status-completed);
+}
+
 .mode-select {
   appearance: none;
   -webkit-appearance: none;
@@ -886,21 +901,72 @@ p {
   color: var(--muted);
 }
 
-/* The tool checkbox list in the new-session form: a compact single-column
-   list; each row reads "☑ Tool name – description". */
-.tools-field {
-  border: none;
-  padding: 0;
-  margin: 0;
-  gap: 6px;
-}
-
-.tools-field legend {
-  padding: 0;
-}
-
+/* The tool/skill checkbox lists in the new-session form: a compact
+   single-column list; each row reads "☑ Tool name – description". Both
+   lists live inside foldable sections (see `.fold-section` below). */
 .tools-hint {
   font-size: 12px;
+}
+
+/* Foldable sections (Tools / Skills) in the new-session form: a compact
+   bordered card whose `<summary>` row toggles the checkbox list. Folded by
+   default (no `open` attribute), so the page stays compact — the defaults
+   (all tools, no forced skills) are right for the common flow. */
+.fold-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 6px 10px;
+  margin: 0;
+}
+
+.fold-section summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--muted);
+}
+
+/* Remove the native disclosure triangle; draw a caret that flips open. */
+.fold-section summary::-webkit-details-marker {
+  display: none;
+}
+
+.fold-section summary::before {
+  content: '▸';
+  font-size: 11px;
+  transition: transform 0.15s ease;
+}
+
+.fold-section[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.fold-section summary:hover {
+  color: var(--text-h);
+}
+
+/* Count badge in a section header ("2 disabled" / "1 loaded"), shown only
+   when the section differs from its default. */
+.fold-count {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--accent);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 8px;
 }
 
 .tools-grid {

@@ -279,7 +279,7 @@ struct RemoveFileArgs {
 /// session scratch dir — the same set the permission policy and the fs call
 /// classify against.
 fn read_roots(ctx: &ToolContext) -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = crate::skills::discover_skills(&ctx.agents_dir)
+    let mut roots: Vec<PathBuf> = mo_core::skills::discover_skills(&ctx.agents_dir)
         .into_iter()
         .map(|s| s.path)
         .collect();
@@ -421,7 +421,7 @@ pub async fn execute_tool(
             // `read_file` may also read global skill folders and the
             // session scratch dir, so pass those roots as extra allowed
             // roots (both for the permission policy and the fs call).
-            let mut roots: Vec<PathBuf> = crate::skills::discover_skills(&ctx.agents_dir)
+            let mut roots: Vec<PathBuf> = mo_core::skills::discover_skills(&ctx.agents_dir)
                 .into_iter()
                 .map(|s| s.path)
                 .collect();

@@ -33,9 +33,9 @@ Frontend  <->  Gateway Service  <->  Agent worker(s)
 
 | Piece | Role |
 | --- | --- |
-| `mo_core` | Shared types, JSONL journal I/O, SQLite metadata DB (WAL), TOML config, the session-mode registry (`build` / `plan` / `explore`) |
-| `mo_gateway` | axum HTTP service: sessions CRUD, history, SSE live updates, worker spawn/kill, mode switching (port 3031) |
-| `mo_worker` | One process per session: runs the LLM agent loop (via `nah_chat`) with tools `read_file`, `edit_file`, `create_file`, `remove_file`, `bash`, `bash_in_background`, `spawn_subagent`, `load_skill`, `request_mode_change`, `ask_user`; journals the system prompt once and reuses it verbatim on every run. The tool set is chosen per session in the "New session" form: `bash` + the file operations are always available, the rest may be disabled — disabled tools' schemas are not injected into the prompt and the worker refuses to execute them |
+| `mo_core` | Shared types, JSONL journal I/O, SQLite metadata DB (WAL), TOML config, the session-mode registry (`build` / `plan` / `explore`), global skill discovery |
+| `mo_gateway` | axum HTTP service: sessions CRUD, history, SSE live updates, worker spawn/kill, mode switching, the skill list + status-bar skill loading (port 3031) |
+| `mo_worker` | One process per session: runs the LLM agent loop (via `nah_chat`) with tools `read_file`, `edit_file`, `create_file`, `remove_file`, `bash`, `bash_in_background`, `spawn_subagent`, `load_skill`, `request_mode_change`, `ask_user`; journals the system prompt once and reuses it verbatim on every run. The tool set is chosen per session in the "New session" form: `bash` + the file operations are always available, the rest may be disabled — disabled tools' schemas are not injected into the prompt and the worker refuses to execute them. Skills the user force-loads in the same form have their full `SKILL.md` inlined into the system prompt |
 | `frontend` | React 19 + Vite + TS UI (Vite dev server on 3030, proxy `/api → :3031`) |
 
 Workers append chat/tool events to a per-session `journal.jsonl` and update
@@ -387,8 +387,11 @@ picker (`build` / `plan` / `explore` — switching a terminal session's mode
 changes only the write sandbox of subsequent runs) with the **model
 picker** side-by-side (switching only affects the next run — the respawned
 worker is spawned with the new model and receives the full journal
-history), the session status badge and the current context length in
-tokens. The length comes from the LLM API — the worker requests
+history), a **Load a skill…** picker (sends the chosen skill's full
+`SKILL.md` to the session as a new user message and respawns the worker —
+see "Loading skills"; disabled while the session is running), the session
+status badge and the current context length in tokens. The length comes
+from the LLM API — the worker requests
 `stream_options.include_usage` and journals the reported
 `usage.prompt_tokens` after every LLM call as a `context_usage` event, so
 the bar live-updates as the conversation grows
@@ -474,6 +477,29 @@ $HOME/.agents/
 - Project instructions (`<workdir>/AGENTS.md`) come after the global
   instructions, so project rules can refine or override user defaults.
 
+### Loading skills
+
+Skills can be **force-loaded** in two ways, both driven by the user (not
+the model):
+
+- **At session creation** — the "New session" form has a **Skills** section
+  (folded by default, next to the foldable Tools section; `GET /api/skills`
+  serves every discovered skill) with one checkbox per skill. Checked
+  skills are stored on the session row (`skills`, a JSON array of skill
+  names) and their **full `SKILL.md` contents are inlined into the system
+  prompt** on the first run (and again after a context compression), so the
+  model has them from the start and they are dropped from the load-on-demand
+  listing. Subagents inherit their parent's loaded skills. Sessions created
+  before skill selection existed have none.
+- **From the status bar** — the status bar has a **Load a skill…** picker
+  next to the model picker (disabled while the session is running). Picking
+  a skill journals its full `SKILL.md` as a **new user message** (wrapped
+  in a marker so the model understands it is the user loading a skill) and
+  respawns the worker, exactly like a followup message — `POST
+  /api/sessions/:id/skills/load`. This is a one-off load: it is not
+  persisted on the session row (unlike the New-session form), so a later
+  context compression can fold it into the handoff like any other message.
+
 ## API
 
 | Endpoint | Description |
@@ -482,12 +508,14 @@ $HOME/.agents/
 | `GET /api/models` | configured models from `mo.toml` (`[{nickname, name, base_url, default}]`; first one is `default`) |
 | `GET /api/modes` | built-in session modes: `[{name, label, description, tools, writable}]` (`build`, `plan`, `explore`) |
 | `GET /api/tools` | the session tool registry for the "New session" checkbox list: `[{name, label, description, fixed}]` — `fixed` (bash + file operations) tools are always available, the rest may be disabled per session |
-| `POST /api/sessions` `{workdir, prompt, model?, mode?, banned_tools?}` | create session + spawn worker (`model` = model name from `/api/models`, default when absent; `mode` = mode name from `/api/modes`, `build` when absent; `banned_tools` = the *toggleable* tools from `/api/tools` to disable for this session — disabled schemas are not injected into the prompt; absent/empty bans nothing, and fixed tools cannot be banned) |
+| `GET /api/skills` | every discovered global skill (both layouts, sorted, deduplicated): `[{name, description}]` — for the "New session" skill checkbox list and the status-bar "load skill" picker |
+| `POST /api/sessions` `{workdir, prompt, model?, mode?, banned_tools?, skills?}` | create session + spawn worker (`model` = model name from `/api/models`, default when absent; `mode` = mode name from `/api/modes`, `build` when absent; `banned_tools` = the *toggleable* tools from `/api/tools` to disable for this session — disabled schemas are not injected into the prompt; absent/empty bans nothing, and fixed tools cannot be banned; `skills` = skill names from `/api/skills` to force-load — their full `SKILL.md` is injected into the system prompt at the first run; absent/empty force-loads nothing, and unknown names are rejected) |
 | `GET /api/sessions` | list root sessions (newest first; subagent sessions are hidden — they are reached through their parent's tool blocks) |
 | `GET /api/sessions/:id` | detail; liveness check flips dead workers to `failed` |
 | `GET /api/sessions/:id/history?after_seq=N` | journal events after `N` |
 | `GET /api/sessions/:id/events` | SSE tail: new events + synthesized status changes |
 | `POST /api/sessions/:id/messages` `{content}` | continue a terminal session: journal the user message (preceded by a `mode_change` notice when the mode was switched since the last run and/or a `model_change` notice when the model was), reset to `pending`, respawn the worker |
+| `POST /api/sessions/:id/skills/load` `{name}` | load a skill from the status bar: journal the skill's full `SKILL.md` as a new user message (wrapped in a marker) and respawn the worker — exactly like a followup, but nothing is persisted on the session row (unknown skill → 400; running session → 409) |
 | `POST /api/sessions/:id/mode` `{mode}` | switch a terminal session's mode (409 while running): changes only the write sandbox of subsequent runs — the journaled system prompt never changes; the switch surfaces as a `mode_change` notice before the next user message |
 | `POST /api/sessions/:id/model` `{model}` | switch a terminal session's model (409 while running): only the next run is affected — the respawned worker is spawned with the new model and receives the full journal history; the switch surfaces as a `model_change` notice before the next run that uses it |
 | `POST /api/sessions/:id/mode/approve` | approve a pending `mode_change_request` (the agent called `request_mode_change`): switch the session's mode to the requested one and continue the run with a single `mode_change` notice (409 unless the journal's last mode marker is a pending request) |

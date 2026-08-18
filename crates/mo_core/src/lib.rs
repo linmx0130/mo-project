@@ -5,6 +5,7 @@ pub mod config;
 pub mod db;
 pub mod journal;
 pub mod modes;
+pub mod skills;
 pub mod tools;
 pub mod types;
 
@@ -16,6 +17,9 @@ pub use journal::{JournalError, JournalWriter, read_events, read_events_after, r
 pub use modes::{
     MODES, ModeInfo, ModeMarker, last_mode_marker, mode_change_approved_message,
     mode_change_message,
+};
+pub use skills::{
+    SKILL_LOAD_USER_PREFIX, Skill, discover_skills, find_skill, parse_skill_md, skill_load_message,
 };
 pub use tools::{
     FIXED_TOOLS, TOGGLEABLE_TOOLS, TOOL_NAMES, TOOLS, ToolInfo, is_enabled, is_fixed,

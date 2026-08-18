@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
-import type { Mode, ModeInfo, ModelInfo, Session, ToolInfo } from '../api'
-import { createSession, getModels, getModes, getTools } from '../api'
+import type { Mode, ModeInfo, ModelInfo, Session, SkillInfo, ToolInfo } from '../api'
+import { createSession, getModels, getModes, getSkills, getTools } from '../api'
 import type { Draft } from '../draft'
 import Composer from './Composer'
 
@@ -17,10 +17,11 @@ interface Props {
 }
 
 /** Placeholder session shown after clicking "New session": a workdir field,
- *  a model picker, a mode picker, a tool checkbox list plus the chat
- *  composer. The backend session is only created on Send. All field values
- *  live in the shared `draft` (App) and are only cleared once a session is
- *  actually created. */
+ *  a model picker, a mode picker, a foldable tool checkbox list and a
+ *  foldable skill checkbox list (both folded by default — the page is busy
+ *  enough without them) plus the chat composer. The backend session is only
+ *  created on Send. All field values live in the shared `draft` (App) and
+ *  are only cleared once a session is actually created. */
 export default function DraftSession({
   draft,
   onDraftChange,
@@ -30,17 +31,19 @@ export default function DraftSession({
   const [models, setModels] = useState<ModelInfo[]>([])
   const [modes, setModes] = useState<ModeInfo[]>([])
   const [tools, setTools] = useState<ToolInfo[]>([])
+  const [skills, setSkills] = useState<SkillInfo[]>([])
   const [sending, setSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  // Load the configured models, modes and tools once. The first model is
-  // the default; it is pre-selected so "just type and send" uses the
-  // default model. The modes are static (build is the default) but fetched
-  // for their descriptions. The tool registry drives the checkbox list
-  // (which tools may be disabled for this session). A draft's stored pick
-  // wins when it is still valid (the lists may have changed between
-  // visits); otherwise it is reset to the default. These checks are
-  // idempotent, so re-running on every draft change is harmless.
+  // Load the configured models, modes, tools and skills once. The first
+  // model is the default; it is pre-selected so "just type and send" uses
+  // the default model. The modes are static (build is the default) but
+  // fetched for their descriptions. The tool registry drives the checkbox
+  // list (which tools may be disabled for this session) and the skill list
+  // drives the force-load checkboxes. A draft's stored pick wins when it is
+  // still valid (the lists may have changed between visits); otherwise it
+  // is reset to the default. These checks are idempotent, so re-running on
+  // every draft change is harmless.
   useEffect(() => {
     let cancelled = false
     getModels()
@@ -68,6 +71,14 @@ export default function DraftSession({
         // Gateway unreachable; the backend default (all tools enabled)
         // applies on send.
       })
+    getSkills()
+      .then((list) => {
+        if (cancelled) return
+        setSkills(list)
+      })
+      .catch(() => {
+        // Gateway unreachable; no skills are force-loaded on send.
+      })
     return () => {
       cancelled = true
     }
@@ -87,6 +98,15 @@ export default function DraftSession({
     }
   }, [modes, draft, onDraftChange])
 
+  useEffect(() => {
+    if (skills.length === 0) return
+    const picked = draft?.skills ?? []
+    const valid = picked.filter((s) => skills.some((k) => k.name === s))
+    if (valid.length !== picked.length) {
+      onDraftChange({ skills: valid })
+    }
+  }, [skills, draft, onDraftChange])
+
   const selectedMode = modes.find((m) => m.name === (draft?.mode ?? 'build'))
 
   /** The toggleable tools the user turned off (draft state; `[]` = all
@@ -100,6 +120,19 @@ export default function DraftSession({
       ? bannedTools.filter((t) => t !== name)
       : [...bannedTools, name]
     onDraftChange({ bannedTools: next })
+  }
+
+  /** The skills the user force-loaded (draft state; `[]` = none). */
+  const forcedSkills = draft?.skills ?? []
+
+  /** Toggle one skill's checkbox: checking force-loads it for this
+   *  session (its full SKILL.md goes into the system prompt), unchecking
+   *  drops it. */
+  const toggleSkill = (name: string, enabled: boolean) => {
+    const next = enabled
+      ? [...forcedSkills, name]
+      : forcedSkills.filter((s) => s !== name)
+    onDraftChange({ skills: next })
   }
 
   const handleSend = async (text: string): Promise<boolean> => {
@@ -116,6 +149,7 @@ export default function DraftSession({
         draft.model || undefined,
         draft.mode,
         bannedTools,
+        forcedSkills,
       )
       onCreated(session)
       return true
@@ -126,14 +160,18 @@ export default function DraftSession({
     }
   }
 
+  const disabledCount = bannedTools.filter((t) =>
+    tools.some((tool) => tool.name === t),
+  ).length
+
   return (
     <div className="draft">
       <header className="session-header">
         <div>
           <h2>New session</h2>
           <p className="muted">
-            Set the working directory, model, mode and tools, then send your
-            first message.
+            Set the working directory, model, mode, tools and skills, then
+            send your first message.
           </p>
         </div>
       </header>
@@ -193,8 +231,16 @@ export default function DraftSession({
             </span>
           )}
         </label>
-        <fieldset className="field tools-field">
-          <legend className="field-label">Tools</legend>
+        {/* The tools and skills checkbox lists are folded by default: the
+            page stays compact, and the defaults (all tools, no forced
+            skills) are right for the common "just type and send" flow. */}
+        <details className="field fold-section tools-field">
+          <summary>
+            <span className="fold-title">Tools</span>
+            {disabledCount > 0 && (
+              <span className="fold-count">{disabledCount} disabled</span>
+            )}
+          </summary>
           <p className="muted tools-hint">
             Bash and file tools are always available. Disable optional tools
             for this session — the agent won&apos;t be able to use them.
@@ -222,7 +268,49 @@ export default function DraftSession({
               )
             })}
           </div>
-        </fieldset>
+        </details>
+        <details className="field fold-section skills-field">
+          <summary>
+            <span className="fold-title">Skills</span>
+            {forcedSkills.length > 0 && (
+              <span className="fold-count">
+                {forcedSkills.length} loaded
+              </span>
+            )}
+          </summary>
+          <p className="muted tools-hint">
+            Force-load global skills for this session: their full SKILL.md
+            instructions are injected into the system prompt, so the agent
+            has them from the start (no load_skill call needed).
+          </p>
+          {skills.length === 0 ? (
+            <p className="muted tools-hint">No skills discovered.</p>
+          ) : (
+            <div className="tools-grid">
+              {skills.map((skill) => {
+                const checked = forcedSkills.includes(skill.name)
+                return (
+                  <label
+                    key={skill.name}
+                    className="tool-option"
+                    title={skill.description}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      disabled={sending}
+                      onChange={(e) =>
+                        toggleSkill(skill.name, e.target.checked)
+                      }
+                    />
+                    <span className="tool-name">{skill.name}</span>
+                    <span className="tool-desc">{skill.description}</span>
+                  </label>
+                )
+              })}
+            </div>
+          )}
+        </details>
         {error && <p className="form-error">{error}</p>}
       </div>
       <Composer

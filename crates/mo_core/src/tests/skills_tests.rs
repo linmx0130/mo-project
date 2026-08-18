@@ -1,5 +1,5 @@
 //! Unit tests for the `skills` module — production code lives in
-//! `mo_worker/src/skills.rs`. Wired from there with `#[cfg(test)] #[path = "tests/skills_tests.rs"] mod tests;` so the tests keep `use super::*` access
+//! `mo_core/src/skills.rs`. Wired from there with `#[cfg(test)] #[path = "tests/skills_tests.rs"] mod tests;` so the tests keep `use super::*` access
 //! to the module's items (private ones included).
 
 use super::*;
@@ -91,4 +91,24 @@ fn parse_skill_md_extracts_frontmatter() {
     // Quoted values are unquoted.
     let (_, desc) = parse_skill_md("x", "---\ndescription: 'quoted value'\n---\nbody");
     assert_eq!(desc, "quoted value");
+}
+
+/// The status-bar load message wraps the skill's SKILL.md in a marker so
+/// the model understands the pasted file is the user force-loading a skill.
+#[test]
+fn skill_load_message_wraps_content_with_marker() {
+    let msg = skill_load_message("j-space", "# Just instructions\n");
+    assert!(msg.starts_with("[The user loaded the skill \"j-space\""));
+    assert!(msg.contains("Treat them as active and follow them."));
+    assert!(msg.contains("# Just instructions"));
+    // Content is trimmed (no trailing newline gluing).
+    assert!(msg.ends_with("# Just instructions"));
+}
+
+/// The prefix's `%s` placeholder is substituted with the skill name.
+#[test]
+fn skill_load_prefix_substitutes_name() {
+    let msg = skill_load_message("my-skill", "body");
+    assert!(!msg.contains("%s"));
+    assert!(msg.contains("my-skill"));
 }

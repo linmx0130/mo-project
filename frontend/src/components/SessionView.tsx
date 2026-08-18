@@ -7,6 +7,7 @@ import type {
   PermissionRequestItem,
   Session,
   SessionStatus,
+  SkillInfo,
 } from '../api'
 import {
   answerAskUser,
@@ -16,6 +17,8 @@ import {
   getHistory,
   getModels,
   getSession,
+  getSkills,
+  loadSkill,
   postMessage,
   rejectModeChange,
   switchMode,
@@ -68,6 +71,9 @@ export default function SessionView({ session, onStatusChange }: Props) {
   }
   // The configured models (GET /api/models), for the status-bar picker.
   const [models, setModels] = useState<ModelInfo[]>([])
+  // The discovered global skills (GET /api/skills), for the status-bar
+  // skill picker.
+  const [skills, setSkills] = useState<SkillInfo[]>([])
 
   useEffect(() => {
     let cancelled = false
@@ -77,6 +83,13 @@ export default function SessionView({ session, onStatusChange }: Props) {
       })
       .catch(() => {
         // Gateway unreachable; the picker stays disabled.
+      })
+    getSkills()
+      .then((list) => {
+        if (!cancelled) setSkills(list)
+      })
+      .catch(() => {
+        // Gateway unreachable; the skill picker stays disabled.
       })
     return () => {
       cancelled = true
@@ -209,6 +222,23 @@ export default function SessionView({ session, onStatusChange }: Props) {
     try {
       const updated = await switchModel(session.id, next)
       setModel(updated.model)
+      onStatusChange()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  /** Load a skill from the status-bar picker (terminal sessions only):
+   *  the backend journals the skill's full SKILL.md as a new user message
+   *  and respawns the worker — exactly like sending a followup. */
+  const handleLoadSkill = async (name: string) => {
+    if (running) return
+    try {
+      const updated = await loadSkill(session.id, name)
+      setStatus(updated.status)
+      // The previous SSE stream closed at the terminal status; re-arm it
+      // so the new run streams in.
+      setRunId((r) => r + 1)
       onStatusChange()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -548,6 +578,9 @@ export default function SessionView({ session, onStatusChange }: Props) {
         model={model}
         modelEnabled={!running}
         onSwitchModel={(next) => void handleModelSwitch(next)}
+        skills={skills}
+        skillEnabled={!running}
+        onLoadSkill={(name) => void handleLoadSkill(name)}
       />
 
       {subagentId && (

@@ -115,6 +115,7 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
                 config.subagent_depth,
                 config.session.mode,
                 &scratch,
+                &config.session.skills,
             );
             journal.append(JournalEventKind::SystemPrompt {
                 content: prompt.clone(),
@@ -156,13 +157,16 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
                     // model context on future rebuilds (it stays visible in
                     // the journal/UI), and a fresh system prompt built from
                     // the current mode anchors the compressed "session"
-                    // (the mode system prompt per spec).
+                    // (the mode system prompt per spec). The forced skills
+                    // are re-inlined too — the compressed session keeps the
+                    // user's loaded skills.
                     let new_system = build_system_prompt(
                         &config.workdir,
                         &config.agents_dir,
                         config.subagent_depth,
                         config.session.mode,
                         &scratch,
+                        &config.session.skills,
                     );
                     journal.append(JournalEventKind::Handoff {
                         content: text,
