@@ -13,7 +13,7 @@ use axum::{
 };
 use mo_core::{
     AskUserMarker, JournalEvent, JournalEventKind, JournalMessage, JournalWriter, Mode,
-    PermissionMarker, Session, SessionStatus, db,
+    PermissionDecision, PermissionMarker, Session, SessionStatus, db,
 };
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
@@ -757,22 +757,31 @@ struct AnswerPermissionRequest {
     /// The id of the pending `permission_request` (`"p1"`, assigned by the
     /// worker); must match the pending request.
     request_id: String,
-    /// Whether the user allowed the request (Allow) or denied it (Deny).
-    allowed: bool,
+    /// For batched requests: the per-item decisions, keyed by each held
+    /// call's id. Must cover exactly the pending request's items — every
+    /// item decided, no unknown ids.
+    #[serde(default)]
+    decisions: BTreeMap<String, bool>,
+    /// Legacy single-item requests (pre-batch journals): the single
+    /// Allow/Deny decision. Ignored when `decisions` is provided.
+    #[serde(default)]
+    allowed: Option<bool>,
 }
 
-/// POST /api/sessions/:id/permission/answer — the user answered a pending
-/// `permission_request` in the UI (clicked Allow or Deny on a file-access
-/// request for a path outside the auto-allowed roots).
+/// POST /api/sessions/:id/permission/answer — the user decided a pending
+/// `permission_request` in the UI (Allow / Deny per path on a batched
+/// file-access request for paths outside the auto-allowed roots).
 ///
-/// Validates the request id against the pending request, journals a
-/// `PermissionAnswered` event carrying the request's tool / operation /
-/// path plus the decision (self-contained, so the worker's history rebuild
-/// can synthesize the model-facing message even after a context
-/// compression), and respawns the worker — the model then retries the tool
-/// call when allowed or finds another way when denied. The session must be
-/// terminal and the journal's last permission marker must be a pending
-/// request.
+/// For a batched request: validates `decisions` covers exactly the pending
+/// request's items (every `call_id` present, no unknowns, non-empty),
+/// journals a `PermissionAnswered` event carrying one `PermissionDecision`
+/// per item — tool / operation / path copied from the request, so the event
+/// is self-contained — and respawns the worker. On resume the worker
+/// re-runs the held calls (allowed → real result, denied → denial error),
+/// so the model receives the outcomes as ordinary tool results. For a
+/// legacy single-item request, the old `allowed` contract is kept. The
+/// session must be terminal and the journal's last permission marker must
+/// be a pending request.
 async fn answer_permission(
     State(state): State<Arc<AppState>>,
     PathParam(id): PathParam<String>,
@@ -794,7 +803,8 @@ async fn answer_permission(
     let events = mo_core::read_events(Path::new(&journal_path)).map_err(ApiError::internal)?;
     // The pending request: the last permission marker is a request, and the
     // request whose id the answer keys. (Stage 1: one request at a time.)
-    let (pending_id, tool, operation, path) = match mo_core::last_permission_marker(&events) {
+    let (pending_id, tool, operation, path, items) = match mo_core::last_permission_marker(&events)
+    {
         Some(PermissionMarker::RequestPending) => events
             .iter()
             .rev()
@@ -804,11 +814,13 @@ async fn answer_permission(
                     tool,
                     operation,
                     path,
+                    items,
                 } => Some((
                     request_id.clone(),
                     tool.clone(),
                     operation.clone(),
                     path.clone(),
+                    items.clone(),
                 )),
                 _ => None,
             })
@@ -826,19 +838,68 @@ async fn answer_permission(
         )));
     }
 
-    {
-        let mut journal =
-            JournalWriter::open(Path::new(&journal_path)).map_err(ApiError::internal)?;
+    let mut journal = JournalWriter::open(Path::new(&journal_path)).map_err(ApiError::internal)?;
+    if !items.is_empty() {
+        // Batched request: the user decided every item. Validate the
+        // decisions cover exactly the items (all present, no unknowns).
+        if payload.decisions.is_empty() {
+            return Err(ApiError::bad_request(
+                "missing decisions: every requested path must be allowed or denied",
+            ));
+        }
+        for call_id in payload.decisions.keys() {
+            if !items.iter().any(|i| &i.call_id == call_id) {
+                return Err(ApiError::bad_request(format!(
+                    "unknown call id: {call_id} (the pending request covers {})",
+                    items.len()
+                )));
+            }
+        }
+        let mut decisions = Vec::with_capacity(items.len());
+        for item in &items {
+            let allowed = payload.decisions.get(&item.call_id).ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "missing decision for call {} (every requested path must be allowed or denied)",
+                    item.call_id
+                ))
+            })?;
+            decisions.push(PermissionDecision {
+                call_id: item.call_id.clone(),
+                tool: item.tool.clone(),
+                operation: item.operation.clone(),
+                path: item.path.clone(),
+                allowed: *allowed,
+            });
+        }
+        journal
+            .append(JournalEventKind::PermissionAnswered {
+                request_id: pending_id,
+                tool: None,
+                operation: None,
+                path: None,
+                allowed: None,
+                decisions,
+            })
+            .map_err(ApiError::internal)?;
+    } else {
+        // Legacy single-item request: the old Allow/Deny contract.
+        let allowed = payload.allowed.ok_or_else(|| {
+            ApiError::bad_request(
+                "missing allowed: the pending legacy request needs a single decision",
+            )
+        })?;
         journal
             .append(JournalEventKind::PermissionAnswered {
                 request_id: pending_id,
                 tool,
                 operation,
                 path,
-                allowed: payload.allowed,
+                allowed: Some(allowed),
+                decisions: Vec::new(),
             })
             .map_err(ApiError::internal)?;
     }
+    drop(journal);
 
     {
         let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());

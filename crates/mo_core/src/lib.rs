@@ -23,6 +23,6 @@ pub use tools::{
 };
 pub use types::{
     AskUserMarker, AskUserOption, AskUserQuestion, JournalEvent, JournalEventKind, JournalMessage,
-    Mode, PermissionMarker, Session, SessionStatus, ToolCallInfo, last_ask_user_marker,
-    last_model_marker, last_permission_marker,
+    Mode, PermissionDecision, PermissionMarker, PermissionRequestItem, Session, SessionStatus,
+    ToolCallInfo, last_ask_user_marker, last_model_marker, last_permission_marker,
 };

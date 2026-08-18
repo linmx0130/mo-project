@@ -71,7 +71,7 @@ pub fn tool_definitions(enabled: &[String]) -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": TOOL_READ_FILE,
-                "description": "Read a UTF-8 text file inside the working directory, the session scratch dir, or a global skill folder (the load_skill tool returns skill folder paths). Output is capped at ~1 MB. Paths outside those roots require the user's approval: a permission request is shown in the UI, and the user's answer arrives as a user message — retry the call only if they allowed it.",
+                "description": "Read a UTF-8 text file inside the working directory, the session scratch dir, or a global skill folder (the load_skill tool returns skill folder paths). Output is capped at ~1 MB. Paths outside those roots require the user's approval in the UI; the call is held until the user decides and then returns the file content (or a denial error) like any other result.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -86,7 +86,7 @@ pub fn tool_definitions(enabled: &[String]) -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": TOOL_EDIT_FILE,
-                "description": "Replace old_string with new_string in a file. The match must be unique unless replace_all is true. Returns the full new file content. Paths outside the working directory require the user's approval: a permission request is shown in the UI (in plan/explore mode, create/edit/remove are only allowed in the session scratch dir and are otherwise denied without asking).",
+                "description": "Replace old_string with new_string in a file. The match must be unique unless replace_all is true. Returns the full new file content. Paths outside the working directory require the user's approval in the UI; the call is held until the user decides and then completes (or returns a denial error) like any other result. In plan/explore mode, create/edit/remove are only allowed in the session scratch dir and are otherwise denied without asking.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -104,7 +104,7 @@ pub fn tool_definitions(enabled: &[String]) -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": TOOL_CREATE_FILE,
-                "description": "Create a new file with the given content inside the working directory. The parent directory must already exist and the file must not exist (use edit_file to modify existing files). Returns the content written. Paths outside the working directory require the user's approval: a permission request is shown in the UI (in plan/explore mode, create/edit/remove are only allowed in the session scratch dir and are otherwise denied without asking).",
+                "description": "Create a new file with the given content inside the working directory. The parent directory must already exist and the file must not exist (use edit_file to modify existing files). Returns the content written. Paths outside the working directory require the user's approval in the UI; the call is held until the user decides and then completes (or returns a denial error) like any other result. In plan/explore mode, create/edit/remove are only allowed in the session scratch dir and are otherwise denied without asking.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -120,7 +120,7 @@ pub fn tool_definitions(enabled: &[String]) -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": TOOL_REMOVE_FILE,
-                "description": "Remove a regular file inside the working directory. Directories and symlinks are refused. Returns a confirmation. Paths outside the working directory require the user's approval: a permission request is shown in the UI (in plan/explore mode, create/edit/remove are only allowed in the session scratch dir and are otherwise denied without asking).",
+                "description": "Remove a regular file inside the working directory. Directories and symlinks are refused. Returns a confirmation. Paths outside the working directory require the user's approval in the UI; the call is held until the user decides and then completes (or returns a denial error) like any other result. In plan/explore mode, create/edit/remove are only allowed in the session scratch dir and are otherwise denied without asking.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -274,6 +274,92 @@ struct CreateFileArgs {
 struct RemoveFileArgs {
     path: String,
 }
+
+/// The extra read roots for `read_file`: global skill folders plus the
+/// session scratch dir — the same set the permission policy and the fs call
+/// classify against.
+fn read_roots(ctx: &ToolContext) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = crate::skills::discover_skills(&ctx.agents_dir)
+        .into_iter()
+        .map(|s| s.path)
+        .collect();
+    roots.push(ctx.scratch.clone());
+    roots
+}
+
+/// Pre-flight one tool call of an assistant message: `Run` unless the call
+/// targets a path outside the allowed roots and the mode permits asking, in
+/// which case the call is held as a `Permission` item (the agent loop
+/// combines the message's held items into one batched permission request
+/// and ends the run — nothing is sent to the model until the user decides).
+/// Non-file tools, unparseable arguments and policy errors (missing file,
+/// plan/explore denial, a remembered denial) are all `Run`: execution then
+/// produces the ordinary tool result or error.
+pub fn preflight(ctx: &ToolContext, name: &str, arguments: &str, call_id: &str) -> Preflight {
+    match name {
+        TOOL_READ_FILE => {
+            let Ok(args) = serde_json::from_str::<ReadFileArgs>(arguments) else {
+                return Preflight::Run;
+            };
+            permission::preflight(
+                ctx,
+                TOOL_READ_FILE,
+                "read",
+                &args.path,
+                arguments,
+                call_id,
+                &read_roots(ctx),
+            )
+        }
+        TOOL_EDIT_FILE => {
+            let Ok(args) = serde_json::from_str::<EditFileArgs>(arguments) else {
+                return Preflight::Run;
+            };
+            permission::preflight(
+                ctx,
+                TOOL_EDIT_FILE,
+                "write",
+                &args.path,
+                arguments,
+                call_id,
+                &[],
+            )
+        }
+        TOOL_CREATE_FILE => {
+            let Ok(args) = serde_json::from_str::<CreateFileArgs>(arguments) else {
+                return Preflight::Run;
+            };
+            permission::preflight(
+                ctx,
+                TOOL_CREATE_FILE,
+                "write",
+                &args.path,
+                arguments,
+                call_id,
+                &[],
+            )
+        }
+        TOOL_REMOVE_FILE => {
+            let Ok(args) = serde_json::from_str::<RemoveFileArgs>(arguments) else {
+                return Preflight::Run;
+            };
+            permission::preflight(
+                ctx,
+                TOOL_REMOVE_FILE,
+                "write",
+                &args.path,
+                arguments,
+                call_id,
+                &[],
+            )
+        }
+        _ => Preflight::Run,
+    }
+}
+
+/// The outcome of pre-flighting one tool call (see `preflight`); re-exported
+/// so the agent loop can name it.
+pub use permission::Preflight;
 
 #[derive(Deserialize)]
 struct BashArgs {

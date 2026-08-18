@@ -80,10 +80,10 @@ pub fn build_system_prompt(
         "Files inside the working directory are freely accessible. read_file may also \
          read the session scratch directory and global skill folders (see \"Global \
          skills\" below). Any other path requires the user's approval: the harness \
-         shows a permission request in the UI, and the user's accept or deny arrives as \
-         a user message — retry the tool call only if they accept. Never attempt to \
-         access files or run commands that escape the working directory without \
-         approval.\n\n",
+         shows a permission request in the UI, holds the call until the user decides, \
+         and then returns the call's outcome (the file content, or a denial error) like \
+         any other result. Never attempt to access files or run commands that escape \
+         the working directory without approval.\n\n",
     );
     prompt.push_str(
         "The harness may compress the context mid-task when it nears the model's context \
@@ -232,8 +232,8 @@ fn tool_usage_rules(mode: Mode, scratch: &Path) -> String {
                (use replace_all only when every occurrence should change).\n\
              - A path outside the working directory (and outside the session scratch\n\
                dir) requires the user's approval: the harness shows a permission request\n\
-               in the UI, and the user's accept or deny arrives as a user message — retry\n\
-               the tool call only if they accept.\n\
+               in the UI, holds the call until the user decides, and then returns the\n\
+               call's outcome (the result, or a denial error) like any other result.\n\
              - Use bash for anything outside the file tools: builds, tests, git, etc.\n\
              - Use bash_in_background for commands that run longer than ~2 minutes:\n\
                it returns a process id immediately; check it with action=status and\n\
@@ -253,9 +253,9 @@ fn tool_usage_rules(mode: Mode, scratch: &Path) -> String {
                scratch directory {} (absolute paths); the codebase is read-only and\n\
                modifications there are denied.\n\
              - Reading a path outside the working directory and the scratch dir shows\n\
-               a permission request to the user in the UI (the answer arrives as a user\n\
-               message); writing outside the scratch dir is denied outright — never\n\
-               asked about.\n\
+               a permission request to the user in the UI (the call is held until the\n\
+               user decides, then returns its outcome); writing outside the scratch dir\n\
+               is denied outright — never asked about.\n\
              - Use bash or bash_in_background for anything outside the file tools\n\
                (builds, tests, git, ...), keeping them read-only.\n\
              - Tool calls in one message run concurrently (up to max_tool_concurrency);\n\

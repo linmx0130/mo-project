@@ -1,5 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { AskUserQuestion, JournalEvent, Mode, ModelInfo, Session, SessionStatus } from '../api'
+import type {
+  AskUserQuestion,
+  JournalEvent,
+  Mode,
+  ModelInfo,
+  PermissionRequestItem,
+  Session,
+  SessionStatus,
+} from '../api'
 import {
   answerAskUser,
   answerPermission,
@@ -272,27 +280,33 @@ export default function SessionView({ session, onStatusChange }: Props) {
     }
     return lastQuestion
   }, [events])
-  // A pending file-access permission request: a file tool asked to read or
-  // write a path outside the auto-allowed roots (journaled as
-  // `permission_request`) and the user has not decided yet. Resolved by a
-  // `permission_answered` event after it. While pending, the composer is
-  // frozen and the Allow / Deny card is shown instead.
+  // A pending file-access permission request: file tools asked to read or
+  // write paths outside the auto-allowed roots (journaled as a batched
+  // `permission_request` with one item per held call) and the user has not
+  // decided yet. Resolved by a `permission_answered` event after it. While
+  // pending, the composer is frozen and the Allow / Deny card is shown
+  // instead. Legacy single-item requests (pre-batch journals) are treated
+  // as a one-item batch.
   const pendingPermission = useMemo(() => {
     let lastRequest: {
       request_id: string
-      tool: string
-      operation: string
-      path: string
+      items: PermissionRequestItem[]
+      legacy?: { tool: string; operation: string; path: string }
       seq: number
     } | null = null
     let lastAnswerSeq: number | null = null
     for (const ev of events) {
       if (ev.kind.kind === 'permission_request') {
+        const kind = ev.kind
         lastRequest = {
-          request_id: ev.kind.request_id,
-          tool: ev.kind.tool,
-          operation: ev.kind.operation,
-          path: ev.kind.path,
+          request_id: kind.request_id,
+          items: kind.items ?? [],
+          legacy:
+            kind.tool !== undefined &&
+            kind.operation !== undefined &&
+            kind.path !== undefined
+              ? { tool: kind.tool, operation: kind.operation, path: kind.path }
+              : undefined,
           seq: ev.seq ?? -1,
         }
       } else if (ev.kind.kind === 'permission_answered') {
@@ -382,20 +396,25 @@ export default function SessionView({ session, onStatusChange }: Props) {
     }
   }
 
-  /** Decide the pending file-access permission request (Allow or Deny):
-   *  the backend journals the decision and resumes the run — the model
-   *  retries the tool call when allowed, or finds another way when denied. */
-  const submitPermission = async (allowed: boolean) => {
+  /** Decide the pending file-access permission request: `decisions` maps
+   *  each held call's id to Allow (true) / Deny (false) and must cover
+   *  every item of the batched request; the backend journals the decisions
+   *  and resumes the run — the held calls then complete (allowed → real
+   *  result, denied → denial error). Legacy single-item requests are
+   *  answered with `allowed` instead. */
+  const submitPermission = async (
+    decisions: Record<string, boolean> | boolean,
+  ) => {
     if (!pendingPermission) return
     setSending(true)
     try {
       const updated = await answerPermission(
         session.id,
         pendingPermission.request_id,
-        allowed,
+        typeof decisions === 'boolean' ? { allowed: decisions } : { decisions },
       )
       setStatus(updated.status)
-      // Re-arm the SSE stream (the run continues with the decision); the
+      // Re-arm the SSE stream (the run continues with the decisions); the
       // effect also refetches the history, which now resolves the request.
       setRunId((r) => r + 1)
       onStatusChange()
@@ -484,14 +503,30 @@ export default function SessionView({ session, onStatusChange }: Props) {
         />
       ) : pendingPermission && !running ? (
         // A file-access request from the agent is awaiting the user's
-        // decision: freeze the input box and show Allow / Deny instead.
+        // decision: freeze the input box and show the Allow / Deny card
+        // listing every requested path instead.
         <PermissionCard
-          tool={pendingPermission.tool}
-          operation={pendingPermission.operation}
-          path={pendingPermission.path}
+          requestId={pendingPermission.request_id}
+          items={
+            pendingPermission.items.length > 0
+              ? pendingPermission.items
+              : pendingPermission.legacy
+                ? [
+                    {
+                      call_id: '',
+                      tool: pendingPermission.legacy.tool,
+                      operation: pendingPermission.legacy.operation,
+                      path: pendingPermission.legacy.path,
+                    },
+                  ]
+                : []
+          }
+          legacy={
+            pendingPermission.items.length === 0 &&
+            pendingPermission.legacy !== undefined
+          }
           busy={sending}
-          onAllow={() => void submitPermission(true)}
-          onDeny={() => void submitPermission(false)}
+          onSubmit={(decisions) => void submitPermission(decisions)}
         />
       ) : (
         <Composer

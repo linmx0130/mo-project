@@ -711,14 +711,19 @@ async fn read_outside_journals_permission_request_and_returns_guidance() {
         match &events[0] {
             JournalEventKind::PermissionRequest {
                 request_id,
-                tool,
-                operation,
-                path,
+                tool: Some(tool),
+                operation: Some(operation),
+                path: Some(path),
+                items,
             } => {
                 assert_eq!(request_id, "p1");
                 assert_eq!(tool, TOOL_READ_FILE);
                 assert_eq!(operation, "read");
                 assert_eq!(path, &outside);
+                // The fallback journals the legacy single-item shape: no
+                // batched items (the batched flow holds calls before
+                // execution instead of reaching this per-call path).
+                assert!(items.is_empty(), "items: {items:#?}");
             }
             other => panic!("expected permission_request, got: {other:?}"),
         }
@@ -754,7 +759,7 @@ async fn write_outside_asks_in_build_but_is_denied_in_plan() {
         assert_eq!(events.len(), 1, "events: {events:#?}");
         assert!(matches!(
             &events[0],
-            JournalEventKind::PermissionRequest { operation, .. } if operation == "write"
+            JournalEventKind::PermissionRequest { operation: Some(op), .. } if op == "write"
         ));
     }
     // The guard is dropped: the Plan branch below awaits execute_tool again.
@@ -814,10 +819,11 @@ async fn allowed_retry_reads_file_without_asking_again() {
     journal
         .append(JournalEventKind::PermissionAnswered {
             request_id: "p1".into(),
-            tool: TOOL_READ_FILE.into(),
-            operation: "read".into(),
-            path: outside.clone(),
-            allowed: true,
+            tool: Some(TOOL_READ_FILE.into()),
+            operation: Some("read".into()),
+            path: Some(outside.clone()),
+            allowed: Some(true),
+            decisions: Vec::new(),
         })
         .unwrap();
     drop(journal);
@@ -853,10 +859,11 @@ async fn denied_retry_is_refused_without_asking_again() {
     journal
         .append(JournalEventKind::PermissionAnswered {
             request_id: "p1".into(),
-            tool: TOOL_READ_FILE.into(),
-            operation: "read".into(),
-            path: outside.clone(),
-            allowed: false,
+            tool: Some(TOOL_READ_FILE.into()),
+            operation: Some("read".into()),
+            path: Some(outside.clone()),
+            allowed: Some(false),
+            decisions: Vec::new(),
         })
         .unwrap();
     drop(journal);
@@ -866,7 +873,7 @@ async fn denied_retry_is_refused_without_asking_again() {
     let err = execute_tool(&ctx, TOOL_READ_FILE, &args, "c1", &no_event)
         .await
         .unwrap_err();
-    assert!(err.contains("denied this request earlier"), "got: {err}");
+    assert!(err.contains("denied permission"), "got: {err}");
 }
 
 /// One pending user-facing request at a time: a pending clarification
@@ -912,9 +919,16 @@ async fn pending_requests_block_new_permission_requests() {
     journal
         .append(JournalEventKind::PermissionRequest {
             request_id: "p1".into(),
-            tool: TOOL_READ_FILE.into(),
-            operation: "read".into(),
-            path: "/etc/a".into(),
+            tool: None,
+            operation: None,
+            path: None,
+            items: vec![mo_core::PermissionRequestItem {
+                call_id: "call_0".into(),
+                tool: TOOL_READ_FILE.into(),
+                operation: "read".into(),
+                path: "/etc/a".into(),
+                arguments: r#"{"path":"/etc/a"}"#.into(),
+            }],
         })
         .unwrap();
     drop(journal);

@@ -180,6 +180,36 @@ pub struct AskUserOption {
     pub option_text: String,
 }
 
+/// One item of a batched file-access permission request: a file tool call
+/// whose path is outside the auto-allowed roots, held for the user's
+/// decision. `call_id` links the item to the tool call in the assistant
+/// message (and its `ToolCallStart` / `ToolResult` journal events) so the
+/// worker can re-run the held call once the user decides;
+/// `tool` / `operation` / `path` drive the UI card and the remembered
+/// `(tool, path)` decision; `arguments` is the call's full original JSON
+/// arguments so the resume re-execution is self-contained.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PermissionRequestItem {
+    pub call_id: String,
+    pub tool: String,
+    pub operation: String,
+    pub path: String,
+    pub arguments: String,
+}
+
+/// One decision of a batched permission answer: whether the user allowed or
+/// denied the `PermissionRequestItem` with the same `call_id`. Carries the
+/// item's `tool` / `operation` / `path` so the event is self-contained (the
+/// remembered-`(tool, path)` scan and the UI summary need no lookup).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PermissionDecision {
+    pub call_id: String,
+    pub tool: String,
+    pub operation: String,
+    pub path: String,
+    pub allowed: bool,
+}
+
 /// One clarification question (`ask_user` tool). Stage 1 supports exactly
 /// one question per tool call — the model calls the tool again for further
 /// questions, and a second call is refused while one is pending.
@@ -416,7 +446,7 @@ pub enum JournalEventKind {
     AskUserAnswered {
         answers: BTreeMap<String, String>,
     },
-    /// The worker's request for user permission to access a file path
+    /// The worker's request for user permission to access file paths
     /// outside the session's auto-allowed roots (the working directory,
     /// the session scratch dir, and — for reads — global skill folders).
     /// Journaled by the worker when a file tool call (`read_file`,
@@ -424,40 +454,73 @@ pub enum JournalEventKind {
     /// the mode permits asking (reads in any mode; writes in `build` mode
     /// only — `plan`/`explore` writes outside the scratch dir are denied
     /// outright, never asked about). The frontend renders it as a
-    /// permission card (Allow / Deny) and freezes the composer while it is
-    /// pending.
+    /// permission card (Allow / Deny per path) and freezes the composer
+    /// while it is pending.
+    ///
+    /// One message's file-tool calls that need approval are combined into a
+    /// **single** request: `items` carries one entry per held call
+    /// (`call_id`, `tool`, `operation`, `path`, and the call's original
+    /// `arguments` so the worker can re-run it once the user decides). The
+    /// run ends right after the request is journaled — nothing is sent to
+    /// the LLM until the user's decision (the permission flow is
+    /// transparent to the model; after the answer the held calls' real
+    /// outcomes are journaled and the resume delivers them as ordinary
+    /// tool results).
     ///
     /// `request_id` is assigned by the worker (`p1`) and keys the answer in
-    /// the `PermissionAnswered` event. `tool` is the tool name, `operation`
-    /// is `"read"` or `"write"`, and `path` is the path exactly as the
-    /// model passed it. Readers (the worker's history rebuild) skip this
-    /// event: it is flow metadata for the UI, never a chat message.
+    /// the `PermissionAnswered` event. Readers (the worker's history
+    /// rebuild) skip this event: it is flow metadata for the UI, never a
+    /// chat message.
+    ///
+    /// The `tool` / `operation` / `path` fields are the *legacy* single-item
+    /// shape (pre-batch journals, one request per call). `#[serde(default)]`
+    /// keeps journals written before batching parseable; new requests are
+    /// always written with `items`.
     PermissionRequest {
         request_id: String,
-        tool: String,
-        operation: String,
-        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        items: Vec<PermissionRequestItem>,
     },
     /// The user answered a pending `PermissionRequest`. Journaled by the
     /// gateway (`POST /api/sessions/:id/permission/answer`) when the user
-    /// clicks Allow or Deny in the UI; it resolves the request (the worker
-    /// respawns and the run continues) and carries `allowed` plus the
-    /// request's `tool` / `operation` / `path` (copied from the pending
-    /// request at answer time, so the event is self-contained even after a
-    /// context compression dropped the request from the model context).
+    /// decides the paths in the UI; it resolves the request (the worker
+    /// respawns and the run continues) and carries one `PermissionDecision`
+    /// per held call, each with the item's `tool` / `operation` / `path`
+    /// copied from the pending request at answer time — self-contained, so
+    /// the worker's remembered-`(tool, path)` scan and the UI summary need
+    /// no lookup (and the event survives a context compression that dropped
+    /// the request from the model context).
     ///
-    /// The worker's history rebuild maps this event to a user-role message,
-    /// so the model receives the decision and retries the tool call when
-    /// allowed (or finds another way when denied). The worker also
-    /// remembers the decision per `(tool, path)`, so a retry of an allowed
-    /// path does not prompt again and a retry of a denied path is refused
-    /// outright.
+    /// On resume the worker re-runs the held calls: allowed ones execute
+    /// (their real results are journaled as ordinary `ToolResult` events,
+    /// so the model receives the actual outcome — file content, etc. — not
+    /// a "please retry" message), denied ones produce the remembered-denial
+    /// error. The worker also remembers each decision per `(tool, path)`, so
+    /// a later retry of an allowed path does not prompt again and a retry of
+    /// a denied path is refused outright.
+    ///
+    /// The `tool` / `operation` / `path` / `allowed` fields are the *legacy*
+    /// single-item shape (pre-batch journals); `#[serde(default)]` keeps
+    /// them parseable, and the worker still synthesizes the old
+    /// model-facing decision message for them (backward compatibility).
     PermissionAnswered {
         request_id: String,
-        tool: String,
-        operation: String,
-        path: String,
-        allowed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allowed: Option<bool>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        decisions: Vec<PermissionDecision>,
     },
     /// A streamed chunk of an assistant message (token-by-token preview).
     ///

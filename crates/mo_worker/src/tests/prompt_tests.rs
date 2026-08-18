@@ -32,7 +32,7 @@ fn includes_workdir_and_agents_md() {
 
 /// Every mode's system prompt tells the model about the file-access
 /// permission flow: paths outside the allowed roots prompt the user in the
-/// UI, and the decision arrives as a user message (retry only if allowed).
+/// UI — the call is held until the user decides, then returns its outcome.
 #[test]
 fn all_modes_mention_permission_requests() {
     let dir = tempfile::tempdir().unwrap();
@@ -44,14 +44,14 @@ fn all_modes_mention_permission_requests() {
             "mode {mode}: {prompt}"
         );
         assert!(
-            prompt.contains("retry the tool call only if they accept")
-                || prompt.contains("the answer arrives as a user message"),
+            prompt.contains("holds the call until the user decides")
+                || prompt.contains("the call is held until the user decides"),
             "mode {mode}: {prompt}"
         );
     }
     // Build: outside paths are asked about.
     let prompt = prompt_for(Mode::Build, &dir, &agents);
-    assert!(prompt.contains("retry the tool call only if they accept"));
+    assert!(prompt.contains("holds the call until the user decides"));
     // Plan/explore: reads outside prompt the user; writes outside the
     // scratch dir are denied outright.
     let prompt = prompt_for(Mode::Plan, &dir, &agents);
