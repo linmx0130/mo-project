@@ -217,6 +217,64 @@ fn history_keeps_answered_tool_calls() {
     assert_eq!(messages[3].content.to_string(), "done");
 }
 
+/// A journal written by an older worker build (or a provider that never
+/// streams a `role` field in its deltas, e.g. the `dots3-note-prev`
+/// proxy) may carry an assistant message with an EMPTY role. Strict
+/// OpenAI-compatible endpoints reject an empty role when the history is
+/// re-sent — HTTP 400 "Invalid provider request", which is exactly what
+/// killed sessions after their first tool call — so the rebuild must
+/// normalize it to "assistant".
+#[test]
+fn history_normalizes_empty_assistant_role() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("journal.jsonl");
+    let mut journal = JournalWriter::open(&path).unwrap();
+    journal.append(user_msg("do it")).unwrap();
+    journal
+        .append(JournalEventKind::Message(JournalMessage {
+            role: String::new(), // the provider never streamed a role
+            content: String::new(),
+            reasoning_content: None,
+            tool_call_id: None,
+            tool_calls: Some(vec![ToolCallInfo {
+                id: "call_1".to_string(),
+                name: "bash".to_string(),
+                arguments: r#"{"command":"echo hi"}"#.to_string(),
+            }]),
+        }))
+        .unwrap();
+    journal
+        .append(JournalEventKind::ToolResult {
+            id: "call_1".to_string(),
+            name: "bash".to_string(),
+            ok: true,
+            output: "hi".to_string(),
+        })
+        .unwrap();
+    drop(journal);
+
+    let (system, messages, _) = history_from_journal(&path).unwrap();
+    assert!(system.is_none(), "no system prompt journaled here");
+    assert_eq!(messages.len(), 3, "messages: {messages:#?}");
+    assert_eq!(
+        messages[1].role, "assistant",
+        "empty role must be normalized to assistant: {messages:#?}"
+    );
+    assert!(
+        messages[1]
+            .tool_calls
+            .as_ref()
+            .is_some_and(|c| c.len() == 1),
+        "the tool call must survive normalization: {messages:#?}"
+    );
+    assert_eq!(messages[2].role, "tool");
+    assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
+    // No message may carry an empty role into the model context.
+    for m in &messages {
+        assert!(!m.role.is_empty(), "empty role survived: {messages:#?}");
+    }
+}
+
 /// Tool results are journaled in *completion* order (parallel
 /// execution), but the rebuilt context must present them in the
 /// assistant's `tool_calls` array order — the model-facing history is
@@ -671,6 +729,153 @@ async fn e2e_agent_loop_with_mock_llm() {
     assert!(
         matches!(kinds[12], JournalEventKind::Message(m) if m.role == "assistant" && m.content.contains("hello world from notes") && m.reasoning_content.as_deref() == Some("Let me recall: notes say hello."))
     );
+}
+
+/// End-to-end regression for providers that never send a `role` field in
+/// their streamed deltas (e.g. the `dots3-note-prev` proxy): request 1
+/// emits a tool call without any role delta; the worker must default the
+/// assembled message's role to "assistant", so the follow-up request
+/// (which echoes that assistant message + the tool result back) carries a
+/// valid role — an empty role is rejected by strict endpoints with HTTP
+/// 400 "Invalid provider request", which is exactly what failed this
+/// session after its first tool call.
+#[tokio::test]
+async fn e2e_provider_without_role_delta_round_trips_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path().join("work");
+    std::fs::create_dir_all(&workdir).unwrap();
+    std::fs::write(workdir.join("notes.txt"), "hello world from notes\n").unwrap();
+    let data_dir = dir.path().join("data");
+    let agents_dir = dir.path().join("agents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+
+    let conn = open_db(&data_dir.join("mo.db")).unwrap();
+    let session = sample_session(
+        &workdir,
+        &data_dir.join("sessions").join("e2e").join("journal.jsonl"),
+    );
+    db::create_session(&conn, &session).unwrap();
+    drop(conn);
+
+    // Mock LLM server. Deltas NEVER include a `role` field (like the
+    // real `dots3-note-prev` stream). Request 2's body must show the
+    // echoed assistant message with role "assistant" — never "".
+    let calls = Arc::new(AtomicUsize::new(0));
+    let router = Router::new()
+        .route(
+            "/chat/completions",
+            post(
+                |calls: axum::extract::State<Arc<AtomicUsize>>,
+                 body: axum::extract::Json<Value>| async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    let msgs = body["messages"].as_array().unwrap();
+                    if n == 1 {
+                        // Second request: the echoed assistant message must
+                        // have a non-empty role — the endpoint rejects ""
+                        // (HTTP 400 "Invalid provider request").
+                        let assistant = msgs
+                            .iter()
+                            .rev()
+                            .find(|m| {
+                                m["tool_calls"].is_array()
+                                    && !m["tool_calls"].as_array().unwrap().is_empty()
+                            })
+                            .expect("echoed assistant tool-call message must be present");
+                        assert_eq!(
+                            assistant["role"], "assistant",
+                            "assistant message must carry role 'assistant', got: {assistant}"
+                        );
+                        let tool = msgs
+                            .iter()
+                            .rev()
+                            .find(|m| m["role"] == "tool")
+                            .expect("tool result message must be present");
+                        assert!(
+                            tool["content"]
+                                .as_str()
+                                .unwrap()
+                                .contains("hello world from notes"),
+                            "got: {tool}"
+                        );
+                    }
+                    let body = if n == 0 {
+                        // No role delta anywhere — reasoning first, then
+                        // the tool call (mirrors the real provider stream).
+                        sse_payload_with_usage(
+                            &[
+                                delta_reasoning("The user wants me to check the file. "),
+                                delta_reasoning("I'll read notes.txt."),
+                                delta_tool_call(
+                                    0,
+                                    "call_1",
+                                    "read_file",
+                                    r#"{"path":"notes.txt"}"#,
+                                ),
+                            ],
+                            30,
+                            5,
+                        )
+                    } else {
+                        sse_payload_with_usage(
+                            &[
+                                delta_reasoning("Let me answer. "),
+                                delta_content("done: read the notes"),
+                            ],
+                            48,
+                            12,
+                        )
+                    };
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        body,
+                    )
+                },
+            ),
+        )
+        .with_state(calls.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let agent_cfg = AgentConfig {
+        session: session.clone(),
+        workdir: workdir.clone(),
+        data_dir: data_dir.clone(),
+        agents_dir,
+        model_base_url: format!("http://{addr}"),
+        model_name: "mock-model".to_string(),
+        auth_token: None,
+        context_window: Some(4096),
+        subagent_depth: 0,
+        max_tool_concurrency: 8,
+        context_compression_threshold: 0.75,
+    };
+    let mut journal = JournalWriter::open(std::path::Path::new(&session.journal_path)).unwrap();
+    journal
+        .append(JournalEventKind::Message(JournalMessage {
+            role: "user".to_string(),
+            content: "Read notes.txt and tell me what it says.".to_string(),
+            reasoning_content: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }))
+        .unwrap();
+    run_agent(agent_cfg, &mut journal).await.unwrap();
+
+    // The journaled assistant messages carry role "assistant" even
+    // though the stream never provided one.
+    let events = mo_core::read_events(std::path::Path::new(&session.journal_path)).unwrap();
+    let assistant_msgs: Vec<&JournalEventKind> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            JournalEventKind::Message(m) if m.role == "assistant" => Some(&e.kind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(assistant_msgs.len(), 2, "events: {events:#?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "exactly two LLM calls");
 }
 
 /// A second run on the same journal must reuse the journaled system
