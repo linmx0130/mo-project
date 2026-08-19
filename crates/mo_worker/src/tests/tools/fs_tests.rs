@@ -214,7 +214,8 @@ fn approved_paths_bypass_sandbox_for_exact_path_only() {
     // `..` (not in the approved list).
     assert!(create_file(&workdir, "../new-outside.txt", "x", &approved_new).is_err());
 
-    // edit_file: an approved outside file can be edited...
+    // edit_file: an approved outside file can be edited (the tool returns
+    // a confirmation, not the content)...
     let edited = edit_file(
         &workdir,
         &outside.display().to_string(),
@@ -224,7 +225,8 @@ fn approved_paths_bypass_sandbox_for_exact_path_only() {
         &approved,
     )
     .unwrap();
-    assert_eq!(edited, "LINE ONE\n");
+    assert!(edited.contains("edit applied"), "got: {edited}");
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "LINE ONE\n");
     // ...and an unapproved outside file still cannot.
     assert!(
         edit_file(
@@ -245,10 +247,14 @@ fn approved_paths_bypass_sandbox_for_exact_path_only() {
 }
 
 #[test]
-fn edit_unique_match_and_content_returned() {
+fn edit_unique_match_returns_confirmation_and_applies() {
     let (_dir, workdir) = setup();
-    let new_content = edit_file(&workdir, "notes.txt", "line one", "ONE", false, &[]).unwrap();
-    assert_eq!(new_content, "ONE\nline two\n");
+    let confirmation = edit_file(&workdir, "notes.txt", "line one", "ONE", false, &[]).unwrap();
+    assert!(confirmation.contains("edit applied"), "got: {confirmation}");
+    assert!(
+        !confirmation.contains("line two"),
+        "the tool must not return the file content: {confirmation}"
+    );
     assert_eq!(
         read_file(&workdir, "notes.txt", &[], &[]).unwrap(),
         "ONE\nline two\n"
@@ -261,9 +267,13 @@ fn edit_requires_unique_match() {
     fs::write(workdir.join("dup.txt"), "same\nsame\n").unwrap();
     let err = edit_file(&workdir, "dup.txt", "same", "x", false, &[]).unwrap_err();
     assert!(err.contains("exactly once"), "got: {err}");
-    // replace_all handles it.
-    let new_content = edit_file(&workdir, "dup.txt", "same", "x", true, &[]).unwrap();
-    assert_eq!(new_content, "x\nx\n");
+    // replace_all handles it (returning a confirmation, not the content).
+    let confirmation = edit_file(&workdir, "dup.txt", "same", "x", true, &[]).unwrap();
+    assert!(confirmation.contains("edit applied"), "got: {confirmation}");
+    assert_eq!(
+        fs::read_to_string(workdir.join("dup.txt")).unwrap(),
+        "x\nx\n"
+    );
 }
 
 #[test]

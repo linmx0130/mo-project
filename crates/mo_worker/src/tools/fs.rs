@@ -267,7 +267,8 @@ pub fn remove_file(workdir: &Path, raw: &str, approved: &[PathBuf]) -> Result<St
 }
 
 /// Replace `old_string` with `new_string` in the file. Without `replace_all`
-/// the match must be unique. Returns the full new file content.
+/// the match must be unique. Returns a confirmation on success — the caller
+/// can read the file back with `read_file` to inspect the result.
 pub fn edit_file(
     workdir: &Path,
     raw: &str,
@@ -296,7 +297,7 @@ pub fn edit_file(
         content.replacen(old_string, new_string, 1)
     };
     fs::write(&full, &updated).map_err(|e| format!("failed to write {raw}: {e}"))?;
-    Ok(updated)
+    Ok(format!("edit applied successfully to {raw}"))
 }
 
 fn cap_output(text: &str) -> String {
