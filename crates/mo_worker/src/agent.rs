@@ -596,25 +596,39 @@ fn history_from_journal(
                     tool_calls: None,
                 });
             }
-            JournalEventKind::Message(m) => messages.push(ChatMessage {
-                role: m.role,
-                content: ChatMessageContentValue::Text(m.content),
-                reasoning_content: m.reasoning_content,
-                tool_call_id: m.tool_call_id,
-                tool_calls: m.tool_calls.map(|calls| {
-                    calls
-                        .into_iter()
-                        .map(|tc: ToolCallInfo| ToolCallRequest {
-                            id: tc.id,
-                            _type: "function".to_string(),
-                            function: FunctionCallRequest {
-                                name: tc.name,
-                                arguments: tc.arguments,
-                            },
-                        })
-                        .collect()
-                }),
-            }),
+            JournalEventKind::Message(m) => {
+                // Normalize an empty role to "assistant": journals written
+                // before the role-defaulting fix may carry messages whose
+                // provider never streamed a `role` field. An empty role is
+                // rejected by strict OpenAI-compatible endpoints (HTTP 400
+                // "Invalid provider request") when the history is re-sent —
+                // which is exactly what happens on a followup / resumed
+                // session — so the rebuild must not reproduce it.
+                let role = if m.role.is_empty() {
+                    "assistant".to_string()
+                } else {
+                    m.role
+                };
+                messages.push(ChatMessage {
+                    role,
+                    content: ChatMessageContentValue::Text(m.content),
+                    reasoning_content: m.reasoning_content,
+                    tool_call_id: m.tool_call_id,
+                    tool_calls: m.tool_calls.map(|calls| {
+                        calls
+                            .into_iter()
+                            .map(|tc: ToolCallInfo| ToolCallRequest {
+                                id: tc.id,
+                                _type: "function".to_string(),
+                                function: FunctionCallRequest {
+                                    name: tc.name,
+                                    arguments: tc.arguments,
+                                },
+                            })
+                            .collect()
+                    }),
+                })
+            }
             JournalEventKind::ToolResult { id, output, .. } => messages.push(ChatMessage {
                 role: "tool".to_string(),
                 content: ChatMessageContentValue::Text(output),
@@ -845,9 +859,17 @@ async fn generate_once(
             }
         }
     }
-    let empty = message.role.is_empty()
-        && message.content.to_string().is_empty()
-        && message.tool_calls.is_none();
+    // Some providers never send a `role` field in their streamed deltas
+    // (e.g. the `dots3-note-prev` proxy), so the assembled message's role
+    // stays empty. A completion is an assistant message by definition, and
+    // an empty role is rejected by strict OpenAI-compatible endpoints when
+    // the message is echoed back in a later request (HTTP 400 "Invalid
+    // provider request") — normalize it before the message is journaled
+    // and fed back.
+    if message.role.is_empty() {
+        message.role = "assistant".to_string();
+    }
+    let empty = message.content.to_string().is_empty() && message.tool_calls.is_none();
     if empty {
         bail!("model returned an empty response");
     }
