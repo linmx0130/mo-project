@@ -22,6 +22,7 @@ fn clear_legacy_env() {
         "MO_MODEL_NAME",
         "MO_AUTH_TOKEN",
         "MO_PORT",
+        "MO_BIND",
         "MO_DATA_DIR",
         "MO_MAX_TOOL_CONCURRENCY",
         "MO_CONTEXT_COMPRESSION_THRESHOLD",
@@ -49,6 +50,7 @@ fn parses_models_and_defaults() {
         &path,
         r#"
                 port = 4040
+                bind = "127.0.0.1"
                 subagent_depth = 2
                 max_tool_concurrency = 4
                 [[models]]
@@ -66,6 +68,7 @@ fn parses_models_and_defaults() {
     .unwrap();
     let config = MoConfig::load(Some(&path)).unwrap();
     assert_eq!(config.port, 4040);
+    assert_eq!(config.bind, "127.0.0.1");
     assert_eq!(config.subagent_depth, 2);
     assert_eq!(config.max_tool_concurrency, 4);
     assert_eq!(config.models.len(), 2);
@@ -97,6 +100,16 @@ fn max_tool_concurrency_defaults_to_8() {
     std::fs::write(&path, "port = 4040\n").unwrap();
     let config = MoConfig::load(Some(&path)).unwrap();
     assert_eq!(config.max_tool_concurrency, DEFAULT_MAX_TOOL_CONCURRENCY);
+}
+
+#[test]
+fn bind_defaults_to_0_0_0_0() {
+    let _guard = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mo.toml");
+    std::fs::write(&path, "port = 4040\n").unwrap();
+    let config = MoConfig::load(Some(&path)).unwrap();
+    assert_eq!(config.bind, DEFAULT_BIND);
 }
 
 #[test]
@@ -261,6 +274,7 @@ fn env_fallback_builds_one_model() {
     let config = MoConfig::load(None).unwrap();
     assert!(config.models.is_empty());
     assert_eq!(config.port, DEFAULT_PORT);
+    assert_eq!(config.bind, DEFAULT_BIND);
     assert_eq!(config.source, None);
 
     // Legacy MO_* vars -> env fallback builds one model.
@@ -269,6 +283,7 @@ fn env_fallback_builds_one_model() {
         env::set_var("MO_MODEL_NAME", "env-model");
         env::set_var("MO_AUTH_TOKEN", "env-tok");
         env::set_var("MO_PORT", "9999");
+        env::set_var("MO_BIND", "127.0.0.1");
         env::set_var("MO_MAX_TOOL_CONCURRENCY", "3");
     }
     let config = MoConfig::load(None).unwrap();
@@ -276,6 +291,7 @@ fn env_fallback_builds_one_model() {
     assert_eq!(config.models[0].name, "env-model");
     assert_eq!(config.models[0].token.as_deref(), Some("env-tok"));
     assert_eq!(config.port, 9999);
+    assert_eq!(config.bind, "127.0.0.1");
     assert_eq!(config.max_tool_concurrency, 3);
     assert_eq!(config.source, None);
 
@@ -284,6 +300,7 @@ fn env_fallback_builds_one_model() {
         env::remove_var("MO_MODEL_NAME");
         env::remove_var("MO_AUTH_TOKEN");
         env::remove_var("MO_PORT");
+        env::remove_var("MO_BIND");
         env::remove_var("MO_MAX_TOOL_CONCURRENCY");
     }
     env::set_current_dir(&cwd).unwrap();
