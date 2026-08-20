@@ -18,6 +18,11 @@
 # Gateway HTTP port (default 3031).
 # port = 3031
 
+# Gateway listen address (default "0.0.0.0"). When nginx fronts the gateway,
+# set this to "127.0.0.1" so the public network can never reach the gateway
+# directly — only the proxy can.
+# bind = "0.0.0.0"
+
 # Accepted for backward compatibility (its value no longer changes
 # behavior): root sessions are always depth 0 — never framed as subagents —
 # and subagent nesting is hard-capped at 1 (a subagent can never spawn

@@ -90,9 +90,9 @@ async fn main() {
     let app = create_router(state);
 
     let port = config.port;
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+    let listener = tokio::net::TcpListener::bind(format!("{}:{port}", config.bind))
         .await
         .expect("failed to bind port");
-    tracing::info!("mo_gateway listening on http://0.0.0.0:{port}");
+    tracing::info!(bind = %config.bind, "mo_gateway listening on http://{}:{port}", config.bind);
     axum::serve(listener, app).await.expect("server error");
 }

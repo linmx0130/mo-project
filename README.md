@@ -439,7 +439,7 @@ the parent's window and threshold).
 
 Configuration lives in `mo.toml` (see above). When no config file is found,
 the gateway (and a standalone worker) falls back to these `MO_*` env vars —
-kept for existing setups; new deployments should use the config file:
+kept for existing setups; new installs should use the config file:
 
 | Var | Used by | Default |
 | --- | --- | --- |
@@ -453,6 +453,7 @@ kept for existing setups; new deployments should use the config file:
 | `MO_CONTEXT_COMPRESSION_THRESHOLD` | worker | `0.75` (fraction of the model's context window at which the worker asks for a handoff prompt and sends only the compressed context; see "Context compression") |
 | `MO_WORKER_BIN` | gateway | sibling of `mo_gateway` exe named `mo_worker` |
 | `MO_PORT` | gateway | `3031` |
+| `MO_BIND` | gateway | `0.0.0.0` (listen address; set `127.0.0.1` when behind a reverse proxy) |
 
 ## Global agent data (`$HOME/.agents`)
 

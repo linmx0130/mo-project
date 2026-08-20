@@ -12,6 +12,10 @@
 //! data_dir      = "./data"            # runtime data dir (default ./data)
 //! agents_dir    = "~/.agents"         # global agents dir (default $HOME/.agents)
 //! port          = 3031                # gateway HTTP port (default 3031)
+//! bind          = "0.0.0.0"           # gateway listen address (default "0.0.0.0");
+//!                                     # set to "127.0.0.1" behind a reverse proxy so
+//!                                     # the public network can never reach the gateway
+//!                                     # directly
 //! subagent_depth = 0                  # accepted for backward compatibility (no longer
 //!                                     # changes behavior): root sessions are always
 //!                                     # depth 0; nesting is hard-capped at 1
@@ -45,6 +49,11 @@ use serde::Deserialize;
 
 /// Default gateway HTTP port.
 pub const DEFAULT_PORT: u16 = 3031;
+
+/// Default gateway listen address (all interfaces). A reverse proxy in
+/// front of the gateway sets `bind = "127.0.0.1"` so it is only reachable
+/// through the proxy.
+pub const DEFAULT_BIND: &str = "0.0.0.0";
 
 /// Default maximum number of tool calls from a single assistant message
 /// that execute concurrently (see `MoConfig::max_tool_concurrency`).
@@ -86,6 +95,11 @@ pub struct FileConfig {
     pub agents_dir: Option<PathBuf>,
     #[serde(default)]
     pub port: Option<u16>,
+    /// Gateway listen address (default `DEFAULT_BIND`, `"0.0.0.0"`). Set
+    /// to `"127.0.0.1"` when the gateway sits behind a reverse proxy so it
+    /// is never reachable from the public network directly.
+    #[serde(default)]
+    pub bind: Option<String>,
     #[serde(default)]
     pub subagent_depth: Option<u32>,
     #[serde(default)]
@@ -111,6 +125,10 @@ pub struct MoConfig {
     pub data_dir: PathBuf,
     pub agents_dir: PathBuf,
     pub port: u16,
+    /// Gateway listen address (default `DEFAULT_BIND`, `"0.0.0.0"`); set it
+    /// to `"127.0.0.1"` when nginx fronts the gateway so it is only
+    /// reachable through the proxy.
+    pub bind: String,
     pub subagent_depth: u32,
     pub worker_bin: Option<PathBuf>,
     /// Maximum number of tool calls from a single assistant message that
@@ -185,6 +203,10 @@ impl MoConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_PORT),
+            bind: env::var("MO_BIND")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| DEFAULT_BIND.to_string()),
             subagent_depth: env::var("MO_SUBAGENT_DEPTH")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -215,6 +237,7 @@ impl FileConfig {
             data_dir: self.data_dir.unwrap_or_else(|| PathBuf::from("./data")),
             agents_dir: self.agents_dir.unwrap_or_else(default_agents_dir),
             port: self.port.unwrap_or(DEFAULT_PORT),
+            bind: self.bind.unwrap_or_else(|| DEFAULT_BIND.to_string()),
             subagent_depth: self.subagent_depth.unwrap_or(0),
             worker_bin: self.worker_bin,
             max_tool_concurrency: self
