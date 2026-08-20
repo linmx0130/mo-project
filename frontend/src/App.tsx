@@ -24,12 +24,24 @@ function applyTheme(theme: Theme) {
   localStorage.setItem(THEME_KEY, theme)
 }
 
+const SIDEBAR_KEY = 'mo-sidebar-collapsed'
+
+function initialSidebarCollapsed(): boolean {
+  // Persisted alongside the theme, so a folded sidebar stays folded across
+  // reloads (the theme lives in `mo-theme` above).
+  return localStorage.getItem(SIDEBAR_KEY) === '1'
+}
+
 function App() {
   const [sessions, setSessions] = useState<Session[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [draftOpen, setDraftOpen] = useState(false)
   const [lastWorkdir, setLastWorkdir] = useState('')
   const [theme, setTheme] = useState<Theme>(initialTheme)
+  // Sidebar folded state: collapsed to a slim rail showing only the toggle
+  // button, so the main panel gets the room back on narrow screens. Saved
+  // to localStorage so the choice survives reloads.
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(initialSidebarCollapsed)
   // The "New session" form, in one place so it survives navigating between
   // sessions (DraftSession unmounts); mirrored to localStorage so it also
   // survives reloads. Only a successful session creation clears it.
@@ -46,6 +58,11 @@ function App() {
     applyTheme(theme)
   }, [theme])
 
+  // Mirror the sidebar folded state to localStorage.
+  useEffect(() => {
+    localStorage.setItem(SIDEBAR_KEY, sidebarCollapsed ? '1' : '0')
+  }, [sidebarCollapsed])
+
   // Mirror the draft to localStorage on every change; removing it (session
   // created) drops the stored copy too.
   useEffect(() => {
@@ -54,6 +71,7 @@ function App() {
   }, [draft])
 
   const toggleTheme = () => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))
+  const toggleSidebar = () => setSidebarCollapsed((c) => !c)
 
   /** Single source of truth for the new-session form. Patches are merged
    *  into the current draft (materializing one from defaults on the first
@@ -155,43 +173,55 @@ function App() {
 
   return (
     <div className="app">
-      <aside className="sidebar">
+      <aside className={`sidebar${sidebarCollapsed ? ' collapsed' : ''}`}>
         <header className="sidebar-header">
           <h1>
             mo <span className="subtitle">agent harness</span>
           </h1>
-        </header>
-        <button type="button" className="new-session-btn" onClick={openDraft}>
-          + New session
-        </button>
-        <div className="sidebar-list">
-          {listError && (
-            <p className="form-error list-error" role="alert">
-              {listError}
-            </p>
-          )}
-          <SessionList
-            sessions={sessions}
-            selectedId={selectedId}
-            deletingId={deletingId}
-            onSelect={selectSession}
-            onDelete={(id) => void handleDelete(id)}
-          />
-        </div>
-        <footer className="sidebar-footer">
           <button
             type="button"
-            className="theme-toggle"
-            onClick={toggleTheme}
-            aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
-            title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
+            className="sidebar-toggle"
+            onClick={toggleSidebar}
+            aria-expanded={!sidebarCollapsed}
+            aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
           >
-            <span className="theme-icon" aria-hidden="true">
-              {theme === 'dark' ? '☀️' : '🌙'}
-            </span>
-            {theme === 'dark' ? 'Light mode' : 'Dark mode'}
+            <span aria-hidden="true">{sidebarCollapsed ? '›' : '‹'}</span>
           </button>
-        </footer>
+        </header>
+        <div className="sidebar-body">
+          <button type="button" className="new-session-btn" onClick={openDraft}>
+            + New session
+          </button>
+          <div className="sidebar-list">
+            {listError && (
+              <p className="form-error list-error" role="alert">
+                {listError}
+              </p>
+            )}
+            <SessionList
+              sessions={sessions}
+              selectedId={selectedId}
+              deletingId={deletingId}
+              onSelect={selectSession}
+              onDelete={(id) => void handleDelete(id)}
+            />
+          </div>
+          <footer className="sidebar-footer">
+            <button
+              type="button"
+              className="theme-toggle"
+              onClick={toggleTheme}
+              aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
+              title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
+            >
+              <span className="theme-icon" aria-hidden="true">
+                {theme === 'dark' ? '☀️' : '🌙'}
+              </span>
+              {theme === 'dark' ? 'Light mode' : 'Dark mode'}
+            </button>
+          </footer>
+        </div>
       </aside>
       <main className="main">
         {draftOpen ? (

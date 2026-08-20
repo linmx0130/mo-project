@@ -103,6 +103,24 @@ p {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  /* Smoothly slide between the full panel and the folded rail (overflow:
+     hidden above clips the content while the width animates). */
+  transition: width 0.2s ease;
+}
+
+/* Folded sidebar: a slim rail that only keeps the toggle button in the
+   header's top-right corner, so the nav bar can always be re-expanded.
+   The title, new-session button, session list and footer are hidden (see
+   the `.sidebar.collapsed` rules below). */
+.sidebar.collapsed {
+  width: 48px;
+}
+
+.sidebar-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .sidebar-list {
@@ -143,14 +161,55 @@ p {
 }
 
 .sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   padding: 16px;
   border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
 }
 
 .sidebar-header .subtitle {
   font-size: 13px;
   font-weight: 400;
   color: var(--muted);
+}
+
+/* Collapse/expand toggle: sits in the header's top-right corner when the
+   sidebar is open, and alone in the folded rail when it isn't. */
+.sidebar-toggle {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1;
+  padding: 4px 7px;
+  cursor: pointer;
+}
+
+.sidebar-toggle:hover {
+  color: var(--text-h);
+  background: var(--bg);
+  border-color: var(--border);
+}
+
+/* Folded state: shrink the header to fit the rail, drop its bottom border
+   and keep the toggle button pinned to the top-right corner. */
+.sidebar.collapsed .sidebar-header {
+  padding: 8px;
+  border-bottom: none;
+  justify-content: flex-end;
+}
+
+.sidebar.collapsed h1,
+.sidebar.collapsed .sidebar-body {
+  display: none;
 }
 
 .new-session-btn {
