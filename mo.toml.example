@@ -23,6 +23,12 @@
 # directly — only the proxy can.
 # bind = "0.0.0.0"
 
+# UI accent (theme) color for the web frontend, as a hex value (#RGB or
+# #RRGGBB). Default "#009dc4" (deep cyan). Light mode uses the color verbatim
+# (translucent tints are derived from it); dark mode auto-lightens it for
+# contrast on the dark background.
+# theme_color = "#009dc4"
+
 # Accepted for backward compatibility (its value no longer changes
 # behavior): root sessions are always depth 0 — never framed as subagents —
 # and subagent nesting is hard-capped at 1 (a subagent can never spawn

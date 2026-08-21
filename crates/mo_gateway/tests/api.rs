@@ -62,6 +62,7 @@ fn setup(sleep: bool) -> (tempfile::TempDir, Router) {
         db: Mutex::new(conn),
         worker_bin,
         cwd: std::env::current_dir().unwrap(),
+        theme_color: mo_core::config::DEFAULT_THEME_COLOR.to_string(),
         agents_dir: dir.path().join("agents"),
         max_tool_concurrency: mo_core::config::DEFAULT_MAX_TOOL_CONCURRENCY,
         context_compression_threshold: mo_core::config::DEFAULT_CONTEXT_COMPRESSION_THRESHOLD,
@@ -100,6 +101,13 @@ async fn meta_reports_gateway_cwd() {
     assert_eq!(status, StatusCode::OK);
     let cwd = meta["cwd"].as_str().expect("meta.cwd should be a string");
     assert_eq!(cwd, std::env::current_dir().unwrap().to_string_lossy());
+    // The configured UI accent color (default cyan when unset) is served
+    // too — the frontend derives its theme from it.
+    assert_eq!(
+        meta["theme_color"],
+        mo_core::config::DEFAULT_THEME_COLOR,
+        "meta: {meta}"
+    );
 }
 
 #[tokio::test]
@@ -965,6 +973,7 @@ async fn spawn_worker_passes_context_window_env() {
         db: Mutex::new(conn),
         worker_bin,
         cwd: std::env::current_dir().unwrap(),
+        theme_color: mo_core::config::DEFAULT_THEME_COLOR.to_string(),
         agents_dir: dir.path().join("agents"),
         max_tool_concurrency: mo_core::config::DEFAULT_MAX_TOOL_CONCURRENCY,
         context_compression_threshold: mo_core::config::DEFAULT_CONTEXT_COMPRESSION_THRESHOLD,

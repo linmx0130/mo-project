@@ -45,6 +45,10 @@ export interface Session {
 export interface Meta {
   /** Absolute path of the gateway's startup directory. */
   cwd: string
+  /** The configured UI accent color as a hex value (from `mo.toml`
+   *  `theme_color`, default `#009dc4`). Optional so a response from an
+   *  older gateway degrades to the stylesheet default (deep cyan). */
+  theme_color?: string
 }
 
 /** A configured model (GET /api/models). The first one is the default. */

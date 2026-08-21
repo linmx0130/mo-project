@@ -82,6 +82,7 @@ async fn main() {
         db: Mutex::new(conn),
         worker_bin,
         cwd,
+        theme_color: config.theme_color,
         agents_dir: config.agents_dir,
         max_tool_concurrency: config.max_tool_concurrency,
         context_compression_threshold: config.context_compression_threshold,

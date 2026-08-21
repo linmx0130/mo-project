@@ -5,9 +5,13 @@
   --panel: #1a1d26;
   --border: #2a2e3a;
   --muted: #7b8494;
-  --accent: #c084fc;
-  --accent-bg: rgba(192, 132, 252, 0.12);
-  --accent-bg-hover: rgba(192, 132, 252, 0.2);
+  /* Accent (theme) color: overridden at runtime from mo.toml `theme_color`
+     (see src/theme.ts); these are the built-in defaults. Light mode is the
+     source color (#009dc4); dark mode auto-lightens it (mix 40% with
+     white, #66c4dc) and both modes derive the translucent tints. */
+  --accent: #66c4dc;
+  --accent-bg: rgba(102, 196, 220, 0.12);
+  --accent-bg-hover: rgba(102, 196, 220, 0.2);
 
   --status-pending: #8b93a3;
   --status-running: #60a5fa;
@@ -37,9 +41,9 @@
   --panel: #ffffff;
   --border: #dde1e8;
   --muted: #6b7484;
-  --accent: #7c3aed;
-  --accent-bg: rgba(124, 58, 237, 0.09);
-  --accent-bg-hover: rgba(124, 58, 237, 0.16);
+  --accent: #009dc4;
+  --accent-bg: rgba(0, 157, 196, 0.09);
+  --accent-bg-hover: rgba(0, 157, 196, 0.16);
 
   --status-pending: #6b7280;
   --status-running: #2563eb;

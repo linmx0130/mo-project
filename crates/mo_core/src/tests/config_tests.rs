@@ -26,6 +26,7 @@ fn clear_legacy_env() {
         "MO_DATA_DIR",
         "MO_MAX_TOOL_CONCURRENCY",
         "MO_CONTEXT_COMPRESSION_THRESHOLD",
+        "MO_THEME_COLOR",
     ] {
         unsafe {
             env::remove_var(key);
@@ -154,6 +155,86 @@ fn context_compression_threshold_out_of_range_rejected() {
             "threshold {bad} must be rejected"
         );
     }
+}
+
+#[test]
+fn theme_color_defaults_to_deep_cyan() {
+    let _guard = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mo.toml");
+    std::fs::write(&path, "port = 4040\n").unwrap();
+    let config = MoConfig::load(Some(&path)).unwrap();
+    assert_eq!(config.theme_color, DEFAULT_THEME_COLOR);
+    assert_eq!(config.theme_color, "#009dc4");
+}
+
+#[test]
+fn theme_color_is_parsed() {
+    let _guard = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mo.toml");
+    // #RRGGBB and #RGB, any case.
+    for (value, expected) in [
+        ("#22c55e", "#22c55e"),
+        ("#0af", "#0af"),
+        ("#A1B2C3", "#A1B2C3"),
+    ] {
+        std::fs::write(&path, format!("theme_color = \"{value}\"\n")).unwrap();
+        let config = MoConfig::load(Some(&path)).unwrap();
+        assert_eq!(config.theme_color, expected, "value: {value}");
+    }
+}
+
+#[test]
+fn theme_color_invalid_rejected() {
+    let _guard = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    for bad in [
+        "purple", "#12345", "#1234567", "#gggggg", "#", "", "c084fc", // missing the leading #
+    ] {
+        let path = dir.path().join("mo.toml");
+        std::fs::write(&path, format!("theme_color = \"{bad}\"\n")).unwrap();
+        assert!(
+            matches!(
+                MoConfig::load(Some(&path)),
+                Err(ConfigError::InvalidThemeColor { .. })
+            ),
+            "theme_color {bad:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn theme_color_env_fallback() {
+    let _guard = env_lock();
+    clear_legacy_env();
+    let dir = tempfile::tempdir().unwrap();
+    sandboxed_home(&dir);
+    let cwd = env::current_dir().unwrap();
+    env::set_current_dir(dir.path()).unwrap();
+
+    // Unset -> default.
+    let config = MoConfig::load(None).unwrap();
+    assert_eq!(config.theme_color, DEFAULT_THEME_COLOR);
+
+    // Set -> parsed.
+    unsafe {
+        env::set_var("MO_THEME_COLOR", "#ff0000");
+    }
+    let config = MoConfig::load(None).unwrap();
+    assert_eq!(config.theme_color, "#ff0000");
+
+    // Invalid -> default (the env fallback is lenient, unlike the file).
+    unsafe {
+        env::set_var("MO_THEME_COLOR", "nope");
+    }
+    let config = MoConfig::load(None).unwrap();
+    assert_eq!(config.theme_color, DEFAULT_THEME_COLOR);
+
+    unsafe {
+        env::remove_var("MO_THEME_COLOR");
+    }
+    env::set_current_dir(&cwd).unwrap();
 }
 
 #[test]

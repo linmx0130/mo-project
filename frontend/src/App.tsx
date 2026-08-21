@@ -2,11 +2,10 @@ import { useCallback, useEffect, useState } from 'react'
 import type { Session } from './api'
 import { deleteSession, getMeta, listSessions } from './api'
 import { clearDraft, loadDraft, saveDraft, type Draft } from './draft'
+import { applyThemeColor, type Theme } from './theme'
 import DraftSession from './components/DraftSession'
 import SessionList from './components/SessionList'
 import SessionView from './components/SessionView'
-
-type Theme = 'dark' | 'light'
 
 const THEME_KEY = 'mo-theme'
 
@@ -37,7 +36,14 @@ function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [draftOpen, setDraftOpen] = useState(false)
   const [lastWorkdir, setLastWorkdir] = useState('')
+  // Theme: applied to <html data-theme> so CSS vars switch; persisted so the
+  // choice survives reloads.
   const [theme, setTheme] = useState<Theme>(initialTheme)
+  // The configured accent color from the gateway (GET /api/meta →
+  // theme_color from mo.toml); null until fetched, and null when the
+  // gateway does not serve one (older gateway) → the stylesheet default
+  // (cyan) applies.
+  const [themeColor, setThemeColor] = useState<string | null>(null)
   // Sidebar folded state: collapsed to a slim rail showing only the toggle
   // button, so the main panel gets the room back on narrow screens. Saved
   // to localStorage so the choice survives reloads.
@@ -57,6 +63,13 @@ function App() {
   useEffect(() => {
     applyTheme(theme)
   }, [theme])
+
+  // Accent color: re-derive the --accent* CSS variables whenever the theme
+  // or the configured color changes (light mode uses the color verbatim;
+  // dark mode lightens it for contrast).
+  useEffect(() => {
+    applyThemeColor(theme, themeColor)
+  }, [theme, themeColor])
 
   // Mirror the sidebar folded state to localStorage.
   useEffect(() => {
@@ -115,15 +128,20 @@ function App() {
 
   // Pre-fill the draft workdir with the gateway's startup directory (the
   // cwd the gateway process was launched from), so new sessions don't make
-  // the user retype it.
+  // the user retype it. Also picks up the configured accent color
+  // (`theme_color` from mo.toml) so the UI is themed before the first
+  // user interaction.
   useEffect(() => {
     let cancelled = false
     getMeta()
       .then((meta) => {
-        if (!cancelled && meta.cwd) setLastWorkdir(meta.cwd)
+        if (cancelled) return
+        if (meta.cwd) setLastWorkdir(meta.cwd)
+        setThemeColor(meta.theme_color ?? null)
       })
       .catch(() => {
-        // gateway not reachable; fall back to an empty workdir
+        // gateway not reachable; fall back to an empty workdir and the
+        // default (cyan) accent
       })
     return () => {
       cancelled = true

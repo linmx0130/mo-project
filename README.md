@@ -60,7 +60,8 @@ data/                      # runtime data dir (gitignored): mo.db + sessions/<id
 ## Configuration (`mo.toml`)
 
 All configuration lives in a TOML file — models, ports, data dir, agents
-dir, subagent depth. The gateway resolves it in this order:
+dir, subagent depth, the UI theme color. The gateway resolves it in this
+order:
 
 1. `--config <file>` passed to `mo_gateway`
 2. `$PWD/mo.toml`
@@ -75,6 +76,12 @@ template; the essentials:
 port = 3031                    # gateway HTTP port (default 3031)
 # data_dir = "./data"          # runtime data (default ./data)
 # agents_dir = "~/.agents"     # global agents dir (default $HOME/.agents)
+# theme_color = "#009dc4"      # UI accent (theme) color as a hex value
+                              # (#RGB or #RRGGBB; default "#009dc4",
+                              # deep cyan). Light mode uses it verbatim
+                              # (translucent tints are derived from it);
+                              # dark mode auto-lightens it for contrast on
+                              # the dark background.
 # subagent_depth = 0           # accepted for backward compatibility (no longer
                               # changes behavior): root sessions are always
                               # depth 0 (never framed as subagents); nesting is
@@ -454,6 +461,7 @@ kept for existing setups; new installs should use the config file:
 | `MO_WORKER_BIN` | gateway | sibling of `mo_gateway` exe named `mo_worker` |
 | `MO_PORT` | gateway | `3031` |
 | `MO_BIND` | gateway | `0.0.0.0` (listen address; set `127.0.0.1` when behind a reverse proxy) |
+| `MO_THEME_COLOR` | gateway | `#009dc4` (UI accent color as a hex value; invalid values fall back to the default) |
 
 ## Global agent data (`$HOME/.agents`)
 
@@ -505,7 +513,7 @@ the model):
 
 | Endpoint | Description |
 | --- | --- |
-| `GET /api/meta` | static gateway metadata: `{cwd}` (gateway startup dir, used as the default session workdir) |
+| `GET /api/meta` | static gateway metadata: `{cwd, theme_color}` (`cwd` = gateway startup dir, used as the default session workdir; `theme_color` = the configured UI accent color from `mo.toml`, default `#009dc4`) |
 | `GET /api/models` | configured models from `mo.toml` (`[{nickname, name, base_url, default}]`; first one is `default`) |
 | `GET /api/modes` | built-in session modes: `[{name, label, description, tools, writable}]` (`build`, `plan`, `explore`) |
 | `GET /api/tools` | the session tool registry for the "New session" checkbox list: `[{name, label, description, fixed}]` — `fixed` (bash + file operations) tools are always available, the rest may be disabled per session |
