@@ -16,6 +16,12 @@
 //!                                     # set to "127.0.0.1" behind a reverse proxy so
 //!                                     # the public network can never reach the gateway
 //!                                     # directly
+//! theme_color   = "#009dc4"           # optional; the web UI's accent color as a
+//!                                     # hex value (#RGB or #RRGGBB; default #009dc4,
+//!                                     # deep cyan). Light mode uses the color
+//!                                     # verbatim (translucent tints are derived
+//!                                     # from it); dark mode auto-lightens it for
+//!                                     # contrast on the dark background.
 //! subagent_depth = 0                  # accepted for backward compatibility (no longer
 //!                                     # changes behavior): root sessions are always
 //!                                     # depth 0; nesting is hard-capped at 1
@@ -65,6 +71,10 @@ pub const DEFAULT_MAX_TOOL_CONCURRENCY: usize = 8;
 /// `MoConfig::context_compression_threshold`).
 pub const DEFAULT_CONTEXT_COMPRESSION_THRESHOLD: f64 = 0.75;
 
+/// Default UI accent color: deep cyan (see `MoConfig::theme_color`). Light
+/// mode uses it verbatim; dark mode auto-lightens it for contrast.
+pub const DEFAULT_THEME_COLOR: &str = "#009dc4";
+
 /// One configured LLM endpoint.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ModelConfig {
@@ -100,6 +110,12 @@ pub struct FileConfig {
     /// is never reachable from the public network directly.
     #[serde(default)]
     pub bind: Option<String>,
+    /// The web UI's accent color as a hex value (`#RGB` or `#RRGGBB`;
+    /// default `DEFAULT_THEME_COLOR`, deep cyan). Light mode uses the color
+    /// verbatim with derived translucent tints; dark mode auto-lightens it
+    /// for contrast on the dark background.
+    #[serde(default)]
+    pub theme_color: Option<String>,
     #[serde(default)]
     pub subagent_depth: Option<u32>,
     #[serde(default)]
@@ -129,6 +145,11 @@ pub struct MoConfig {
     /// to `"127.0.0.1"` when nginx fronts the gateway so it is only
     /// reachable through the proxy.
     pub bind: String,
+    /// The web UI's accent color as a hex value (default
+    /// `DEFAULT_THEME_COLOR`); served to the frontend via `GET /api/meta`,
+    /// which derives the translucent tints and the dark-mode variant from
+    /// it.
+    pub theme_color: String,
     pub subagent_depth: u32,
     pub worker_bin: Option<PathBuf>,
     /// Maximum number of tool calls from a single assistant message that
@@ -157,6 +178,14 @@ impl MoConfig {
                     && !(t > 0.0 && t <= 1.0)
                 {
                     return Err(ConfigError::InvalidThreshold { path, value: t });
+                }
+                if let Some(color) = &file.theme_color
+                    && !is_valid_hex_color(color)
+                {
+                    return Err(ConfigError::InvalidThemeColor {
+                        path,
+                        value: color.clone(),
+                    });
                 }
                 let config = file.into_config();
                 Ok(config.with_source(Some(path)))
@@ -207,6 +236,10 @@ impl MoConfig {
                 .ok()
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| DEFAULT_BIND.to_string()),
+            theme_color: env::var("MO_THEME_COLOR")
+                .ok()
+                .filter(|v| is_valid_hex_color(v))
+                .unwrap_or_else(|| DEFAULT_THEME_COLOR.to_string()),
             subagent_depth: env::var("MO_SUBAGENT_DEPTH")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -238,6 +271,9 @@ impl FileConfig {
             agents_dir: self.agents_dir.unwrap_or_else(default_agents_dir),
             port: self.port.unwrap_or(DEFAULT_PORT),
             bind: self.bind.unwrap_or_else(|| DEFAULT_BIND.to_string()),
+            theme_color: self
+                .theme_color
+                .unwrap_or_else(|| DEFAULT_THEME_COLOR.to_string()),
             subagent_depth: self.subagent_depth.unwrap_or(0),
             worker_bin: self.worker_bin,
             max_tool_concurrency: self
@@ -259,6 +295,17 @@ pub fn default_agents_dir() -> PathBuf {
         Ok(home) if !home.is_empty() => PathBuf::from(home).join(".agents"),
         _ => PathBuf::from(".agents"),
     }
+}
+
+/// Whether a string is a valid hex color: `#` followed by 3 or 6 hex
+/// digits (`#RGB` / `#RRGGBB`, case-insensitive). Used to validate
+/// `theme_color` from `mo.toml` (the env fallback is lenient and drops
+/// invalid values instead).
+fn is_valid_hex_color(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix('#') else {
+        return false;
+    };
+    matches!(hex.len(), 3 | 6) && hex.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Resolve the config file path: explicit `--config` first, then the search
@@ -315,6 +362,10 @@ pub enum ConfigError {
         "invalid context_compression_threshold in {path}: {value} (expected a fraction in (0, 1])"
     )]
     InvalidThreshold { path: PathBuf, value: f64 },
+    #[error(
+        "invalid theme_color in {path}: {value} (expected a hex color like \"#009dc4\" — #RGB or #RRGGBB)"
+    )]
+    InvalidThemeColor { path: PathBuf, value: String },
 }
 
 // Unit tests live in `mo_core/src/tests/config_tests.rs` (see AGENTS.md).

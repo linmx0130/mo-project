@@ -46,8 +46,9 @@ npm run dev                   # dev server on :3030, /api proxied to :3031
 - Workers are the single writers of their session journal; the gateway only
   reads files + DB and controls workers via spawn/kill (process group).
 - Configuration lives in `mo.toml` (models, port, data dir, agents dir,
-  subagent depth); the gateway passes the resolved values to spawned workers
-  via env. `MO_*` env vars are only a fallback when no config file exists.
+  subagent depth, theme color); the gateway passes the resolved values to
+  spawned workers via env. `MO_*` env vars are only a fallback when no
+  config file exists.
 - Tool outputs are capped at ~1 MB; paths are sandboxed to the session workdir
   and the session scratch dir (`read_file` may also read global skill folders;
   skill bodies are fetched via the `load_skill` tool). Paths outside those

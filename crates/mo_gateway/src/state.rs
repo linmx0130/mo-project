@@ -13,6 +13,11 @@ pub struct AppState {
     /// Working directory the gateway process was started in; the frontend
     /// uses it as the default session workdir.
     pub cwd: PathBuf,
+    /// The web UI's accent color as a hex value (from `mo.toml`, default
+    /// `mo_core::config::DEFAULT_THEME_COLOR`); served to the frontend via
+    /// `GET /api/meta`, which derives the translucent tints and the
+    /// dark-mode variant from it.
+    pub theme_color: String,
     /// Global agents dir passed to every worker (`$HOME/.agents` by
     /// default; see `mo_core::config::default_agents_dir`).
     pub agents_dir: PathBuf,

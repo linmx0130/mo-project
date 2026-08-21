@@ -36,6 +36,7 @@ fn test_app() -> TestApp {
         db: Mutex::new(conn),
         worker_bin,
         cwd: dir.path().to_path_buf(),
+        theme_color: mo_core::config::DEFAULT_THEME_COLOR.to_string(),
         agents_dir: dir.path().join("agents"),
         max_tool_concurrency: mo_core::config::DEFAULT_MAX_TOOL_CONCURRENCY,
         context_compression_threshold: mo_core::config::DEFAULT_CONTEXT_COMPRESSION_THRESHOLD,
@@ -166,6 +167,35 @@ async fn send_followup(app: &Arc<AppState>, id: &str, content: &str) -> StatusCo
         .body(Body::from(format!(r#"{{"content":"{content}"}}"#)))
         .unwrap();
     router.oneshot(request).await.unwrap().status()
+}
+
+/// GET /api/meta serves the gateway's startup cwd and the configured UI
+/// accent color (the default cyan unless `theme_color` is set).
+#[tokio::test]
+async fn meta_serves_cwd_and_theme_color() {
+    let app = test_app();
+    let router = create_router(app.state.clone());
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/meta")
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        value["cwd"],
+        app.state.cwd.display().to_string(),
+        "meta: {value}"
+    );
+    assert_eq!(
+        value["theme_color"],
+        mo_core::config::DEFAULT_THEME_COLOR,
+        "meta: {value}"
+    );
 }
 
 /// The happy path of the followup journal: a mode-change notice

@@ -67,12 +67,18 @@ struct MetaResponse {
     /// Absolute path of the directory the gateway process was started in —
     /// the frontend pre-fills it as the default session workdir.
     cwd: String,
+    /// The web UI's accent color as a hex value (from `mo.toml`
+    /// `theme_color`, default `#009dc4`). The frontend derives the
+    /// translucent tints and the dark-mode variant from it.
+    theme_color: String,
 }
 
-/// GET /api/meta — static gateway metadata (currently just the cwd).
+/// GET /api/meta — static gateway metadata (cwd + the configured UI accent
+/// color).
 async fn meta(State(state): State<Arc<AppState>>) -> Json<MetaResponse> {
     Json(MetaResponse {
         cwd: state.cwd.display().to_string(),
+        theme_color: state.theme_color.clone(),
     })
 }
 
