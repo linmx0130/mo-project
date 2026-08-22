@@ -963,9 +963,21 @@ async fn spawn_worker_passes_context_window_env() {
     std::fs::create_dir_all(&workdir).unwrap();
     let data_dir = dir.path().join("data");
     let env_file = dir.path().join("env.txt");
+    let env_tmp = dir.path().join("env.txt.tmp");
+    // The stub dumps its env to a temp file and then atomically renames it
+    // into place. Writing directly to `env_file` is racy: the shell's `>`
+    // redirection truncates (creates) the file before `env | grep` has
+    // written anything, so a poll that sees the file exist can still read an
+    // empty dump — hit on slow/loaded runners (e.g. GitHub Actions) as
+    // "MO_CONTEXT_WINDOW missing from worker env: ".
     let worker_bin = write_stub_worker(
         dir.path(),
-        &format!("#!/bin/sh\nenv | grep MO_ > {}\n", env_file.display()),
+        &format!(
+            "#!/bin/sh\nenv | grep MO_ > {}; mv {} {}\n",
+            env_tmp.display(),
+            env_tmp.display(),
+            env_file.display()
+        ),
     );
     let conn = mo_core::open_db(&data_dir.join("mo.db")).unwrap();
     let state = Arc::new(AppState {
