@@ -18,6 +18,11 @@ workers each get their own sequence):
     /api/sessions/:id/permission/answer); the resumed connection already
     carries the held call's outcome as an ordinary tool result and gives
     the final answer
+  * prompt contains "image" (or the last user message carries an
+    `image_url` part) -> replies that it can see the attached image, after
+    verifying the worker rebuilt it into a base64 `data:image/…;base64,…`
+    URL (the image-content smoke path; the mock also tolerates typed
+    content lists in any message)
   * prompt contains "slow"     -> request 1 asks for `bash sleep 60`
                                  (use this to test cancel)
   * otherwise                  -> read_file greeting.txt, then
@@ -102,7 +107,31 @@ class Handler(BaseHTTPRequestHandler):
         n = getattr(state, "count", 0)
         state.count = n + 1
         user_msgs = [m for m in body.get("messages", []) if m.get("role") == "user"]
-        prompt = user_msgs[0].get("content", "") if user_msgs else ""
+        # A message's content may be a plain string or an OpenAI-style typed
+        # content list ({type: text, text} / {type: image_url, image_url}).
+        # Flatten the text parts; record whether any image_url part arrived.
+        def content_text(content):
+            if isinstance(content, str):
+                return content, False
+            if isinstance(content, list):
+                text = "".join(
+                    part.get("text", "")
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                )
+                has_image = any(
+                    isinstance(part, dict)
+                    and part.get("type") == "image_url"
+                    and part.get("image_url", {}).get("url", "").startswith("data:image/")
+                    for part in content
+                )
+                return text, has_image
+            return "", False
+
+        prompt = ""
+        last_user_has_image = False
+        if user_msgs:
+            prompt, last_user_has_image = content_text(user_msgs[0].get("content", ""))
 
         system_msgs = [m for m in body.get("messages", []) if m.get("role") == "system"]
         if any("short title" in m.get("content", "") for m in system_msgs):
@@ -112,6 +141,18 @@ class Handler(BaseHTTPRequestHandler):
                 {"role": "assistant"},
                 {"content": (prompt[:40] if prompt else "Untitled session")},
             ]
+        elif "image" in prompt or last_user_has_image:
+            # The smoke test's image flow: the user attached an image and the
+            # worker rebuilt it into a base64 data URL in the message content.
+            # Verify it arrived, then reply about it.
+            if last_user_has_image:
+                deltas = [{"role": "assistant"}] + stream_text(
+                    "I can see the image you attached to this message."
+                )
+            else:
+                deltas = [{"role": "assistant"}] + stream_text(
+                    "I expected an attached image but did not receive one."
+                )
         elif any(
             "The user answered your clarification question" in m.get("content", "")
             for m in user_msgs

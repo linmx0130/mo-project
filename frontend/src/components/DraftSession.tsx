@@ -1,6 +1,15 @@
 import { useEffect, useState } from 'react'
 import type { Mode, ModeInfo, ModelInfo, Session, SkillInfo, ToolInfo } from '../api'
-import { createSession, getModels, getModes, getSkills, getTools } from '../api'
+import {
+  createSession,
+  deleteSession,
+  getModels,
+  getModes,
+  getSkills,
+  getTools,
+  postMessage,
+  uploadImage,
+} from '../api'
 import type { Draft } from '../draft'
 import Composer from './Composer'
 
@@ -135,28 +144,60 @@ export default function DraftSession({
     onDraftChange({ skills: next })
   }
 
-  const handleSend = async (text: string): Promise<boolean> => {
+  /** Create the session and send the first message. With attached images the
+   *  send is two-phase: the session row is created *deferred* (no worker —
+   *  the row creates the session folder), the image files are uploaded into
+   *  it, and the first message is sent via the followup path, which is what
+   *  journals it and spawns the worker. On a mid-flow failure the deferred
+   *  session is deleted again (best-effort), so no empty pending session is
+   *  left behind. */
+  const handleSend = async (text: string, files: File[]): Promise<boolean> => {
     if (!draft?.workdir.trim()) {
       setError('Working directory is required.')
       return false
     }
     setSending(true)
     setError(null)
+    let createdId: string | null = null
     try {
-      const session = await createSession(
+      if (files.length === 0) {
+        const session = await createSession(
+          draft.workdir.trim(),
+          text,
+          draft.model || undefined,
+          draft.mode,
+          bannedTools,
+          forcedSkills,
+        )
+        onCreated(session)
+        return true
+      }
+      const deferred = await createSession(
         draft.workdir.trim(),
-        text,
+        '',
         draft.model || undefined,
         draft.mode,
         bannedTools,
         forcedSkills,
+        true, // defer_spawn: row only, the first message is sent below
       )
+      createdId = deferred.id
+      const images = await Promise.all(
+        files.map((f) => uploadImage(deferred.id, f)),
+      )
+      const session = await postMessage(deferred.id, text, images)
       onCreated(session)
       return true
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
-      setSending(false)
+      if (createdId) {
+        // The deferred session never received its first message; drop it
+        // (worker + files + row) so the sidebar stays clean.
+        deleteSession(createdId).catch(() => {})
+      }
       return false
+    } finally {
+      setSending(false)
     }
   }
 

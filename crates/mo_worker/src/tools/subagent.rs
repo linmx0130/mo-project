@@ -197,6 +197,7 @@ fn create_child_session(
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: Vec::new(),
         }))
         .map_err(|e| e.to_string())?;
     Ok(id)

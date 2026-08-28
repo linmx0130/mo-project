@@ -60,6 +60,5 @@ npm run dev                   # dev server on :3030, /api proxied to :3031
 
 ## Branch policy
 
-Per `~/.agents/AGENTS.md`, feature work goes on a branch; the initial MVP was
-committed directly to `main` with explicit user approval. When in doubt,
-follow the user's instruction for the current task.
+Feature work, bug fixes or any other new change go on a branch.
+When in doubt, follow the user's instruction for the current task.

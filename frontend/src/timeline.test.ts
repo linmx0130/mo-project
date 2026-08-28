@@ -320,3 +320,36 @@ describe('buildTimeline — tool blocks at turn boundaries', () => {
     }
   })
 })
+
+describe('buildTimeline — messages with images', () => {
+  it('keeps the images reference on the user message block', () => {
+    const items = buildTimeline([
+      ev({
+        kind: 'message',
+        role: 'user',
+        content: 'what is this?',
+        images: [{ path: 'images/abc.png', mime: 'image/png' }],
+      }),
+    ])
+    const user = items.find(
+      (i) => i.type === 'message' && i.message.role === 'user',
+    )
+    expect(user?.type).toBe('message')
+    if (user?.type !== 'message') return
+    expect(user.message.images).toEqual([
+      { path: 'images/abc.png', mime: 'image/png' },
+    ])
+    // An image-only user message (no text) is still rendered.
+    const items2 = buildTimeline([
+      ev({
+        kind: 'message',
+        role: 'user',
+        content: '',
+        images: [{ path: 'images/abc.png', mime: 'image/png' }],
+      }),
+    ])
+    expect(
+      items2.some((i) => i.type === 'message' && i.message.role === 'user'),
+    ).toBe(true)
+  })
+})

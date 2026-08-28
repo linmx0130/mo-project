@@ -99,6 +99,7 @@ fn history_drops_dangling_tool_calls() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         }))
         .unwrap();
     // The worker journaled the assistant tool call, then died before
@@ -114,6 +115,7 @@ fn history_drops_dangling_tool_calls() {
                 name: "bash".to_string(),
                 arguments: r#"{"command":"./gradlew assembleDebug"}"#.to_string(),
             }]),
+            images: vec![],
         }))
         .unwrap();
     journal
@@ -132,6 +134,7 @@ fn history_drops_dangling_tool_calls() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         }))
         .unwrap();
     drop(journal);
@@ -166,6 +169,7 @@ fn history_keeps_answered_tool_calls() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         }))
         .unwrap();
     journal
@@ -179,6 +183,7 @@ fn history_keeps_answered_tool_calls() {
                 name: "read_file".to_string(),
                 arguments: r#"{"path":"notes.txt"}"#.to_string(),
             }]),
+            images: vec![],
         }))
         .unwrap();
     journal
@@ -196,6 +201,7 @@ fn history_keeps_answered_tool_calls() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         }))
         .unwrap();
     drop(journal);
@@ -241,6 +247,7 @@ fn history_normalizes_empty_assistant_role() {
                 name: "bash".to_string(),
                 arguments: r#"{"command":"echo hi"}"#.to_string(),
             }]),
+            images: vec![],
         }))
         .unwrap();
     journal
@@ -291,6 +298,7 @@ fn history_reorders_tool_messages_to_match_call_order() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         }))
         .unwrap();
     // The assistant called read_file(a) first, then read_file(b).
@@ -312,6 +320,7 @@ fn history_reorders_tool_messages_to_match_call_order() {
                     arguments: r#"{"path":"b.txt"}"#.to_string(),
                 },
             ]),
+            images: vec![],
         }))
         .unwrap();
     // ...but call_b finished first, so its result was journaled first.
@@ -338,6 +347,7 @@ fn history_reorders_tool_messages_to_match_call_order() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         }))
         .unwrap();
     drop(journal);
@@ -478,6 +488,7 @@ async fn e2e_parallel_tool_calls_are_batched_in_call_order() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         }))
         .unwrap();
     run_agent(agent_cfg, &mut journal).await.unwrap();
@@ -641,6 +652,7 @@ async fn e2e_agent_loop_with_mock_llm() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         }))
         .unwrap();
     run_agent(agent_cfg, &mut journal).await.unwrap();
@@ -860,6 +872,7 @@ async fn e2e_provider_without_role_delta_round_trips_tools() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         }))
         .unwrap();
     run_agent(agent_cfg, &mut journal).await.unwrap();
@@ -894,6 +907,7 @@ fn history_reuses_journaled_system_prompt() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         }))
         .unwrap();
     let prompt = "You are in Build mode. [stale copy that must survive]";
@@ -911,6 +925,7 @@ fn history_reuses_journaled_system_prompt() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         }))
         .unwrap();
     drop(journal);
@@ -943,6 +958,7 @@ fn history_places_mode_change_before_followup_user_message() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         }))
         .unwrap();
     journal
@@ -959,6 +975,7 @@ fn history_places_mode_change_before_followup_user_message() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         }))
         .unwrap();
     // The gateway appended the mode-change notice, then the followup.
@@ -975,6 +992,7 @@ fn history_places_mode_change_before_followup_user_message() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         }))
         .unwrap();
     drop(journal);
@@ -1020,6 +1038,7 @@ fn history_synthesizes_answer_message_from_ask_user_answered() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         }))
         .unwrap();
     journal
@@ -1040,7 +1059,8 @@ fn history_synthesizes_answer_message_from_ask_user_answered() {
                 name: "ask_user".to_string(),
                 arguments: r#"{"question_title":"Select a language","question_text":"Which one?","options":[{"option_title":"C++","option_text":"Fast"},{"option_title":"Python","option_text":"Easy"}]}"#.to_string(),
             }]),
-        }))
+        images: vec![],
+}))
         .unwrap();
     journal
         .append(JournalEventKind::ToolResult {
@@ -1058,6 +1078,7 @@ fn history_synthesizes_answer_message_from_ask_user_answered() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         }))
         .unwrap();
     // The gateway appended the answer (what the user picked in the UI).
@@ -1133,6 +1154,7 @@ fn history_synthesizes_decision_message_from_legacy_permission_answered() {
                 name: "read_file".to_string(),
                 arguments: r#"{"path":"/etc/hostname"}"#.to_string(),
             }]),
+            images: vec![],
         }))
         .unwrap();
     journal
@@ -1168,6 +1190,7 @@ fn history_synthesizes_decision_message_from_legacy_permission_answered() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         }))
         .unwrap();
     // The gateway appended the user's decision (Allow) — legacy single-item
@@ -1287,6 +1310,7 @@ fn history_skips_batched_permission_answer() {
                     arguments: r#"{"path":"/etc/b"}"#.to_string(),
                 },
             ]),
+            images: vec![],
         }))
         .unwrap();
     journal
@@ -1433,6 +1457,7 @@ async fn resume_held_permission_calls_delivers_outcomes() {
                     arguments: format!(r#"{{"path":"{b}"}}"#),
                 },
             ]),
+            images: vec![],
         }))
         .unwrap();
     journal
@@ -1750,6 +1775,7 @@ async fn e2e_batched_permission_flow_holds_then_delivers_outcomes() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         }))
         .unwrap();
     run_agent(agent_cfg.clone(), &mut journal).await.unwrap();
@@ -1873,6 +1899,7 @@ fn user_msg(content: &str) -> JournalEventKind {
         reasoning_content: None,
         tool_call_id: None,
         tool_calls: None,
+        images: vec![],
     })
 }
 
@@ -1883,6 +1910,7 @@ fn assistant_msg(content: &str) -> JournalEventKind {
         reasoning_content: None,
         tool_call_id: None,
         tool_calls: None,
+        images: vec![],
     })
 }
 
@@ -2074,6 +2102,7 @@ fn history_keeps_post_handoff_tool_order() {
                     arguments: r#"{"path":"b.txt"}"#.to_string(),
                 },
             ]),
+            images: vec![],
         }))
         .unwrap();
     // call_b finished first.
@@ -2156,6 +2185,7 @@ fn history_drops_dangling_tool_calls_after_handoff() {
                 name: "bash".to_string(),
                 arguments: r#"{"command":"make"}"#.to_string(),
             }]),
+            images: vec![],
         }))
         .unwrap();
     journal
@@ -2394,6 +2424,7 @@ async fn e2e_context_compression_generates_handoff_and_resumes() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         }))
         .unwrap();
     run_agent(agent_cfg, &mut journal).await.unwrap();
@@ -2466,4 +2497,129 @@ async fn e2e_context_compression_generates_handoff_and_resumes() {
     assert!(
         matches!(kinds[10], JournalEventKind::Message(m) if m.role == "assistant" && m.content.contains("continued after compression"))
     );
+}
+
+/// A journaled user message with images rebuilds into an OpenAI-style typed
+/// content list: a text part plus one `image_url` part per image, each
+/// carrying a `data:<mime>;base64,…` URL — the nah_chat base64 image
+/// content API the worker feeds the LLM.
+#[test]
+fn history_rebuilds_images_into_typed_content() {
+    let dir = tempfile::tempdir().unwrap();
+    // The journal sits directly in the session dir; images live in
+    // `images/` next to it, exactly like a real session.
+    let images_dir = dir.path().join("images");
+    std::fs::create_dir_all(&images_dir).unwrap();
+    let png_bytes: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    std::fs::write(images_dir.join("img1.png"), png_bytes).unwrap();
+
+    let path = dir.path().join("journal.jsonl");
+    let mut journal = JournalWriter::open(&path).unwrap();
+    journal
+        .append(JournalEventKind::Message(JournalMessage {
+            role: "user".to_string(),
+            content: "what does this show?".to_string(),
+            reasoning_content: None,
+            tool_call_id: None,
+            tool_calls: None,
+            images: vec![JournalImage {
+                path: "images/img1.png".to_string(),
+                mime: "image/png".to_string(),
+            }],
+        }))
+        .unwrap();
+
+    let (_, messages, _) = history_from_journal(&path).unwrap();
+    assert_eq!(messages.len(), 1);
+    let ChatMessageContentValue::TypedContentList(parts) = &messages[0].content else {
+        panic!(
+            "expected a typed content list, got: {:?}",
+            messages[0].content
+        );
+    };
+    assert_eq!(parts.len(), 2, "parts: {parts:?}");
+    assert_eq!(parts[0].data_type, "text");
+    assert_eq!(parts[0].text.as_deref(), Some("what does this show?"));
+    assert_eq!(parts[1].data_type, "image_url");
+    let url = parts[1]
+        .image_url
+        .as_ref()
+        .expect("image part carries a url")
+        .url
+        .as_str();
+    let expected = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(png_bytes)
+    );
+    assert_eq!(url, expected);
+}
+
+/// A journaled image whose file is gone must not break the rebuild: the
+/// worker warns and the message keeps its text part.
+#[test]
+fn history_skips_missing_image_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("journal.jsonl");
+    let mut journal = JournalWriter::open(&path).unwrap();
+    journal
+        .append(JournalEventKind::Message(JournalMessage {
+            role: "user".to_string(),
+            content: "see the image?".to_string(),
+            reasoning_content: None,
+            tool_call_id: None,
+            tool_calls: None,
+            images: vec![JournalImage {
+                path: "images/gone.png".to_string(),
+                mime: "image/png".to_string(),
+            }],
+        }))
+        .unwrap();
+
+    let (_, messages, _) = history_from_journal(&path).unwrap();
+    let ChatMessageContentValue::TypedContentList(parts) = &messages[0].content else {
+        panic!(
+            "expected a typed content list with only the text part, got: {:?}",
+            messages[0].content
+        );
+    };
+    assert_eq!(parts.len(), 1, "parts: {parts:?}");
+    assert_eq!(parts[0].data_type, "text");
+}
+
+/// An image path that escapes the session dir (a corrupt or hand-edited
+/// journal) is skipped: only files inside the session dir are base64'd into
+/// the model context.
+#[test]
+fn history_skips_image_paths_escaping_the_session_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    // A real file OUTSIDE the session dir that the journal references via
+    // an absolute path.
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.png"), b"top secret").unwrap();
+
+    let path = dir.path().join("journal.jsonl");
+    let mut journal = JournalWriter::open(&path).unwrap();
+    journal
+        .append(JournalEventKind::Message(JournalMessage {
+            role: "user".to_string(),
+            content: "read this".to_string(),
+            reasoning_content: None,
+            tool_call_id: None,
+            tool_calls: None,
+            images: vec![JournalImage {
+                path: outside.path().join("secret.png").display().to_string(),
+                mime: "image/png".to_string(),
+            }],
+        }))
+        .unwrap();
+
+    let (_, messages, _) = history_from_journal(&path).unwrap();
+    let ChatMessageContentValue::TypedContentList(parts) = &messages[0].content else {
+        panic!(
+            "expected a typed content list with only the text part, got: {:?}",
+            messages[0].content
+        );
+    };
+    assert_eq!(parts.len(), 1, "parts: {parts:?}");
+    assert_eq!(parts[0].data_type, "text");
 }

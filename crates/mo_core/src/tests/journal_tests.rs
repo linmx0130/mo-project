@@ -12,6 +12,7 @@ fn msg_event(role: &str, content: &str) -> JournalEventKind {
         reasoning_content: None,
         tool_call_id: None,
         tool_calls: None,
+        images: vec![],
     })
 }
 
@@ -38,6 +39,7 @@ fn round_trip_append_and_read() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         })
     );
 }

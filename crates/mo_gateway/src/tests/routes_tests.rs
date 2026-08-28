@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use axum::body::Body;
 use axum::http::Request;
 use mo_core::PermissionRequestItem;
+use serde_json::json;
 use tower::ServiceExt;
 
 /// A gateway under test: real AppState + DB in a tempdir, with a
@@ -130,6 +131,7 @@ fn user_msg(content: &str) -> JournalEventKind {
         reasoning_content: None,
         tool_call_id: None,
         tool_calls: None,
+        images: vec![],
     })
 }
 
@@ -140,6 +142,7 @@ fn assistant_msg(content: &str) -> JournalEventKind {
         reasoning_content: None,
         tool_call_id: None,
         tool_calls: None,
+        images: vec![],
     })
 }
 
@@ -1930,4 +1933,286 @@ async fn load_skill_injects_mode_change_when_switched() {
         }
         other => panic!("expected the skill-load user message at seq 4, got: {other:?}"),
     }
+}
+
+/// POST /api/sessions/:id/images stores the raw bytes inside the session's
+/// transaction-history folder (`<session_dir>/images/`) and returns the
+/// journal path; GET serves the bytes back with the right content type.
+#[tokio::test]
+async fn upload_image_stores_and_serves() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    // The session directory is what a real session has (created when the
+    // first message is journaled); a deferred session gets it created by
+    // the upload itself.
+    std::fs::create_dir_all(Path::new(&session.journal_path).parent().unwrap()).unwrap();
+
+    let router = create_router(app.state.clone());
+    let png = vec![0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/sessions/s1/images?name=shot.png")
+        .header("content-type", "image/png")
+        .body(Body::from(png.clone()))
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let path = value["path"].as_str().unwrap().to_string();
+    assert!(path.starts_with("images/"), "path: {path}");
+    assert_eq!(value["name"], "shot.png");
+    assert_eq!(value["mime"], "image/png");
+    assert_eq!(value["size"], png.len() as u64);
+
+    // The file is stored inside the session dir, under the returned path.
+    let stored = app.state.data_dir.join("sessions").join("s1").join(&path);
+    assert_eq!(std::fs::read(&stored).unwrap(), png);
+
+    // GET serves the bytes back with the recorded MIME.
+    let filename = path.strip_prefix("images/").unwrap();
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/api/sessions/s1/images/{filename}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get("content-type").unwrap(), "image/png");
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(bytes.to_vec(), png);
+}
+
+/// The upload endpoint rejects non-image MIME types, disallowed extensions,
+/// missing names and unknown sessions.
+#[tokio::test]
+async fn upload_image_rejects_bad_requests() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    std::fs::create_dir_all(Path::new(&session.journal_path).parent().unwrap()).unwrap();
+    let router = create_router(app.state.clone());
+    let png = vec![0x89u8, b'P'];
+
+    // Non-image content type.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/sessions/s1/images?name=shot.png")
+        .header("content-type", "text/plain")
+        .body(Body::from(png.clone()))
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Disallowed extension.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/sessions/s1/images?name=shot.exe")
+        .header("content-type", "image/png")
+        .body(Body::from(png.clone()))
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // No name at all.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/sessions/s1/images")
+        .header("content-type", "image/png")
+        .body(Body::from(png.clone()))
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Empty body.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/sessions/s1/images?name=shot.png")
+        .header("content-type", "image/png")
+        .body(Body::empty())
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Unknown session.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/sessions/nope/images?name=shot.png")
+        .header("content-type", "image/png")
+        .body(Body::from(png))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// The GET endpoint only serves gateway-generated filenames; anything else
+/// is rejected so a request can never reach outside the images directory.
+#[tokio::test]
+async fn serve_image_rejects_invalid_filenames() {
+    let app = test_app();
+    insert_session(&app.state, "s1", Mode::Build);
+    let router = create_router(app.state.clone());
+    for bad in [
+        "..%2F..%2Fmo.db",
+        "a.png",
+        "not-a-uuid.png",
+        "images",
+        "000000000000000000000000000000000000.txt",
+    ] {
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/api/sessions/s1/images/{bad}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "expected 400 for {bad}"
+        );
+    }
+}
+
+/// A message with images journals the image references in the user message
+/// event; the worker rebuilds them into base64 image_url parts for the LLM.
+/// An image-only message (empty text) is valid too.
+#[tokio::test]
+async fn send_message_journals_images() {
+    let app = test_app();
+    insert_session(&app.state, "s1", Mode::Build);
+    // The referenced image must actually exist in the session's images dir.
+    let images_dir = app
+        .state
+        .data_dir
+        .join("sessions")
+        .join("s1")
+        .join("images");
+    std::fs::create_dir_all(&images_dir).unwrap();
+    std::fs::write(
+        images_dir.join("000000000000000000000000000000000000.png"),
+        b"png",
+    )
+    .unwrap();
+
+    let image =
+        json!({ "path": "images/000000000000000000000000000000000000.png", "mime": "image/png" });
+    let (status, _) = send_followup_json(
+        &app.state,
+        "s1",
+        &json!({ "content": "look", "images": [image.clone()] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let kinds = read_kinds(&app, "s1");
+    match kinds.last().unwrap() {
+        JournalEventKind::Message(m) if m.role == "user" => {
+            assert_eq!(m.content, "look");
+            assert_eq!(m.images.len(), 1);
+            assert_eq!(
+                m.images[0].path,
+                "images/000000000000000000000000000000000000.png"
+            );
+            assert_eq!(m.images[0].mime, "image/png");
+        }
+        other => panic!("expected the user message with images, got: {other:?}"),
+    }
+
+    // Image-only message (empty text + images) is valid too. A fresh
+    // session: the first respawn leaves the session pending with an
+    // instantly-exited stub worker's pid, which a second send rejects.
+    insert_session(&app.state, "s2", Mode::Build);
+    let images_dir = app
+        .state
+        .data_dir
+        .join("sessions")
+        .join("s2")
+        .join("images");
+    std::fs::create_dir_all(&images_dir).unwrap();
+    std::fs::write(
+        images_dir.join("000000000000000000000000000000000000.png"),
+        b"png",
+    )
+    .unwrap();
+    let image =
+        json!({ "path": "images/000000000000000000000000000000000000.png", "mime": "image/png" });
+    let (status, _) = send_followup_json(
+        &app.state,
+        "s2",
+        &json!({ "content": "", "images": [image] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let kinds = read_kinds(&app, "s2");
+    match kinds.last().unwrap() {
+        JournalEventKind::Message(m) if m.role == "user" => {
+            assert!(m.content.is_empty());
+            assert_eq!(m.images.len(), 1);
+        }
+        other => panic!("expected the image-only user message, got: {other:?}"),
+    }
+}
+
+/// A message referencing an image that does not exist (or a path outside
+/// the session's images dir) is rejected before anything is journaled.
+#[tokio::test]
+async fn send_message_rejects_unknown_images() {
+    let app = test_app();
+    insert_session(&app.state, "s1", Mode::Build);
+
+    // Missing file under a valid name.
+    let (status, _) = send_followup_json(
+        &app.state,
+        "s1",
+        &json!({ "content": "hi", "images": [{ "path": "images/000000000000000000000000000000000000.png", "mime": "image/png" }] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Path escaping the images dir.
+    let (status, _) = send_followup_json(
+        &app.state,
+        "s1",
+        &json!({ "content": "hi", "images": [{ "path": "journal.jsonl", "mime": "image/png" }] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Malformed path shape.
+    let (status, _) = send_followup_json(
+        &app.state,
+        "s1",
+        &json!({ "content": "hi", "images": [{ "path": "images/evil.png", "mime": "image/png" }] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Nothing was journaled.
+    let kinds = read_kinds(&app, "s1");
+    assert!(kinds.is_empty(), "kinds: {kinds:#?}");
+}
+
+/// POST /api/sessions/:id/messages with a JSON body, returning the status.
+async fn send_followup_json(
+    app: &Arc<AppState>,
+    id: &str,
+    body: &serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let router = create_router(app.clone());
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/sessions/{id}/messages"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, value)
 }
