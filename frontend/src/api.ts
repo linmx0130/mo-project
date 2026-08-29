@@ -143,6 +143,20 @@ export interface JournalMessage {
   reasoning_content?: string | null
   tool_call_id?: string | null
   tool_calls?: ToolCallInfo[] | null
+  /** Images attached to this message (user messages only): each `path` is
+   *  relative to the session dir (`images/<uuid>.<ext>`) and is served by
+   *  `GET /api/sessions/:id/images/<filename>`; the worker rebuilds them
+   *  into base64 `image_url` parts for the LLM. Empty/absent = plain text. */
+  images?: JournalImage[]
+}
+
+/** An image attached to a journaled user message: the file lives in the
+ *  session's `images/` directory (the transaction-history folder). `path`
+ *  is relative to the session dir — e.g. `images/<uuid>.png` — and `mime`
+ *  is recorded at upload time for the LLM's `data:<mime>;base64,…` URL. */
+export interface JournalImage {
+  path: string
+  mime: string
 }
 
 export type JournalEventKind =
@@ -331,12 +345,14 @@ export function createSession(
   mode?: Mode,
   bannedTools?: string[],
   skills?: string[],
+  deferSpawn?: boolean,
 ): Promise<Session> {
-  const body: Record<string, string | string[]> = { workdir, prompt }
+  const body: Record<string, string | string[] | boolean> = { workdir, prompt }
   if (model) body.model = model
   if (mode) body.mode = mode
   if (bannedTools && bannedTools.length > 0) body.banned_tools = bannedTools
   if (skills && skills.length > 0) body.skills = skills
+  if (deferSpawn) body.defer_spawn = true
   return http('/api/sessions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -414,13 +430,45 @@ export function answerPermission(
   })
 }
 
+/** Upload an image file into the session's transaction-history folder
+ *  (`data/sessions/<id>/images/`). The body is the raw file bytes with its
+ *  MIME type; the original filename travels in `?name=` (only its extension
+ *  is trusted). Returns the journaled `path` (relative to the session dir)
+ *  plus the recorded MIME. */
+export function uploadImage(sessionId: string, file: File): Promise<JournalImage> {
+  return http(
+    `/api/sessions/${sessionId}/images?name=${encodeURIComponent(file.name)}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': file.type || 'application/octet-stream' },
+      body: file,
+    },
+  )
+}
+
+/** The URL serving a journaled image (`path` is relative to the session
+ *  dir, e.g. `images/<uuid>.png`) — used for composer thumbnails and
+ *  timeline rendering. */
+export function imageUrl(sessionId: string, path: string): string {
+  const filename = path.includes('/') ? path.split('/').pop() : path
+  return `/api/sessions/${sessionId}/images/${encodeURIComponent(filename ?? '')}`
+}
+
 /** Send a followup message to a terminal session; the worker respawns and
- *  continues the conversation from the journal history. */
-export function postMessage(id: string, content: string): Promise<Session> {
+ *  continues the conversation from the journal history. `images` lists the
+ *  attached images (paths returned by `uploadImage`); the worker rebuilds
+ *  them into base64 `image_url` parts for the LLM. */
+export function postMessage(
+  id: string,
+  content: string,
+  images?: JournalImage[],
+): Promise<Session> {
+  const body: { content: string; images?: JournalImage[] } = { content }
+  if (images && images.length > 0) body.images = images
   return http(`/api/sessions/${id}/messages`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ content }),
+    body: JSON.stringify(body),
   })
 }
 

@@ -26,7 +26,7 @@ pub use tools::{
     is_toggleable, resolve_enabled_tools,
 };
 pub use types::{
-    AskUserMarker, AskUserOption, AskUserQuestion, JournalEvent, JournalEventKind, JournalMessage,
-    Mode, PermissionDecision, PermissionMarker, PermissionRequestItem, Session, SessionStatus,
-    ToolCallInfo, last_ask_user_marker, last_model_marker, last_permission_marker,
+    AskUserMarker, AskUserOption, AskUserQuestion, JournalEvent, JournalEventKind, JournalImage,
+    JournalMessage, Mode, PermissionDecision, PermissionMarker, PermissionRequestItem, Session,
+    SessionStatus, ToolCallInfo, last_ask_user_marker, last_model_marker, last_permission_marker,
 };

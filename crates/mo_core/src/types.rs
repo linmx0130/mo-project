@@ -166,6 +166,20 @@ pub struct ToolCallInfo {
     pub arguments: String,
 }
 
+/// An image attached to a journaled user message: the file lives in the
+/// session's `images/` directory (the transaction-history folder), and the
+/// journal carries the reference. `path` is relative to the session
+/// directory (the parent of `journal.jsonl`) — e.g. `images/<uuid>.png` —
+/// so the worker resolves it against the journal's location and the
+/// frontend renders it via `GET /api/sessions/:id/images/<filename>`.
+/// `mime` is recorded at upload time and becomes the `data:<mime>;base64,…`
+/// data URL the worker sends to the LLM.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JournalImage {
+    pub path: String,
+    pub mime: String,
+}
+
 /// A chat message mirrored into the journal.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JournalMessage {
@@ -177,6 +191,12 @@ pub struct JournalMessage {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallInfo>>,
+    /// Images attached to this message (user messages only; assistant and
+    /// tool messages never carry them). `#[serde(default)]` keeps journals
+    /// written before image support existed parseable; an empty list means
+    /// a plain text message.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<JournalImage>,
 }
 
 /// One selectable option of a clarification question (`ask_user` tool).

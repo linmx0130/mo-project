@@ -337,6 +337,7 @@ async fn history_returns_events_and_respects_after_seq() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         }))
         .unwrap();
     journal
@@ -477,6 +478,7 @@ async fn sse_streams_journal_events_and_closes_on_terminal() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         }))
         .unwrap();
     journal
@@ -1227,6 +1229,7 @@ async fn approve_mode_change_switches_mode_and_continues() {
                 reasoning_content: None,
                 tool_call_id: None,
                 tool_calls: None,
+                images: vec![],
             }))
             .unwrap();
         journal
@@ -1409,6 +1412,7 @@ async fn answer_ask_user_continues_run() {
                 reasoning_content: None,
                 tool_call_id: None,
                 tool_calls: None,
+                images: vec![],
             }))
             .unwrap();
         journal
@@ -1473,4 +1477,104 @@ fn process_is_alive(pid: u32) -> bool {
     let result = unsafe { libc::kill(pid as i32, 0) };
     result == 0
         || (result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+}
+
+/// The New-session form's two-phase image flow: create the session deferred
+/// (row only, no worker), upload an image into its folder, then send the
+/// first message with the image — the followup endpoint accepts the
+/// never-started pending session, journals the message with the image
+/// reference and spawns the worker.
+#[tokio::test]
+async fn deferred_create_upload_then_message_with_image() {
+    let (_dir, app) = setup(false); // stub exits immediately
+    let workdir = _dir.path().join("work");
+
+    // Phase 1: deferred creation — empty prompt allowed, no worker spawned.
+    let (status, session) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({
+            "workdir": workdir.display().to_string(),
+            "prompt": "",
+            "defer_spawn": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = session["id"].as_str().unwrap().to_string();
+    assert_eq!(session["status"], "pending");
+    assert!(session["pid"].is_null(), "no worker should be spawned yet");
+
+    // Phase 2: upload an image into the session's images dir.
+    let png = vec![0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/sessions/{id}/images?name=shot.png"))
+                .header("content-type", "image/png")
+                .body(Body::from(png))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let bytes = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
+        .await
+        .unwrap();
+    let uploaded: Value = serde_json::from_slice(&bytes).unwrap();
+    let image_path = uploaded["path"].as_str().unwrap().to_string();
+    assert!(image_path.starts_with("images/"), "path: {image_path}");
+    // The file landed in the session's transaction-history folder.
+    assert!(
+        _dir.path()
+            .join("data")
+            .join("sessions")
+            .join(&id)
+            .join(&image_path)
+            .is_file(),
+        "image file should exist in the session folder"
+    );
+
+    // Phase 3: send the first message with the image — the followup path
+    // accepts the never-started pending session and spawns the worker.
+    let (status, session) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{id}/messages"),
+        Some(json!({
+            "content": "what is this?",
+            "images": [{ "path": image_path, "mime": "image/png" }],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(session["status"], "pending");
+    assert!(
+        session["pid"].as_u64().is_some(),
+        "the worker should be spawned now"
+    );
+
+    // The journal carries the message with its images reference.
+    let (status, history) = request(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{id}/history"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let messages: Vec<&Value> = history
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"]["kind"] == "message")
+        .collect();
+    assert_eq!(messages.len(), 1, "history: {history}");
+    assert_eq!(messages[0]["kind"]["role"], "user");
+    assert_eq!(messages[0]["kind"]["content"], "what is this?");
+    assert_eq!(messages[0]["kind"]["images"][0]["path"], image_path);
+    assert_eq!(messages[0]["kind"]["images"][0]["mime"], "image/png");
 }

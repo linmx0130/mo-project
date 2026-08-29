@@ -4,6 +4,8 @@
 
 use super::*;
 
+use serde_json::json;
+
 fn question() -> AskUserQuestion {
     AskUserQuestion {
         question_id: "q1".to_string(),
@@ -83,6 +85,7 @@ fn last_ask_user_marker_scans_from_end() {
         reasoning_content: None,
         tool_call_id: None,
         tool_calls: None,
+        images: vec![],
     }))];
     assert_eq!(last_ask_user_marker(&events), None);
 
@@ -296,6 +299,7 @@ fn last_permission_marker_scans_from_end() {
         reasoning_content: None,
         tool_call_id: None,
         tool_calls: None,
+        images: vec![],
     }))];
     assert_eq!(last_permission_marker(&events), None);
 
@@ -444,6 +448,7 @@ fn last_model_marker_scans_from_end() {
         reasoning_content: None,
         tool_call_id: None,
         tool_calls: None,
+        images: vec![],
     }))];
     assert_eq!(last_model_marker(&events), None);
 
@@ -460,6 +465,7 @@ fn last_model_marker_scans_from_end() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         })),
     ];
     assert_eq!(last_model_marker(&events), Some("model-a".to_string()));
@@ -548,4 +554,35 @@ fn session_skills_defaults_to_empty() {
     assert_eq!(json["skills"][0], "j-space");
     let back: Session = serde_json::from_value(json).unwrap();
     assert_eq!(back.skills, with_skills.skills);
+}
+
+/// A journaled message's `images` survives a serde round-trip, and legacy
+/// journal lines written before image support existed parse with an empty
+/// list (the worker must be able to read old journals).
+#[test]
+fn message_images_round_trip_and_legacy_default() {
+    let with_images = JournalMessage {
+        role: "user".to_string(),
+        content: "what is this?".to_string(),
+        reasoning_content: None,
+        tool_call_id: None,
+        tool_calls: None,
+        images: vec![JournalImage {
+            path: "images/abc.png".to_string(),
+            mime: "image/png".to_string(),
+        }],
+    };
+    let json = serde_json::to_value(&with_images).unwrap();
+    assert_eq!(json["images"][0]["path"], "images/abc.png");
+    assert_eq!(json["images"][0]["mime"], "image/png");
+    let back: JournalMessage = serde_json::from_value(json).unwrap();
+    assert_eq!(back, with_images);
+
+    // Legacy shape: no `images` field → parses with an empty list.
+    let legacy = json!({
+        "role": "user",
+        "content": "old message",
+    });
+    let parsed: JournalMessage = serde_json::from_value(legacy).unwrap();
+    assert!(parsed.images.is_empty(), "legacy messages have no images");
 }

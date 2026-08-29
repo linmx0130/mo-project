@@ -387,6 +387,41 @@ reorders them the same way, so the model-facing context is deterministic
 regardless of completion order. Dependent calls should still be sent in
 separate messages.
 
+## Image content
+
+The composer has an **Upload image** button left of **Send** (in the
+session view *and* the New-session form): picked images appear as
+thumbnails in a strip at the bottom of the typing box (✕ removes one), and
+the message is sent with them attached. An image-only message (no text) is
+valid.
+
+Uploads land in the session's **transaction-history folder**:
+`POST /api/sessions/:id/images` stores each file as
+`<session_dir>/images/<uuid>.<ext>` (the name is gateway-generated; only
+png/jpg/jpeg/gif/webp/bmp with an `image/*` MIME are accepted, 10 MB cap).
+The user `message` journal event records the reference (`images: [{path,
+mime}]`, path relative to the session dir), so the journal stays a
+self-contained history — and a deleted image file is skipped with a log
+warning instead of breaking the conversation.
+
+When the worker rebuilds the chat context from the journal, each attached
+image is read from the session folder, base64-encoded, and sent to the LLM
+through `nah_chat`'s OpenAI-style typed content list — a `text` part plus
+one `image_url` part per image with a `data:<mime>;base64,…` URL, i.e. the
+standard base64 image-content API (`{type: "image_url", image_url: {url:
+"data:image/png;base64,…"}}`). Only files inside the session dir are ever
+embedded (a journal pointing elsewhere is skipped). The frontend renders
+the images of a user message as thumbnails in the timeline via
+`GET /api/sessions/:id/images/<filename>`.
+
+The New-session form's first message with images is sent with a two-phase
+flow: `POST /api/sessions` with `defer_spawn: true` creates the row (and
+with it the session folder) without a worker, the images are uploaded, and
+`POST /api/sessions/:id/messages` sends the first message — which is what
+journals it, spawns the worker and triggers the session title generation.
+If that flow fails partway, the deferred session is deleted again so no
+empty pending session is left behind.
+
 ## Status bar
 
 The session view has a status bar pinned to the bottom showing a mode
@@ -518,12 +553,14 @@ the model):
 | `GET /api/modes` | built-in session modes: `[{name, label, description, tools, writable}]` (`build`, `plan`, `explore`) |
 | `GET /api/tools` | the session tool registry for the "New session" checkbox list: `[{name, label, description, fixed}]` — `fixed` (bash + file operations) tools are always available, the rest may be disabled per session |
 | `GET /api/skills` | every discovered global skill (both layouts, sorted, deduplicated): `[{name, description}]` — for the "New session" skill checkbox list and the status-bar "load skill" picker |
-| `POST /api/sessions` `{workdir, prompt, model?, mode?, banned_tools?, skills?}` | create session + spawn worker (`model` = model name from `/api/models`, default when absent; `mode` = mode name from `/api/modes`, `build` when absent; `banned_tools` = the *toggleable* tools from `/api/tools` to disable for this session — disabled schemas are not injected into the prompt; absent/empty bans nothing, and fixed tools cannot be banned; `skills` = skill names from `/api/skills` to force-load — their full `SKILL.md` is injected into the system prompt at the first run; absent/empty force-loads nothing, and unknown names are rejected) |
+| `POST /api/sessions` `{workdir, prompt, model?, mode?, banned_tools?, skills?, defer_spawn?}` | create session + spawn worker (`model` = model name from `/api/models`, default when absent; `mode` = mode name from `/api/modes`, `build` when absent; `banned_tools` = the *toggleable* tools from `/api/tools` to disable for this session — disabled schemas are not injected into the prompt; absent/empty bans nothing, and fixed tools cannot be banned; `skills` = skill names from `/api/skills` to force-load — their full `SKILL.md` is injected into the system prompt at the first run; absent/empty force-loads nothing, and unknown names are rejected; `defer_spawn` = create the row only — no first message, no worker, no title — used by the New-session form's two-phase image flow: create, upload the images into the session folder, then send the first message via `POST /api/sessions/:id/messages`, which is what journals it and spawns the worker) |
 | `GET /api/sessions` | list root sessions (newest first; subagent sessions are hidden — they are reached through their parent's tool blocks) |
 | `GET /api/sessions/:id` | detail; liveness check flips dead workers to `failed` |
 | `GET /api/sessions/:id/history?after_seq=N` | journal events after `N` |
 | `GET /api/sessions/:id/events` | SSE tail: new events + synthesized status changes |
-| `POST /api/sessions/:id/messages` `{content}` | continue a terminal session: journal the user message (preceded by a `mode_change` notice when the mode was switched since the last run and/or a `model_change` notice when the model was), reset to `pending`, respawn the worker |
+| `POST /api/sessions/:id/messages` `{content, images?}` | continue a terminal session: journal the user message (preceded by a `mode_change` notice when the mode was switched since the last run and/or a `model_change` notice when the model was), reset to `pending`, respawn the worker. `images` (optional) lists attached images as `[{path, mime}]` — `path` must be a path returned by `POST /api/sessions/:id/images`; the worker rebuilds them into base64 `image_url` parts for the LLM. Also accepts the first message of a `defer_spawn` session (a never-started pending session with no worker) |
+| `POST /api/sessions/:id/images` `?name=<file>` (body = raw image bytes, `Content-Type: image/*`) | upload an image file into the session's transaction-history folder (`<session_dir>/images/`, gateway-generated `<uuid>.<ext>` name; 10 MB cap; extensions png/jpg/jpeg/gif/webp/bmp): returns `201 {path, name, mime, size}` — `path` is relative to the session dir (`images/<uuid>.<ext>`) and is what the journal records |
+| `GET /api/sessions/:id/images/:filename` | serve a stored image (composer thumbnails and timeline rendering; only gateway-generated filenames are served) |
 | `POST /api/sessions/:id/skills/load` `{name}` | load a skill from the status bar: journal the skill's full `SKILL.md` as a new user message (wrapped in a marker) and respawn the worker — exactly like a followup, but nothing is persisted on the session row (unknown skill → 400; running session → 409) |
 | `POST /api/sessions/:id/mode` `{mode}` | switch a terminal session's mode (409 while running): changes only the write sandbox of subsequent runs — the journaled system prompt never changes; the switch surfaces as a `mode_change` notice before the next user message |
 | `POST /api/sessions/:id/model` `{model}` | switch a terminal session's model (409 while running): only the next run is affected — the respawned worker is spawned with the new model and receives the full journal history; the switch surfaces as a `model_change` notice before the next run that uses it |
@@ -535,7 +572,10 @@ the model):
 | `DELETE /api/sessions/:id` | permanently delete a session: stop a running worker, remove the session dir (journal, worker log, ...) from disk, drop the DB row (`204` on success) |
 
 Session status: `pending | running | completed | failed | cancelled`.
-Journal events: `message`, `tool_call_start`, `tool_result`, `status_change`,
+Journal events: `message` (a chat message; user messages may carry
+`images`, a list of `{path, mime}` references into the session's `images/`
+folder — see "Image content" below), `tool_call_start`, `tool_result`,
+`status_change`,
 `system_prompt` (the system prompt, journaled once on the first run and
 reused verbatim on every later run, carrying the mode it was built for —
 after a context compression the worker journals a *fresh* one rebuilt for

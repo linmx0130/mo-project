@@ -5,6 +5,7 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64 = "0.22"
 chrono = "0.4.45"
 futures-util.workspace = true
 libc = "0.2.189"

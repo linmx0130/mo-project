@@ -1,5 +1,6 @@
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { imageUrl } from '../api'
 import type { JournalEvent } from '../api'
 import type { MessageBlock, ToolBlock } from '../timeline'
 import CopyButton from './CopyButton'
@@ -165,7 +166,16 @@ export function EventRow({ event }: { event: JournalEvent }) {
   }
 }
 
-export function MessageRow({ message }: { message: MessageBlock }) {
+export function MessageRow({
+  message,
+  sessionId,
+}: {
+  message: MessageBlock
+  /** The session the message belongs to, for rendering attached images
+   *  (`GET /api/sessions/:id/images/<file>`). Optional: a subagent modal
+   *  never renders user messages with images. */
+  sessionId?: string
+}) {
   const role = message.role
   if (role === 'tool') {
     return (
@@ -178,7 +188,22 @@ export function MessageRow({ message }: { message: MessageBlock }) {
     return (
       <div className="msg msg-user">
         <div className="msg-label">user</div>
-        <div className="msg-content">{message.content}</div>
+        {message.content && (
+          <div className="msg-content">{message.content}</div>
+        )}
+        {sessionId && message.images && message.images.length > 0 && (
+          <div className="msg-images">
+            {message.images.map((img, i) => (
+              <img
+                key={`${img.path}-${i}`}
+                className="msg-image"
+                src={imageUrl(sessionId, img.path)}
+                alt=""
+                loading="lazy"
+              />
+            ))}
+          </div>
+        )}
       </div>
     )
   }

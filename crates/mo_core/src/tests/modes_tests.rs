@@ -108,6 +108,7 @@ fn last_mode_marker_resolves_pending_requests() {
             reasoning_content: None,
             tool_call_id: None,
             tool_calls: None,
+            images: vec![],
         }))
     };
     let request = || {

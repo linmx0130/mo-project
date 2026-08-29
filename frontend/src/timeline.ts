@@ -180,6 +180,7 @@ export function buildTimeline(events: JournalEvent[]): TimelineItem[] {
               reasoning_content: kind.reasoning_content ?? null,
               tool_call_id: kind.tool_call_id ?? null,
               tool_calls: kind.tool_calls ?? null,
+              images: kind.images ?? [],
             },
           })
         }

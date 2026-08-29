@@ -7,13 +7,15 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Path as PathParam, Query, State},
-    http::StatusCode,
+    body::Bytes,
+    extract::{DefaultBodyLimit, Path as PathParam, Query, State},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use mo_core::{
-    AskUserMarker, JournalEvent, JournalEventKind, JournalMessage, JournalWriter, Mode,
-    PermissionDecision, PermissionMarker, Session, SessionStatus, db,
+    AskUserMarker, JournalEvent, JournalEventKind, JournalImage, JournalMessage, JournalWriter,
+    Mode, PermissionDecision, PermissionMarker, Session, SessionStatus, db,
 };
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
@@ -24,6 +26,15 @@ use crate::error::{ApiError, ApiResult};
 use crate::process;
 use crate::sse;
 use crate::state::AppState;
+
+/// Max bytes for one uploaded image (the composer's "Upload image" button).
+/// Applied as a route-scoped body limit so the JSON endpoints keep the
+/// default limit.
+const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Extensions accepted for uploaded images (validated against the original
+/// filename's extension and the declared MIME).
+const IMAGE_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "gif", "webp", "bmp"];
 
 pub fn create_router(state: Arc<AppState>) -> Router {
     let cors = CorsLayer::permissive();
@@ -52,6 +63,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/permission/answer",
             post(answer_permission),
         )
+        .route(
+            "/api/sessions/{id}/images",
+            post(upload_image).route_layer(DefaultBodyLimit::max(MAX_IMAGE_BYTES)),
+        )
+        .route("/api/sessions/{id}/images/{filename}", get(serve_image))
         .route("/api/sessions/{id}/cancel", post(cancel))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -175,15 +191,26 @@ struct CreateSessionRequest {
     /// system prompt at the first run. Every name must be a discovered
     /// skill; absent/empty force-loads nothing.
     skills: Option<Vec<String>>,
+    /// Create the session row *without* journaling a first message,
+    /// spawning the worker or generating a title — the New-session form's
+    /// two-phase image flow: create the row (so the session folder exists),
+    /// upload the images into it, then send the first message via
+    /// `POST /api/sessions/:id/messages` (which is what journals it and
+    /// spawns the worker). The session stays `pending` with no pid until
+    /// then; absent/false keeps the current one-shot creation.
+    #[serde(default)]
+    defer_spawn: bool,
 }
 
 /// POST /api/sessions — validate workdir, insert the session row, spawn the
-/// worker, return the session.
+/// worker, return the session. With `defer_spawn` the row is created
+/// without the message/spawn/title parts (see `CreateSessionRequest`).
 async fn create_session(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<CreateSessionRequest>,
 ) -> ApiResult<(StatusCode, Json<Session>)> {
-    if payload.prompt.trim().is_empty() {
+    let defer_spawn = payload.defer_spawn;
+    if !defer_spawn && payload.prompt.trim().is_empty() {
         return Err(ApiError::bad_request("prompt must not be empty"));
     }
     let workdir = PathBuf::from(&payload.workdir);
@@ -276,28 +303,33 @@ async fn create_session(
     // Journal the initial user message before the worker starts: the worker
     // rebuilds its conversation context from the journal, so this is what
     // makes the journal a self-contained history (and followups work the
-    // same way, via POST /api/sessions/:id/messages).
-    {
-        let mut journal =
-            JournalWriter::open(Path::new(&session.journal_path)).map_err(ApiError::internal)?;
-        journal
-            .append(JournalEventKind::Message(JournalMessage {
-                role: "user".to_string(),
-                content: first_message.clone(),
-                reasoning_content: None,
-                tool_call_id: None,
-                tool_calls: None,
-            }))
-            .map_err(ApiError::internal)?;
+    // same way, via POST /api/sessions/:id/messages). Skipped for deferred
+    // sessions: their first message is journaled by
+    // `POST /api/sessions/:id/messages` when the two-phase flow sends it.
+    if !defer_spawn {
+        {
+            let mut journal = JournalWriter::open(Path::new(&session.journal_path))
+                .map_err(ApiError::internal)?;
+            journal
+                .append(JournalEventKind::Message(JournalMessage {
+                    role: "user".to_string(),
+                    content: first_message.clone(),
+                    reasoning_content: None,
+                    tool_call_id: None,
+                    tool_calls: None,
+                    images: Vec::new(),
+                }))
+                .map_err(ApiError::internal)?;
+        }
+
+        spawn_and_patch(&state, &mut session);
+
+        // Fire-and-forget title generation: a short, separate LLM call so
+        // the session does not stay stuck with the placeholder when a model
+        // is configured. The DB (and with it the sidebar/header) updates
+        // when the title lands; failures keep the placeholder.
+        crate::title::spawn_title_generation(state.clone(), id.clone(), first_message);
     }
-
-    spawn_and_patch(&state, &mut session);
-
-    // Fire-and-forget title generation: a short, separate LLM call so the
-    // session does not stay stuck with the placeholder when a model is
-    // configured. The DB (and with it the sidebar/header) updates when the
-    // title lands; failures keep the placeholder.
-    crate::title::spawn_title_generation(state.clone(), id.clone(), first_message);
 
     Ok((StatusCode::CREATED, Json(session)))
 }
@@ -327,24 +359,216 @@ fn spawn_and_patch(state: &AppState, session: &mut Session) {
     }
 }
 
+/// The gateway-assigned name of an uploaded image: `<uuid>.<ext>`, stored
+/// inside the session's `images/` directory. The response's `path` is
+/// relative to the session directory (`images/<filename>`) — the value the
+/// journal records in a message's `images` and that
+/// `GET /api/sessions/:id/images/<filename>` serves.
+#[derive(Serialize)]
+struct UploadedImage {
+    /// Relative to the session directory, e.g. `images/<uuid>.png`.
+    path: String,
+    /// The client's original filename (informational only; the stored name
+    /// is gateway-generated).
+    name: String,
+    /// The image's MIME type, recorded so the worker can build the LLM's
+    /// `data:<mime>;base64,…` URL.
+    mime: String,
+    /// Size in bytes.
+    size: u64,
+}
+
+#[derive(Deserialize)]
+struct UploadImageQuery {
+    /// The client's original filename; only its extension is used.
+    name: Option<String>,
+}
+
+/// True for the exact server-generated image filename shape
+/// `<uuid>.<allowlisted-ext>` — the only names `serve_image` will look up
+/// and `send_message` will accept in a message's `images`, so neither the
+/// filesystem nor the journal can be pointed at paths outside the session's
+/// `images/` directory.
+fn valid_image_filename(name: &str) -> bool {
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return false;
+    }
+    let Some((stem, ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    if !IMAGE_EXTENSIONS.contains(&ext) {
+        return false;
+    }
+    // A UUID is 36 hex/dash characters (8-4-4-4-12).
+    stem.len() == 36 && stem.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// The MIME type served for a stored image, from its extension.
+fn mime_for_image(filename: &str) -> &'static str {
+    match filename.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        _ => "application/octet-stream",
+    }
+}
+
+/// POST /api/sessions/:id/images — upload an image file into the session's
+/// transaction-history folder (`<session_dir>/images/`). The body is the
+/// raw image bytes with `Content-Type: image/*`; the original filename
+/// travels in `?name=` (only its extension is trusted). The gateway names
+/// the stored file `<uuid>.<ext>` and returns the relative `path` the
+/// frontend records in the message and renders via the GET route below.
+async fn upload_image(
+    State(state): State<Arc<AppState>>,
+    PathParam(id): PathParam<String>,
+    Query(query): Query<UploadImageQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<UploadedImage>)> {
+    // The session must exist. Its directory may not yet: a `defer_spawn`
+    // session gets its first upload before any message was journaled or
+    // worker spawned (which is what normally creates the directory).
+    {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        if db::get_session(&conn, &id)
+            .map_err(ApiError::internal)?
+            .is_none()
+        {
+            return Err(ApiError::not_found("session not found"));
+        }
+    }
+    // The declared MIME must be an image; it becomes the `data:<mime>;base64`
+    // URL sent to the LLM.
+    let mime = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !mime.starts_with("image/") {
+        return Err(ApiError::bad_request(format!(
+            "unsupported content type: {mime} (expected an image/* MIME type)"
+        )));
+    }
+    // The original filename's extension must be allowlisted; the stored name
+    // is gateway-generated, so a hostile `?name=` can never escape the
+    // images directory.
+    let original_name = query.name.unwrap_or_default();
+    let ext = original_name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .filter(|ext| IMAGE_EXTENSIONS.contains(&ext.as_str()))
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "unsupported image name: {original_name} (expected a .png/.jpg/.jpeg/.gif/.webp/.bmp file)"
+            ))
+        })?;
+    if body.is_empty() {
+        return Err(ApiError::bad_request("image body must not be empty"));
+    }
+    let filename = format!("{}.{}", uuid::Uuid::new_v4(), ext);
+    let session_dir = state.data_dir.join("sessions").join(&id);
+    let images_dir = session_dir.join("images");
+    std::fs::create_dir_all(&images_dir)
+        .map_err(|e| ApiError::internal(format!("failed to create images dir: {e}")))?;
+    std::fs::write(images_dir.join(&filename), &body)
+        .map_err(|e| ApiError::internal(format!("failed to store image: {e}")))?;
+    Ok((
+        StatusCode::CREATED,
+        Json(UploadedImage {
+            path: format!("images/{filename}"),
+            name: original_name,
+            mime,
+            size: body.len() as u64,
+        }),
+    ))
+}
+
+/// GET /api/sessions/:id/images/:filename — serve a stored image (composer
+/// thumbnails and timeline rendering). Only gateway-generated filenames are
+/// looked up (`valid_image_filename`), so the path can never escape the
+/// session's images directory.
+async fn serve_image(
+    State(state): State<Arc<AppState>>,
+    // Two path parameters must be extracted as a single tuple (axum 0.8
+    // rejects multiple separate `Path` extractors in one handler).
+    PathParam((id, filename)): PathParam<(String, String)>,
+) -> ApiResult<Response> {
+    if !valid_image_filename(&filename) {
+        return Err(ApiError::bad_request("invalid image filename"));
+    }
+    let path = state
+        .data_dir
+        .join("sessions")
+        .join(&id)
+        .join("images")
+        .join(&filename);
+    let bytes =
+        std::fs::read(&path).map_err(|e| ApiError::not_found(format!("image not found: {e}")))?;
+    let mime = mime_for_image(&filename);
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, mime.to_string())],
+        bytes,
+    )
+        .into_response())
+}
+
 #[derive(Deserialize)]
 struct SendMessageRequest {
     content: String,
+    /// Images attached to this message: `path` must be a path the gateway
+    /// returned from `POST /api/sessions/:id/images` (validated against the
+    /// session's images directory); the worker rebuilds them into base64
+    /// `image_url` parts for the LLM. Empty/absent = plain text message.
+    #[serde(default)]
+    images: Vec<JournalImage>,
 }
 
 /// POST /api/sessions/:id/messages — continue a terminal session with a new
 /// user message: journal it, reset the session to `pending`, and spawn a
-/// fresh worker that picks up the full journal history.
+/// fresh worker that picks up the full journal history. Also the first
+/// message of a `defer_spawn` session (the New-session form's two-phase
+/// image flow: the row was created without a message, images were uploaded,
+/// and this endpoint journals the message and starts the worker).
 async fn send_message(
     State(state): State<Arc<AppState>>,
     PathParam(id): PathParam<String>,
     Json(payload): Json<SendMessageRequest>,
 ) -> ApiResult<(StatusCode, Json<Session>)> {
-    if payload.content.trim().is_empty() {
+    if payload.content.trim().is_empty() && payload.images.is_empty() {
         return Err(ApiError::bad_request("message must not be empty"));
     }
     ensure_followup_allowed(&state, &id)?;
-    journal_followup_and_spawn(&state, &id, &payload.content).await
+    // Every attached image must reference a real file in the session's
+    // images directory (validated by name shape + existence), so a message
+    // can never point the worker at arbitrary paths.
+    if !payload.images.is_empty() {
+        let session_dir = state.data_dir.join("sessions").join(&id);
+        for image in &payload.images {
+            let Some(filename) = image.path.strip_prefix("images/") else {
+                return Err(ApiError::bad_request(format!(
+                    "invalid image path: {} (must start with \"images/\")",
+                    image.path
+                )));
+            };
+            if !valid_image_filename(filename) {
+                return Err(ApiError::bad_request(format!(
+                    "invalid image path: {}",
+                    image.path
+                )));
+            }
+            if !session_dir.join(&image.path).is_file() {
+                return Err(ApiError::bad_request(format!(
+                    "image not found: {}",
+                    image.path
+                )));
+            }
+        }
+    }
+    journal_followup_and_spawn(&state, &id, &payload.content, &payload.images).await
 }
 
 #[derive(Deserialize)]
@@ -377,13 +601,15 @@ async fn load_skill(
         &state,
         &id,
         &mo_core::skills::skill_load_message(&skill.name, &content),
+        &[],
     )
     .await
 }
 
 /// Validate that a session may accept a followup (a new user message or a
-/// status-bar skill load): it must exist, be terminal, and its dead worker
-/// must be fully reaped. Shared by `send_message` and `load_skill`.
+/// status-bar skill load): it must exist, be terminal (or a never-started
+/// `defer_spawn` session with no worker), and its dead worker must be fully
+/// reaped. Shared by `send_message` and `load_skill`.
 fn ensure_followup_allowed(state: &AppState, id: &str) -> ApiResult<()> {
     let (status, pid) = {
         let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
@@ -392,7 +618,7 @@ fn ensure_followup_allowed(state: &AppState, id: &str) -> ApiResult<()> {
             None => return Err(ApiError::not_found("session not found")),
         }
     };
-    if status == SessionStatus::Running || status == SessionStatus::Pending {
+    if status == SessionStatus::Running || (status == SessionStatus::Pending && pid.is_some()) {
         return Err(ApiError::conflict("session is already running"));
     }
     // A just-cancelled session's worker may still be dying (cancel records
@@ -406,12 +632,13 @@ fn ensure_followup_allowed(state: &AppState, id: &str) -> ApiResult<()> {
 /// Journal a followup user message (with the mode/model-change notices
 /// injected when the session's mode or model was switched since the last
 /// run), reset the session to `pending`, and spawn a fresh worker — the
-/// shared tail of `send_message` (followup messages) and `load_skill`
-/// (status-bar skill loads).
+/// shared tail of `send_message` (followup messages, with optional `images`)
+/// and `load_skill` (status-bar skill loads, no images).
 async fn journal_followup_and_spawn(
-    state: &AppState,
+    state: &Arc<AppState>,
     id: &str,
     content: &str,
+    images: &[JournalImage],
 ) -> ApiResult<(StatusCode, Json<Session>)> {
     let (journal_path, mode, model) = {
         let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
@@ -437,10 +664,16 @@ async fn journal_followup_and_spawn(
     //   - switching back to the mode of the last run → no message;
     //   - a session that never ran has no marker → no message (the upcoming
     //     first run builds its system prompt from the current mode).
+    // The journal events, read once: used for the mode/model-change marker
+    // scans below and to detect the first message of a `defer_spawn`
+    // session (which gets a generated title after the spawn).
+    let events = mo_core::read_events(Path::new(&journal_path)).map_err(ApiError::internal)?;
+    let was_never_started = !events
+        .iter()
+        .any(|e| matches!(&e.kind, JournalEventKind::Message(_)));
     {
         let mut journal =
             JournalWriter::open(Path::new(&journal_path)).map_err(ApiError::internal)?;
-        let events = mo_core::read_events(Path::new(&journal_path)).map_err(ApiError::internal)?;
         let last_mode = events.iter().rev().find_map(|e| match &e.kind {
             JournalEventKind::SystemPrompt { mode, .. } => Some(*mode),
             JournalEventKind::ModeChange { mode, .. } => Some(*mode),
@@ -487,6 +720,9 @@ async fn journal_followup_and_spawn(
                 })
                 .map_err(ApiError::internal)?;
         }
+        // A `defer_spawn` session's journal holds no message yet — this
+        // followup is its first, so a title is generated from it after the
+        // spawn, exactly like a one-shot creation.
         journal
             .append(JournalEventKind::Message(JournalMessage {
                 role: "user".to_string(),
@@ -494,6 +730,7 @@ async fn journal_followup_and_spawn(
                 reasoning_content: None,
                 tool_call_id: None,
                 tool_calls: None,
+                images: images.to_vec(),
             }))
             .map_err(ApiError::internal)?;
     }
@@ -516,6 +753,13 @@ async fn journal_followup_and_spawn(
             .expect("session row exists")
     };
     spawn_and_patch(state, &mut session);
+
+    // The first message of a deferred session: give it a generated title,
+    // like the one-shot creation flow does (the placeholder title would
+    // otherwise stick forever — followups never rename sessions).
+    if was_never_started {
+        crate::title::spawn_title_generation(state.clone(), id.to_string(), content.to_string());
+    }
 
     Ok((StatusCode::ACCEPTED, Json(session)))
 }

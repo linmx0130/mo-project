@@ -23,6 +23,7 @@ import {
   rejectModeChange,
   switchMode,
   switchModel,
+  uploadImage,
 } from '../api'
 import AskUserCard from './AskUserCard'
 import Composer from './Composer'
@@ -180,11 +181,18 @@ export default function SessionView({ session, onStatusChange }: Props) {
   }
 
   /** Send a followup message; the backend respawns the worker on the same
-   *  session, continuing from the journal history. */
-  const send = async (text: string): Promise<boolean> => {
+   *  session, continuing from the journal history. Picked image files are
+   *  uploaded into the session's transaction-history folder first, and the
+   *  message carries their journaled paths (the worker rebuilds them into
+   *  base64 image_url parts for the LLM). */
+  const send = async (text: string, files: File[]): Promise<boolean> => {
     setSending(true)
     try {
-      const updated = await postMessage(session.id, text)
+      const images =
+        files.length > 0
+          ? await Promise.all(files.map((f) => uploadImage(session.id, f)))
+          : []
+      const updated = await postMessage(session.id, text, images)
       setStatus(updated.status)
       // The previous SSE stream closed at the terminal status; re-arm it so
       // the new run streams in.
@@ -487,7 +495,13 @@ export default function SessionView({ session, onStatusChange }: Props) {
         {timeline.map((item, i) => {
           switch (item.type) {
             case 'message':
-              return <MessageRow key={`msg-${i}`} message={item.message} />
+              return (
+                <MessageRow
+                  key={`msg-${i}`}
+                  message={item.message}
+                  sessionId={session.id}
+                />
+              )
             case 'tool':
               // Tool-call ids come from the model and repeat across followup
               // runs (e.g. a mock replaying `call_slow`), so disambiguate.

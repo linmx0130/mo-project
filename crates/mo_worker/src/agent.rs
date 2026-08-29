@@ -8,11 +8,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use base64::Engine;
 use futures_util::{StreamExt, pin_mut};
-use mo_core::{JournalEventKind, JournalMessage, JournalWriter, Session, ToolCallInfo};
+use mo_core::{
+    JournalEventKind, JournalImage, JournalMessage, JournalWriter, Session, ToolCallInfo,
+};
 use nah_chat::{
     ChatClient, ChatCompletionParamsBuilder, ChatCompletionStreamEvent, ChatMessage,
-    ChatMessageContentValue, FunctionCallRequest, ToolCallRequest,
+    ChatMessageContentValue, FunctionCallRequest, ToolCallRequest, TypedChatMessageContent,
 };
 use serde_json::{Value, json};
 
@@ -611,7 +614,7 @@ fn history_from_journal(
                 };
                 messages.push(ChatMessage {
                     role,
-                    content: ChatMessageContentValue::Text(m.content),
+                    content: content_with_images(journal_path, m.content, m.images),
                     reasoning_content: m.reasoning_content,
                     tool_call_id: m.tool_call_id,
                     tool_calls: m.tool_calls.map(|calls| {
@@ -691,6 +694,62 @@ fn history_from_journal(
         }
     }
     Ok((system_prompt, cleaned, last_prompt_tokens))
+}
+
+/// Build the model-facing content of a journaled message: plain text, or —
+/// when the message carries images — an OpenAI-style typed content list
+/// (`[{type: "text", text: ...}, {type: "image_url", image_url: {url:
+/// "data:<mime>;base64,…"}}]`) that nah_chat serializes for the LLM — the
+/// base64 image-content API the frontend's uploads feed into.
+///
+/// Each image's file is read from the session's images directory (paths
+/// are journaled relative to the session dir, i.e. the journal's parent).
+/// Missing or unreadable files are skipped with a warning — a deleted image
+/// must never break the conversation; the text part stays. A path that
+/// escapes the session dir (a corrupt or hand-edited journal) is skipped
+/// too: only files inside the session dir are ever base64'd into the model
+/// context.
+fn content_with_images(
+    journal_path: &Path,
+    text: String,
+    images: Vec<JournalImage>,
+) -> ChatMessageContentValue {
+    if images.is_empty() {
+        return ChatMessageContentValue::Text(text);
+    }
+    let session_dir = journal_path.parent().expect("journal has a parent dir");
+    let session_dir = match session_dir.canonicalize() {
+        Ok(dir) => dir,
+        Err(e) => {
+            tracing::warn!("cannot resolve session dir for images: {e}");
+            return ChatMessageContentValue::Text(text);
+        }
+    };
+    let mut parts = Vec::with_capacity(images.len() + 1);
+    parts.push(TypedChatMessageContent::text_content(&text));
+    for image in images {
+        let Ok(path) = session_dir.join(&image.path).canonicalize() else {
+            tracing::warn!(path = %image.path, "skipping image: file not found");
+            continue;
+        };
+        if !path.starts_with(&session_dir) {
+            tracing::warn!(path = %image.path, "skipping image: path escapes the session dir");
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(path = %image.path, "skipping image: {e}");
+                continue;
+            }
+        };
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        parts.push(TypedChatMessageContent::image_url_content(&format!(
+            "data:{};base64,{}",
+            image.mime, b64
+        )));
+    }
+    ChatMessageContentValue::TypedContentList(parts)
 }
 
 /// Build a system-role chat message (the standard shape used everywhere the
@@ -903,6 +962,7 @@ fn journal_message_from(msg: &ChatMessage) -> JournalMessage {
                 })
                 .collect()
         }),
+        images: Vec::new(),
     }
 }
 

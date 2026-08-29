@@ -465,13 +465,73 @@ p {
   cursor: not-allowed;
 }
 
+/* The hidden file input behind the "Upload image" button. */
+.composer-file-input {
+  display: none;
+}
+
+/* Thumbnail strip at the bottom of the typing box: the picked images sit
+   between the textarea and the actions row until the message is sent. */
+.composer-images {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 2px 4px;
+}
+
+.composer-thumb {
+  position: relative;
+}
+
+.composer-thumb img {
+  display: block;
+  width: 56px;
+  height: 56px;
+  object-fit: cover;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.thumb-remove {
+  position: absolute;
+  top: -7px;
+  right: -7px;
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--text-h);
+  font-size: 12px;
+  line-height: 1;
+  padding: 0;
+  cursor: pointer;
+}
+
+.thumb-remove:hover {
+  color: var(--status-failed);
+  border-color: var(--status-failed);
+}
+
+.composer-upload-error {
+  color: var(--status-failed);
+  font-size: 12px;
+}
+
 .composer-actions {
   display: flex;
   justify-content: flex-end;
+  gap: 8px;
 }
 
 .composer .send,
-.composer .stop {
+.composer .stop,
+.composer .upload {
   border-radius: 6px;
   padding: 6px 18px;
   font: inherit;
@@ -485,6 +545,18 @@ p {
   color: var(--accent);
 }
 
+/* "Upload image" — a secondary action sitting left of Send. */
+.composer .upload {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
+.composer .upload:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 .composer .stop {
   background: transparent;
   border: 1px solid var(--status-failed);
@@ -492,7 +564,8 @@ p {
 }
 
 .composer .send:disabled,
-.composer .stop:disabled {
+.composer .stop:disabled,
+.composer .upload:disabled {
   opacity: 0.5;
   cursor: default;
 }
@@ -1174,6 +1247,24 @@ p {
 
 .msg-user .msg-label {
   color: var(--accent);
+}
+
+/* Attached images inside a user message, rendered as a thumbnail row below
+   the text. */
+.msg-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.msg-image {
+  max-width: 180px;
+  max-height: 180px;
+  object-fit: contain;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
 }
 
 /* ---------- markdown (assistant messages) ---------- */
