@@ -81,6 +81,13 @@ pub async fn spawn_subagent(
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(stderr_file))
         .kill_on_drop(true);
+    // Scrub the per-model `MO_*` vars inherited from this worker's own
+    // environment before setting the resolved values below: unspecified
+    // vars pass straight through, so a stale value would otherwise leak
+    // into the child (see `mo_gateway::process::spawn_worker`).
+    cmd.env_remove("MO_AUTH_TOKEN")
+        .env_remove("MO_CONTEXT_WINDOW")
+        .env_remove("MO_REASONING_EFFORT");
     if let Some(token) = &ctx.auth_token {
         cmd.env("MO_AUTH_TOKEN", token);
     }

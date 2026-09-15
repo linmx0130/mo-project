@@ -30,11 +30,20 @@
 //!   handoff prompt and starts sending only the compressed context
 //!   (default 0.75, clamped to `(0, 1]`); the gateway passes the value
 //!   from `mo.toml`.
+//!
+//! The per-model fields — `MO_AUTH_TOKEN`, `MO_CONTEXT_WINDOW` and
+//! `MO_REASONING_EFFORT` — belong to the model that `MO_MODEL_BASE_URL` /
+//! `MO_MODEL_NAME` name. When a model arrives via env (the gateway always
+//! sends it), the config file's default model is *not* consulted for them —
+//! that would leak the default model's token / window / effort into a
+//! session running under a different model. The file's default model
+//! supplies them only for a standalone run with no env model (see
+//! `resolve_model`).
 
 use std::env;
 use std::path::PathBuf;
 
-use mo_core::config::DEFAULT_CONTEXT_COMPRESSION_THRESHOLD;
+use mo_core::config::{DEFAULT_CONTEXT_COMPRESSION_THRESHOLD, ModelConfig};
 
 /// The hard cap on subagent nesting. Subagents (sessions with a `parent_id`)
 /// can never spawn further subagents — the depth limit is 1: a root session
@@ -54,8 +63,9 @@ pub struct WorkerConfig {
     pub context_window: Option<u64>,
     /// Optional reasoning effort, forwarded verbatim as the chat-completion
     /// `reasoning_effort` parameter (`None` = the field is omitted). The
-    /// gateway passes the per-session model's value from `mo.toml`;
-    /// standalone workers fall back to the config file's default model.
+    /// gateway passes the per-session model's value from `mo.toml`; a
+    /// standalone worker (no env-supplied model) takes it from the config
+    /// file's default model (see `resolve_model`).
     pub reasoning_effort: Option<String>,
     pub subagent_depth: u32,
     /// Max number of tool calls from a single assistant message that
@@ -82,6 +92,64 @@ pub enum ConfigError {
     MissingBaseUrl,
     #[error("missing model name: set MO_MODEL_NAME or configure [[models]] in mo.toml")]
     MissingModelName,
+}
+
+/// The model and its per-model settings, resolved from a single source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModel {
+    pub base_url: String,
+    pub name: String,
+    pub token: Option<String>,
+    pub context_window: Option<u64>,
+    pub reasoning_effort: Option<String>,
+}
+
+/// Resolve the session's model and its per-model settings: environment
+/// first (the gateway passes the per-session model this way), otherwise the
+/// config file's default (first) model for standalone runs.
+///
+/// The per-model fields — the context window and the reasoning effort —
+/// resolve from the **same source as the model itself**. When a model was
+/// supplied via `MO_MODEL_BASE_URL`/`MO_MODEL_NAME`, the gateway also
+/// supplied those fields (or deliberately omitted them because the model
+/// sets neither), so the config file's default model must never leak its
+/// window / effort into a session running under a different model. The
+/// file's default model is consulted only when no model came from env.
+pub fn resolve_model(
+    file_default: Option<&ModelConfig>,
+    env_base_url: Option<String>,
+    env_name: Option<String>,
+    env_token: Option<String>,
+    env_context_window: Option<String>,
+    env_reasoning_effort: Option<String>,
+) -> Result<ResolvedModel, ConfigError> {
+    match (env_base_url, env_name) {
+        (Some(base_url), Some(name)) => Ok(ResolvedModel {
+            base_url,
+            name,
+            token: env_token.filter(|v| !v.is_empty()),
+            // Blank/unparseable env values mean "unset" — not a cue to fall
+            // back to the config file (that would leak the default model).
+            context_window: env_context_window
+                .filter(|v| !v.is_empty())
+                .and_then(|v| v.parse::<u64>().ok()),
+            reasoning_effort: mo_core::config::normalize_reasoning_effort(env_reasoning_effort),
+        }),
+        (env_base_url, _) => match file_default {
+            Some(model) => Ok(ResolvedModel {
+                base_url: model.base_url.clone(),
+                name: model.name.clone(),
+                token: model.token.clone(),
+                context_window: model.context_window,
+                reasoning_effort: model.reasoning_effort.clone(),
+            }),
+            None => Err(if env_base_url.is_none() {
+                ConfigError::MissingBaseUrl
+            } else {
+                ConfigError::MissingModelName
+            }),
+        },
+    }
 }
 
 pub fn parse_config() -> Result<WorkerConfig, ConfigError> {
@@ -118,50 +186,20 @@ pub fn parse_config() -> Result<WorkerConfig, ConfigError> {
         .map(|v| v.parse::<u32>().map_err(|_| ConfigError::BadDepth(v)))
         .transpose()?
         .unwrap_or(0);
-    // Context window: env first (the gateway passes the per-session model's
-    // window), then the default model from the config file. Unset = unlimited.
-    let context_window = match env::var("MO_CONTEXT_WINDOW") {
-        Ok(v) if !v.is_empty() => v.parse::<u64>().ok(),
-        _ => file_cfg
-            .as_ref()
-            .and_then(|c| c.default_model())
-            .and_then(|m| m.context_window),
-    };
-    // Reasoning effort: env first (the gateway passes the per-session
-    // model's value), then the default model from the config file. A blank
-    // value is treated as unset (the field is omitted from the request).
-    let reasoning_effort = mo_core::config::normalize_reasoning_effort(
+    // The session's model and its per-model settings (context window,
+    // reasoning effort). Env first — the gateway passes the per-session
+    // model that way — otherwise the config file's default model, so a
+    // standalone run works from `mo.toml` alone. Both sources resolve
+    // together, so the default model's settings never leak into a session
+    // running under a different (env-supplied) model.
+    let resolved = resolve_model(
+        file_cfg.as_ref().and_then(|c| c.default_model()),
+        env::var("MO_MODEL_BASE_URL").ok(),
+        env::var("MO_MODEL_NAME").ok(),
+        env::var("MO_AUTH_TOKEN").ok(),
+        env::var("MO_CONTEXT_WINDOW").ok(),
         env::var("MO_REASONING_EFFORT").ok(),
-    )
-    .or_else(|| {
-        file_cfg
-            .as_ref()
-            .and_then(|c| c.default_model())
-            .and_then(|m| m.reasoning_effort.clone())
-    });
-    // Model: env first (the gateway passes the per-session model), then the
-    // default model from the config file.
-    let (model_base_url, model_name, auth_token) =
-        match (env::var("MO_MODEL_BASE_URL"), env::var("MO_MODEL_NAME")) {
-            (Ok(base_url), Ok(model_name)) => (
-                base_url,
-                model_name,
-                env::var("MO_AUTH_TOKEN").ok().filter(|v| !v.is_empty()),
-            ),
-            _ => match file_cfg.as_ref().and_then(|c| c.models.first()) {
-                Some(model) => (
-                    model.base_url.clone(),
-                    model.name.clone(),
-                    model.token.clone(),
-                ),
-                None => {
-                    if env::var("MO_MODEL_BASE_URL").is_err() {
-                        return Err(ConfigError::MissingBaseUrl);
-                    }
-                    return Err(ConfigError::MissingModelName);
-                }
-            },
-        };
+    )?;
     // Tool-call concurrency: env first (the gateway passes the resolved
     // `max_tool_concurrency` from `mo.toml`), then the config file, then the
     // default. Clamped to at least 1 so a misconfigured 0 can never make
@@ -187,11 +225,11 @@ pub fn parse_config() -> Result<WorkerConfig, ConfigError> {
         session_id,
         data_dir,
         agents_dir,
-        model_base_url,
-        model_name,
-        auth_token,
-        context_window,
-        reasoning_effort,
+        model_base_url: resolved.base_url,
+        model_name: resolved.name,
+        auth_token: resolved.token,
+        context_window: resolved.context_window,
+        reasoning_effort: resolved.reasoning_effort,
         subagent_depth,
         max_tool_concurrency,
         context_compression_threshold,
