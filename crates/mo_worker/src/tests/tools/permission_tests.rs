@@ -44,6 +44,7 @@ fn make_ctx(dir: &tempfile::TempDir, mode: Mode, parent_id: Option<String>) -> T
         model_name: "m".into(),
         auth_token: None,
         context_window: None,
+        reasoning_effort: None,
         context_compression_threshold: mo_core::config::DEFAULT_CONTEXT_COMPRESSION_THRESHOLD,
     }
 }

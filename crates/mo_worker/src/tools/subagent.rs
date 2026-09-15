@@ -87,6 +87,12 @@ pub async fn spawn_subagent(
     if let Some(window) = ctx.context_window {
         cmd.env("MO_CONTEXT_WINDOW", window.to_string());
     }
+    // The parent's resolved reasoning effort, so a subagent sends the same
+    // `reasoning_effort` parameter (the config-file fallback would only
+    // match when the parent uses the default model).
+    if let Some(effort) = &ctx.reasoning_effort {
+        cmd.env("MO_REASONING_EFFORT", effort);
+    }
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn subagent worker: {e}"))?;

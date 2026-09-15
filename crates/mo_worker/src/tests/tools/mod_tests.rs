@@ -36,6 +36,7 @@ fn test_ctx(agents_dir: PathBuf) -> ToolContext {
         model_name: "m".into(),
         auth_token: None,
         context_window: None,
+        reasoning_effort: None,
         context_compression_threshold: mo_core::config::DEFAULT_CONTEXT_COMPRESSION_THRESHOLD,
     }
 }
@@ -288,6 +289,7 @@ fn plan_ctx(dir: &tempfile::TempDir, mode: Mode) -> ToolContext {
         model_name: "m".into(),
         auth_token: None,
         context_window: None,
+        reasoning_effort: None,
         context_compression_threshold: mo_core::config::DEFAULT_CONTEXT_COMPRESSION_THRESHOLD,
     }
 }

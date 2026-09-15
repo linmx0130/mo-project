@@ -52,6 +52,9 @@ pub struct ToolContext {
     /// passed to spawned subagents so they compress against the parent's
     /// resolved model settings.
     pub context_window: Option<u64>,
+    /// The session's model reasoning effort (`None` = unset), passed to
+    /// spawned subagents so they send the same `reasoning_effort` parameter.
+    pub reasoning_effort: Option<String>,
     /// The context-compression threshold (fraction of the context window),
     /// passed to spawned subagents so they inherit the same value.
     pub context_compression_threshold: f64,

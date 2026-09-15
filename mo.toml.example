@@ -69,12 +69,19 @@
 # (with a progress bar); when absent the window is treated as unlimited and
 # only the current length is shown. The context length itself comes from the
 # LLM API (`usage.prompt_tokens` of each chat completion).
+#
+# reasoning_effort is optional: forwarded verbatim as the chat-completion
+# API's `reasoning_effort` parameter (the field is omitted when unset). The
+# accepted values are model/provider-dependent and validated by the server —
+# OpenAI reasoning models take none/minimal/low/medium/high/xhigh/max;
+# DeepSeek takes low/high/max.
 [[models]]
 base_url = "https://api.deepseek.com"
 name = "deepseek-v4-flash"
 token = "sk-..."
 # nickname = "deepseek"
 # context_window = 65536
+# reasoning_effort = "high"
 
 # A second model, e.g. a local mock for smoke tests:
 [[models]]

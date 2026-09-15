@@ -38,6 +38,7 @@ fn test_ctx(dir: &tempfile::TempDir, parent_id: Option<String>) -> ToolContext {
         model_name: "m".into(),
         auth_token: None,
         context_window: Some(4096),
+        reasoning_effort: None,
         context_compression_threshold: mo_core::config::DEFAULT_CONTEXT_COMPRESSION_THRESHOLD,
     }
 }

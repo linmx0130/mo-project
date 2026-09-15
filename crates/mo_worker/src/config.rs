@@ -12,6 +12,9 @@
 //! * `MO_AUTH_TOKEN` — optional Bearer token / API key.
 //! * `MO_CONTEXT_WINDOW` — optional model context window in tokens (unset =
 //!   unlimited); embedded in `context_usage` journal events for the status bar.
+//! * `MO_REASONING_EFFORT` — optional reasoning effort, forwarded verbatim as
+//!   the chat-completion `reasoning_effort` parameter (unset = the field is
+//!   omitted); the gateway passes the per-session model's value from `mo.toml`.
 //! * `MO_SUBAGENT_DEPTH` — the session's own subagent depth (0 for root
 //!   sessions, which are never framed as subagents; worker-spawned
 //!   subagents inherit parent depth + 1, hard-capped at 1).
@@ -49,6 +52,11 @@ pub struct WorkerConfig {
     pub model_name: String,
     pub auth_token: Option<String>,
     pub context_window: Option<u64>,
+    /// Optional reasoning effort, forwarded verbatim as the chat-completion
+    /// `reasoning_effort` parameter (`None` = the field is omitted). The
+    /// gateway passes the per-session model's value from `mo.toml`;
+    /// standalone workers fall back to the config file's default model.
+    pub reasoning_effort: Option<String>,
     pub subagent_depth: u32,
     /// Max number of tool calls from a single assistant message that
     /// execute concurrently (clamped to at least 1). The gateway passes the
@@ -119,6 +127,18 @@ pub fn parse_config() -> Result<WorkerConfig, ConfigError> {
             .and_then(|c| c.default_model())
             .and_then(|m| m.context_window),
     };
+    // Reasoning effort: env first (the gateway passes the per-session
+    // model's value), then the default model from the config file. A blank
+    // value is treated as unset (the field is omitted from the request).
+    let reasoning_effort = mo_core::config::normalize_reasoning_effort(
+        env::var("MO_REASONING_EFFORT").ok(),
+    )
+    .or_else(|| {
+        file_cfg
+            .as_ref()
+            .and_then(|c| c.default_model())
+            .and_then(|m| m.reasoning_effort.clone())
+    });
     // Model: env first (the gateway passes the per-session model), then the
     // default model from the config file.
     let (model_base_url, model_name, auth_token) =
@@ -171,6 +191,7 @@ pub fn parse_config() -> Result<WorkerConfig, ConfigError> {
         model_name,
         auth_token,
         context_window,
+        reasoning_effort,
         subagent_depth,
         max_tool_concurrency,
         context_compression_threshold,

@@ -411,6 +411,12 @@ async fn e2e_parallel_tool_calls_are_batched_in_call_order() {
                 |calls: axum::extract::State<Arc<AtomicUsize>>,
                  body: axum::extract::Json<Value>| async move {
                     let n = calls.fetch_add(1, Ordering::SeqCst);
+                    // This session's model does not configure a
+                    // `reasoning_effort`, so the field must be omitted.
+                    assert!(
+                        body.get("reasoning_effort").is_none(),
+                        "unset reasoning effort must omit the field: {body:?}"
+                    );
                     if n == 1 {
                         // Second request: the tool results are fed back.
                         let msgs = body["messages"].as_array().unwrap();
@@ -476,6 +482,7 @@ async fn e2e_parallel_tool_calls_are_batched_in_call_order() {
         model_name: "mock-model".to_string(),
         auth_token: None,
         context_window: Some(4096),
+        reasoning_effort: None,
         subagent_depth: 0,
         max_tool_concurrency: 8,
         context_compression_threshold: 0.75,
@@ -583,6 +590,12 @@ async fn e2e_agent_loop_with_mock_llm() {
                         body["stream_options"]["include_usage"], true,
                         "worker request must ask for usage: {body:?}"
                     );
+                    // The session's model sets `reasoning_effort = "high"`,
+                    // so every request the worker makes must carry it.
+                    assert_eq!(
+                        body["reasoning_effort"], "high",
+                        "worker request must forward the configured reasoning effort: {body:?}"
+                    );
                     let n = calls.fetch_add(1, Ordering::SeqCst);
                     let body = if n == 0 {
                         sse_payload_with_usage(
@@ -638,6 +651,7 @@ async fn e2e_agent_loop_with_mock_llm() {
         model_name: "mock-model".to_string(),
         auth_token: None,
         context_window: Some(4096),
+        reasoning_effort: Some("high".to_string()),
         subagent_depth: 0,
         max_tool_concurrency: 8,
         context_compression_threshold: 0.75,
@@ -860,6 +874,7 @@ async fn e2e_provider_without_role_delta_round_trips_tools() {
         model_name: "mock-model".to_string(),
         auth_token: None,
         context_window: Some(4096),
+        reasoning_effort: None,
         subagent_depth: 0,
         max_tool_concurrency: 8,
         context_compression_threshold: 0.75,
@@ -1635,6 +1650,7 @@ fn tool_ctx(dir: &tempfile::TempDir) -> (ToolContext, std::path::PathBuf) {
         model_name: "m".into(),
         auth_token: None,
         context_window: None,
+        reasoning_effort: None,
         context_compression_threshold: mo_core::config::DEFAULT_CONTEXT_COMPRESSION_THRESHOLD,
     };
     (ctx, outside)
@@ -1760,6 +1776,7 @@ async fn e2e_batched_permission_flow_holds_then_delivers_outcomes() {
         model_name: "mock-model".to_string(),
         auth_token: None,
         context_window: Some(4096),
+        reasoning_effort: None,
         subagent_depth: 0,
         max_tool_concurrency: 8,
         context_compression_threshold: 0.75,
@@ -2412,6 +2429,7 @@ async fn e2e_context_compression_generates_handoff_and_resumes() {
         model_name: "mock-model".to_string(),
         auth_token: None,
         context_window: Some(40),
+        reasoning_effort: None,
         subagent_depth: 0,
         max_tool_concurrency: 8,
         context_compression_threshold: 0.75,

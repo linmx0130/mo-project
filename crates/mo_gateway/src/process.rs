@@ -81,6 +81,12 @@ pub fn spawn_worker(state: &AppState, session: &Session) -> std::io::Result<u32>
         if let Some(window) = model.context_window {
             cmd.env("MO_CONTEXT_WINDOW", window.to_string());
         }
+        // The model's reasoning effort (from `mo.toml`) travels as env; the
+        // worker forwards it verbatim as the chat-completion
+        // `reasoning_effort` parameter. Unset = the field is omitted.
+        if let Some(effort) = &model.reasoning_effort {
+            cmd.env("MO_REASONING_EFFORT", effort);
+        }
     }
     // Tool-call concurrency bound from `mo.toml` (max_tool_concurrency);
     // the worker falls back to its default when unset.

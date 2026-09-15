@@ -134,6 +134,7 @@ async fn main() {
         model_name: cfg.model_name,
         auth_token: cfg.auth_token,
         context_window: cfg.context_window,
+        reasoning_effort: cfg.reasoning_effort,
         subagent_depth: cfg.subagent_depth,
         max_tool_concurrency: cfg.max_tool_concurrency,
         context_compression_threshold: cfg.context_compression_threshold,

@@ -37,6 +37,10 @@ pub struct AgentConfig {
     /// The model's context window in tokens (from `mo.toml`), embedded in
     /// each `ContextUsage` journal event; `None` = unlimited.
     pub context_window: Option<u64>,
+    /// The model's reasoning effort (from `mo.toml`), forwarded verbatim as
+    /// the chat-completion `reasoning_effort` parameter; `None` = the field
+    /// is omitted from requests.
+    pub reasoning_effort: Option<String>,
     pub subagent_depth: u32,
     /// Max number of tool calls from a single assistant message that
     /// execute concurrently (from `mo.toml`'s `max_tool_concurrency`;
@@ -80,6 +84,7 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
         model_name: config.model_name.clone(),
         auth_token: config.auth_token.clone(),
         context_window: config.context_window,
+        reasoning_effort: config.reasoning_effort.clone(),
         context_compression_threshold: config.context_compression_threshold,
     };
 
@@ -153,7 +158,15 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
             && (tokens as f64 / window as f64) >= config.context_compression_threshold
             && !compression_attempted
         {
-            match generate_handoff(&chat_client, &config.model_name, &messages, journal).await {
+            match generate_handoff(
+                &chat_client,
+                &config.model_name,
+                &messages,
+                config.reasoning_effort.as_deref(),
+                journal,
+            )
+            .await
+            {
                 Ok(text) => {
                     // The handoff prompt, journaled as the compression
                     // boundary: everything before it is dropped from the
@@ -213,10 +226,16 @@ pub async fn run_agent(config: AgentConfig, journal: &mut JournalWriter) -> Resu
         // event per content chunk as it arrives; the final `Message` event
         // (full assembled text) is journaled right after, so readers see
         // tokens arrive live and then settle on the canonical message.
-        let (assistant, prompt_tokens) =
-            generate(&chat_client, &config.model_name, &messages, &tools, journal)
-                .await
-                .context("LLM generation failed after retries")?;
+        let (assistant, prompt_tokens) = generate(
+            &chat_client,
+            &config.model_name,
+            &messages,
+            &tools,
+            config.reasoning_effort.as_deref(),
+            journal,
+        )
+        .await
+        .context("LLM generation failed after retries")?;
         // The API reported the tokens this call consumed (system prompt +
         // history + tool outputs). Journal them as the session's current
         // context length; the status bar shows the latest value. Skipped
@@ -774,6 +793,7 @@ async fn generate_handoff(
     chat_client: &ChatClient,
     model: &str,
     messages: &[ChatMessage],
+    reasoning_effort: Option<&str>,
     journal: &mut JournalWriter,
 ) -> Result<String> {
     let mut ctx = messages.to_vec();
@@ -784,7 +804,16 @@ async fn generate_handoff(
         tool_call_id: None,
         tool_calls: None,
     });
-    let (message, _) = generate_with_retry(chat_client, model, &ctx, &[], journal, false).await?;
+    let (message, _) = generate_with_retry(
+        chat_client,
+        model,
+        &ctx,
+        &[],
+        reasoning_effort,
+        journal,
+        false,
+    )
+    .await?;
     Ok(message.content.to_string().trim().to_string())
 }
 
@@ -832,25 +861,49 @@ async fn generate(
     model: &str,
     messages: &[ChatMessage],
     tools: &[Value],
+    reasoning_effort: Option<&str>,
     journal: &mut JournalWriter,
 ) -> Result<(ChatMessage, Option<u64>)> {
-    generate_with_retry(chat_client, model, messages, tools, journal, true).await
+    generate_with_retry(
+        chat_client,
+        model,
+        messages,
+        tools,
+        reasoning_effort,
+        journal,
+        true,
+    )
+    .await
 }
 
 /// Shared retry/backoff wrapper for regular calls and the internal handoff
 /// call. `journal_deltas` controls whether streamed chunks become
 /// `MessageDelta` events — the handoff call keeps the journal clean.
+/// `reasoning_effort` is forwarded verbatim to every call (`None` omits the
+/// parameter); both the regular loop and the handoff honor the model's
+/// configured effort.
 async fn generate_with_retry(
     chat_client: &ChatClient,
     model: &str,
     messages: &[ChatMessage],
     tools: &[Value],
+    reasoning_effort: Option<&str>,
     journal: &mut JournalWriter,
     journal_deltas: bool,
 ) -> Result<(ChatMessage, Option<u64>)> {
     let mut last_error: Option<anyhow::Error> = None;
     for (attempt, delay) in RETRY_DELAYS_SECS.iter().enumerate() {
-        match generate_once(chat_client, model, messages, tools, journal, journal_deltas).await {
+        match generate_once(
+            chat_client,
+            model,
+            messages,
+            tools,
+            reasoning_effort,
+            journal,
+            journal_deltas,
+        )
+        .await
+        {
             Ok(result) => return Ok(result),
             Err(e) => {
                 tracing::warn!("LLM call failed (attempt {}): {e:#}", attempt + 1);
@@ -869,6 +922,7 @@ async fn generate_once(
     model: &str,
     messages: &[ChatMessage],
     tools: &[Value],
+    reasoning_effort: Option<&str>,
     journal: &mut JournalWriter,
     journal_deltas: bool,
 ) -> Result<(ChatMessage, Option<u64>)> {
@@ -878,6 +932,13 @@ async fn generate_once(
     // the stream before any content arrives. Let the model run until it
     // finishes on its own.
     params.temperature(0.7);
+    // The model's configured reasoning effort (from `mo.toml`, passed down
+    // by the gateway as `MO_REASONING_EFFORT`), forwarded verbatim as the
+    // chat-completion `reasoning_effort` parameter. Omitted when unset —
+    // which values the server accepts is model/provider-dependent.
+    if let Some(effort) = reasoning_effort {
+        params.reasoning_effort(effort);
+    }
     // Tool definitions are only advertised on the regular loop calls; the
     // internal handoff call sends none (a plain-text answer is wanted).
     if !tools.is_empty() {
