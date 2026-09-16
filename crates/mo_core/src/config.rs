@@ -46,6 +46,12 @@
 //!                                     # tokens (unlimited when absent). The UI
 //!                                     # shows the session's context length
 //!                                     # against this window in the status bar.
+//! reasoning_effort = "high"           # optional; forwarded verbatim as the
+//!                                     # chat-completion `reasoning_effort`
+//!                                     # parameter (blank = unset). Accepted
+//!                                     # values are model/provider-dependent
+//!                                     # (OpenAI: none/minimal/low/medium/high/
+//!                                     # xhigh/max; DeepSeek: low/high/max).
 //! ```
 
 use std::env;
@@ -93,6 +99,24 @@ pub struct ModelConfig {
     /// renders the session's context length against it.
     #[serde(default)]
     pub context_window: Option<u64>,
+    /// Optional reasoning effort, forwarded verbatim as the chat-completion
+    /// API's `reasoning_effort` parameter (`None` = the field is omitted).
+    /// Accepted values are model/provider-dependent and validated by the
+    /// server — OpenAI reasoning models take `none`/`minimal`/`low`/
+    /// `medium`/`high`/`xhigh`/`max`, DeepSeek takes `low`/`high`/`max`.
+    /// The gateway passes it down to the worker as `MO_REASONING_EFFORT`.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+}
+
+/// Normalize a `reasoning_effort` value: trim surrounding whitespace and
+/// treat a blank string as unset (`None`). The value itself is otherwise
+/// passed through verbatim — which values the server accepts is
+/// model/provider-dependent, so no value is rejected here.
+pub fn normalize_reasoning_effort(value: Option<String>) -> Option<String> {
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Raw TOML file shape (all fields optional so a minimal file works).
@@ -217,6 +241,9 @@ impl MoConfig {
                     token: env::var("MO_AUTH_TOKEN").ok().filter(|v| !v.is_empty()),
                     nickname: None,
                     context_window: None,
+                    reasoning_effort: normalize_reasoning_effort(
+                        env::var("MO_REASONING_EFFORT").ok(),
+                    ),
                 }]
             }
             _ => Vec::new(),
@@ -282,7 +309,14 @@ impl FileConfig {
             context_compression_threshold: self
                 .context_compression_threshold
                 .unwrap_or(DEFAULT_CONTEXT_COMPRESSION_THRESHOLD),
-            models: self.models,
+            models: self
+                .models
+                .into_iter()
+                .map(|mut model| {
+                    model.reasoning_effort = normalize_reasoning_effort(model.reasoning_effort);
+                    model
+                })
+                .collect(),
             source: None,
         }
     }

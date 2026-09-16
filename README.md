@@ -106,6 +106,12 @@ nickname = "deepseek"          # optional label shown in the UI
 # context_window = 65536       # optional: model context window in tokens;
                                # absent = unlimited. The session status bar
                                # shows the current context length against it.
+# reasoning_effort = "high"    # optional: forwarded verbatim as the
+                               # chat-completion API's reasoning_effort
+                               # parameter (omitted when absent). Accepted
+                               # values are model/provider-dependent (OpenAI:
+                               # none/minimal/low/medium/high/xhigh/max;
+                               # DeepSeek: low/high/max).
 
 [[models]]
 base_url = "http://127.0.0.1:9001"
@@ -113,9 +119,10 @@ name = "smoke-model"
 ```
 
 Workers are spawned with the chosen session's model (base URL, name, token,
-context window) plus the data dir / agents dir / subagent depth in their
-environment, so a config file replaces the old env-var setup entirely. The
-worker also falls back to the same config file when run standalone.
+context window, reasoning effort) plus the data dir / agents dir / subagent
+depth in their environment, so a config file replaces the old env-var setup
+entirely. The worker also falls back to the same config file when run
+standalone.
 
 ## Run it
 
@@ -493,6 +500,7 @@ kept for existing setups; new installs should use the config file:
 | `MO_SUBAGENT_DEPTH` | worker | `0` for root sessions (subagents inherit parent depth + 1; nesting is hard-capped at 1 — a subagent can never spawn further subagents) |
 | `MO_MAX_TOOL_CONCURRENCY` | worker | `8` (max tool calls from one assistant message that run concurrently; min 1) |
 | `MO_CONTEXT_COMPRESSION_THRESHOLD` | worker | `0.75` (fraction of the model's context window at which the worker asks for a handoff prompt and sends only the compressed context; see "Context compression") |
+| `MO_REASONING_EFFORT` | worker | unset (forwarded verbatim as the chat-completion `reasoning_effort` parameter; accepted values are model/provider-dependent) |
 | `MO_WORKER_BIN` | gateway | sibling of `mo_gateway` exe named `mo_worker` |
 | `MO_PORT` | gateway | `3031` |
 | `MO_BIND` | gateway | `0.0.0.0` (listen address; set `127.0.0.1` when behind a reverse proxy) |

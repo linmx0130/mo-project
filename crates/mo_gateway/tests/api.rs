@@ -25,6 +25,7 @@ fn test_models() -> Vec<ModelConfig> {
             token: Some("tok-1".into()),
             nickname: Some("alpha".into()),
             context_window: Some(32768),
+            reasoning_effort: Some("high".into()),
         },
         ModelConfig {
             base_url: "http://127.0.0.1:9002".into(),
@@ -32,6 +33,7 @@ fn test_models() -> Vec<ModelConfig> {
             token: None,
             nickname: None,
             context_window: None,
+            reasoning_effort: None,
         },
     ]
 }
@@ -958,8 +960,10 @@ async fn create_session_uses_default_model_and_accepts_model_choice() {
 #[tokio::test]
 async fn spawn_worker_passes_context_window_env() {
     // A stub worker that dumps its MO_* env to a file; the default model in
-    // `test_models` has `context_window = 32768`, which must reach the
-    // worker so it can embed the window in `context_usage` events.
+    // `test_models` has `context_window = 32768` and
+    // `reasoning_effort = "high"`, both of which must reach the worker so it
+    // can embed the window in `context_usage` events and forward the effort
+    // as the chat-completion `reasoning_effort` parameter.
     let dir = tempfile::tempdir().unwrap();
     let workdir = dir.path().join("work");
     std::fs::create_dir_all(&workdir).unwrap();
@@ -1027,6 +1031,45 @@ async fn spawn_worker_passes_context_window_env() {
     assert!(
         env.contains("MO_SUBAGENT_DEPTH=0"),
         "MO_SUBAGENT_DEPTH must be 0 for root workers: {env}"
+    );
+    // The default model's `reasoning_effort = "high"` must reach the worker.
+    assert!(
+        env.contains("MO_REASONING_EFFORT=high"),
+        "MO_REASONING_EFFORT missing from worker env: {env}"
+    );
+
+    // A session on a model without `reasoning_effort` must not carry the
+    // env var at all, so the worker omits the request field entirely.
+    std::fs::remove_file(&env_file).unwrap();
+    let (status, _) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({
+            "workdir": workdir.display().to_string(),
+            "prompt": "env check 2",
+            "model": "second-model",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let mut written = false;
+    for _ in 0..50 {
+        if env_file.exists() {
+            written = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(written, "stub worker never wrote its env (second session)");
+    let env = std::fs::read_to_string(&env_file).unwrap();
+    assert!(
+        !env.contains("MO_REASONING_EFFORT"),
+        "unset reasoning effort must not reach the worker: {env}"
+    );
+    assert!(
+        env.contains("MO_MODEL_NAME=second-model"),
+        "second model env missing: {env}"
     );
 }
 

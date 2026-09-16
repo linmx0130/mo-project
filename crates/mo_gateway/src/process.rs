@@ -66,6 +66,17 @@ pub fn spawn_worker(state: &AppState, session: &Session) -> std::io::Result<u32>
         .process_group(0)
         .kill_on_drop(true);
 
+    // Scrub the per-model `MO_*` vars inherited from the gateway's own
+    // environment before setting the session's model below. Unspecified
+    // vars pass straight through to the child, so a stale value (the
+    // gateway was launched from a shell or worker that had `MO_*` set)
+    // would otherwise leak one model's token / context window / reasoning
+    // effort into a session running under a different model. Each is set
+    // below only when the resolved model actually has it.
+    cmd.env_remove("MO_AUTH_TOKEN")
+        .env_remove("MO_CONTEXT_WINDOW")
+        .env_remove("MO_REASONING_EFFORT");
+
     if let Some(model) = state
         .find_model(&session.model)
         .or_else(|| state.default_model())
@@ -80,6 +91,12 @@ pub fn spawn_worker(state: &AppState, session: &Session) -> std::io::Result<u32>
         // length against it); unset = unlimited.
         if let Some(window) = model.context_window {
             cmd.env("MO_CONTEXT_WINDOW", window.to_string());
+        }
+        // The model's reasoning effort (from `mo.toml`) travels as env; the
+        // worker forwards it verbatim as the chat-completion
+        // `reasoning_effort` parameter. Unset = the field is omitted.
+        if let Some(effort) = &model.reasoning_effort {
+            cmd.env("MO_REASONING_EFFORT", effort);
         }
     }
     // Tool-call concurrency bound from `mo.toml` (max_tool_concurrency);

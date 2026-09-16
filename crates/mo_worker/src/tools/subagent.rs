@@ -81,11 +81,24 @@ pub async fn spawn_subagent(
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(stderr_file))
         .kill_on_drop(true);
+    // Scrub the per-model `MO_*` vars inherited from this worker's own
+    // environment before setting the resolved values below: unspecified
+    // vars pass straight through, so a stale value would otherwise leak
+    // into the child (see `mo_gateway::process::spawn_worker`).
+    cmd.env_remove("MO_AUTH_TOKEN")
+        .env_remove("MO_CONTEXT_WINDOW")
+        .env_remove("MO_REASONING_EFFORT");
     if let Some(token) = &ctx.auth_token {
         cmd.env("MO_AUTH_TOKEN", token);
     }
     if let Some(window) = ctx.context_window {
         cmd.env("MO_CONTEXT_WINDOW", window.to_string());
+    }
+    // The parent's resolved reasoning effort, so a subagent sends the same
+    // `reasoning_effort` parameter (the config-file fallback would only
+    // match when the parent uses the default model).
+    if let Some(effort) = &ctx.reasoning_effort {
+        cmd.env("MO_REASONING_EFFORT", effort);
     }
     let mut child = cmd
         .spawn()

@@ -27,6 +27,7 @@ fn clear_legacy_env() {
         "MO_MAX_TOOL_CONCURRENCY",
         "MO_CONTEXT_COMPRESSION_THRESHOLD",
         "MO_THEME_COLOR",
+        "MO_REASONING_EFFORT",
     ] {
         unsafe {
             env::remove_var(key);
@@ -60,6 +61,7 @@ fn parses_models_and_defaults() {
                 token = "tok-a"
                 nickname = "alpha"
                 context_window = 65536
+                reasoning_effort = "high"
 
                 [[models]]
                 base_url = "https://b.example.com"
@@ -83,14 +85,39 @@ fn parses_models_and_defaults() {
         Some("tok-a")
     );
     assert_eq!(config.default_model().unwrap().context_window, Some(65536));
+    assert_eq!(
+        config.default_model().unwrap().reasoning_effort.as_deref(),
+        Some("high")
+    );
     assert_eq!(config.find_model("model-b").unwrap().token, None);
     // Unset context_window means unlimited.
     assert_eq!(config.find_model("model-b").unwrap().context_window, None);
+    // reasoning_effort is optional too.
+    assert_eq!(config.find_model("model-b").unwrap().reasoning_effort, None);
     assert!(config.find_model("nope").is_none());
     assert_eq!(config.source.as_deref(), Some(path.as_path()));
     // Unset keys fall back to defaults.
     assert_eq!(config.data_dir, PathBuf::from("./data"));
     assert_eq!(config.worker_bin, None);
+}
+
+#[test]
+fn reasoning_effort_blank_is_treated_as_unset() {
+    let _guard = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mo.toml");
+    std::fs::write(
+        &path,
+        r#"
+                [[models]]
+                base_url = "https://a.example.com"
+                name = "model-a"
+                reasoning_effort = "   "
+            "#,
+    )
+    .unwrap();
+    let config = MoConfig::load(Some(&path)).unwrap();
+    assert_eq!(config.default_model().unwrap().reasoning_effort, None);
 }
 
 #[test]
@@ -366,15 +393,25 @@ fn env_fallback_builds_one_model() {
         env::set_var("MO_PORT", "9999");
         env::set_var("MO_BIND", "127.0.0.1");
         env::set_var("MO_MAX_TOOL_CONCURRENCY", "3");
+        env::set_var("MO_REASONING_EFFORT", "  low  ");
     }
     let config = MoConfig::load(None).unwrap();
     assert_eq!(config.models.len(), 1);
     assert_eq!(config.models[0].name, "env-model");
     assert_eq!(config.models[0].token.as_deref(), Some("env-tok"));
+    // The env value is trimmed.
+    assert_eq!(config.models[0].reasoning_effort.as_deref(), Some("low"));
     assert_eq!(config.port, 9999);
     assert_eq!(config.bind, "127.0.0.1");
     assert_eq!(config.max_tool_concurrency, 3);
     assert_eq!(config.source, None);
+
+    // A blank value is treated as unset.
+    unsafe {
+        env::set_var("MO_REASONING_EFFORT", "   ");
+    }
+    let config = MoConfig::load(None).unwrap();
+    assert_eq!(config.models[0].reasoning_effort, None);
 
     unsafe {
         env::remove_var("MO_MODEL_BASE_URL");
@@ -383,6 +420,7 @@ fn env_fallback_builds_one_model() {
         env::remove_var("MO_PORT");
         env::remove_var("MO_BIND");
         env::remove_var("MO_MAX_TOOL_CONCURRENCY");
+        env::remove_var("MO_REASONING_EFFORT");
     }
     env::set_current_dir(&cwd).unwrap();
 }

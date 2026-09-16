@@ -51,6 +51,7 @@ fn test_app() -> TestApp {
                 token: None,
                 nickname: None,
                 context_window: None,
+                reasoning_effort: None,
             },
             mo_core::ModelConfig {
                 base_url: "http://127.0.0.1:9002".into(),
@@ -58,6 +59,7 @@ fn test_app() -> TestApp {
                 token: None,
                 nickname: None,
                 context_window: None,
+                reasoning_effort: None,
             },
             mo_core::ModelConfig {
                 base_url: "http://127.0.0.1:9003".into(),
@@ -65,6 +67,7 @@ fn test_app() -> TestApp {
                 token: None,
                 nickname: None,
                 context_window: None,
+                reasoning_effort: None,
             },
         ],
     });
