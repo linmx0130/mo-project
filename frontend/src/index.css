@@ -296,6 +296,31 @@ p {
   cursor: pointer;
 }
 
+.session-edit {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+  padding: 6px 8px;
+  cursor: pointer;
+}
+
+.session-edit:hover:not(:disabled) {
+  color: var(--text-h);
+  background: var(--accent-bg-hover);
+}
+
+.session-edit:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .session-delete:hover:not(:disabled) {
   color: var(--status-failed);
   background: var(--accent-bg-hover);
@@ -1660,6 +1685,44 @@ p {
   color: var(--muted);
 }
 
+.dialog-input {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font: inherit;
+  padding: 8px 12px;
+}
+
+.dialog-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.dialog-input:disabled {
+  opacity: 0.6;
+}
+
+.dialog-error {
+  font-size: 12px;
+  color: var(--status-failed);
+}
+
+/* ---------- edit-title modal ---------- */
+
+.edit-title-modal {
+  width: min(480px, 100%);
+}
+
+.edit-title-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 16px;
+}
+
 .dialog-actions {
   display: flex;
   justify-content: flex-end;
@@ -1677,9 +1740,14 @@ p {
   cursor: pointer;
 }
 
-.dialog-btn:hover {
+.dialog-btn:hover:not(:disabled) {
   border-color: var(--accent);
   color: var(--accent);
+}
+
+.dialog-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .dialog-btn.primary {

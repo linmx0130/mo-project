@@ -277,7 +277,7 @@ export interface JournalEvent {
   kind: JournalEventKind
 }
 
-async function http<T>(url: string, init?: RequestInit): Promise<T> {
+async function request(url: string, init?: RequestInit): Promise<Response> {
   const res = await fetch(url, init)
   if (!res.ok) {
     let message = `HTTP ${res.status}`
@@ -289,6 +289,11 @@ async function http<T>(url: string, init?: RequestInit): Promise<T> {
     }
     throw new Error(message)
   }
+  return res
+}
+
+async function http<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await request(url, init)
   // 204 No Content (e.g. session deletion) has no JSON body.
   if (res.status === 204) return undefined as T
   return res.json() as Promise<T>
@@ -496,4 +501,31 @@ export function cancelSession(id: string): Promise<Session> {
 /** Permanently delete a session (worker killed, files + DB row removed). */
 export function deleteSession(id: string): Promise<void> {
   return http(`/api/sessions/${id}`, { method: 'DELETE' })
+}
+
+/** Rename a session (the `prompt` field doubles as the title). The backend
+ *  trims the title, rejects an empty one, and caps it at 256 characters. */
+export function updateSession(id: string, prompt: string): Promise<Session> {
+  return http(`/api/sessions/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt }),
+  })
+}
+
+/** Ask the backend for another LLM-generated title (from the session's
+ *  first user message). The server waits (bounded) for generation to
+ *  finish: status 200 means the returned session carries the final title
+ *  (possibly identical to the old one — a finished result, not a pending
+ *  one); status 202 means generation is still running and the title lands
+ *  asynchronously, visible on the next `listSessions()` poll. */
+export async function regenerateTitle(
+  id: string,
+  signal?: AbortSignal,
+): Promise<{ status: number; session: Session }> {
+  const res = await request(`/api/sessions/${id}/title/regenerate`, {
+    method: 'POST',
+    signal,
+  })
+  return { status: res.status, session: (await res.json()) as Session }
 }

@@ -48,7 +48,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions", post(create_session).get(list_sessions))
         .route(
             "/api/sessions/{id}",
-            get(get_session).delete(delete_session),
+            get(get_session)
+                .patch(rename_session)
+                .delete(delete_session),
         )
         .route("/api/sessions/{id}/history", get(history))
         .route("/api/sessions/{id}/events", get(sse::events))
@@ -56,6 +58,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/skills/load", post(load_skill))
         .route("/api/sessions/{id}/mode", post(switch_mode))
         .route("/api/sessions/{id}/model", post(switch_model))
+        .route(
+            "/api/sessions/{id}/title/regenerate",
+            post(regenerate_title),
+        )
         .route("/api/sessions/{id}/mode/approve", post(approve_mode_change))
         .route("/api/sessions/{id}/mode/reject", post(reject_mode_change))
         .route("/api/sessions/{id}/ask/answer", post(answer_ask_user))
@@ -1273,6 +1279,105 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> ApiResult<Json<Vec
     let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
     let sessions = db::list_sessions(&conn).map_err(ApiError::internal)?;
     Ok(Json(sessions))
+}
+
+#[derive(Deserialize)]
+struct RenameSessionRequest {
+    /// New title; trimmed, must not be empty, capped at 256 characters.
+    prompt: String,
+}
+
+/// PATCH /api/sessions/:id — rename the session (the `prompt` column doubles
+/// as the title). Allowed in any status: the title is display-only metadata
+/// and no worker state is touched. The new title is capped at
+/// `title::MAX_TITLE_CHARS` characters, same as generated titles.
+async fn rename_session(
+    State(state): State<Arc<AppState>>,
+    PathParam(id): PathParam<String>,
+    Json(payload): Json<RenameSessionRequest>,
+) -> ApiResult<Json<Session>> {
+    let title = payload.prompt.trim();
+    if title.is_empty() {
+        return Err(ApiError::bad_request("title must not be empty"));
+    }
+    let title = crate::title::cap_title(title);
+    {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        if db::get_session(&conn, &id)
+            .map_err(ApiError::internal)?
+            .is_none()
+        {
+            return Err(ApiError::not_found("session not found"));
+        }
+        db::set_prompt(&conn, &id, &title).map_err(ApiError::internal)?;
+    }
+    let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+    let session = db::get_session(&conn, &id)
+        .map_err(ApiError::internal)?
+        .expect("session row exists");
+    Ok(Json(session))
+}
+
+/// POST /api/sessions/:id/title/regenerate — ask the model for a new title
+/// from the session's first user message. The handler waits (bounded) for
+/// the background generation to finish and answers with the refreshed
+/// session:
+///
+/// * `200` — generation finished; the body carries the final title (which
+///   may equal the old one: at temperature 0 the model often regenerates an
+///   identical title, and that is a completed result, not a pending one).
+/// * `500` — the LLM call failed; the current title is untouched.
+/// * `202` — generation did not finish within the wait; the title lands
+///   asynchronously and shows up in `GET /api/sessions` polling.
+///
+/// Allowed in any status.
+async fn regenerate_title(
+    State(state): State<Arc<AppState>>,
+    PathParam(id): PathParam<String>,
+) -> ApiResult<(StatusCode, Json<Session>)> {
+    let journal_path = {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        match db::get_session(&conn, &id).map_err(ApiError::internal)? {
+            Some(session) => session.journal_path,
+            None => return Err(ApiError::not_found("session not found")),
+        }
+    };
+    let events = mo_core::read_events(Path::new(&journal_path)).map_err(ApiError::internal)?;
+    let first_message = events.iter().find_map(|e| match &e.kind {
+        JournalEventKind::Message(m) if m.role == "user" => Some(m.content.clone()),
+        _ => None,
+    });
+    let Some(first_message) = first_message else {
+        return Err(ApiError::bad_request(
+            "session has no user message to generate a title from",
+        ));
+    };
+    let rx = crate::title::spawn_title_generation_wait(state.clone(), id.clone(), first_message);
+    // Wait for the generation thread without blocking the shared runtime.
+    // The bound keeps a slow/unreachable model from holding the request
+    // forever; past it, the client falls back to list-polling (202).
+    const GENERATION_WAIT: std::time::Duration = std::time::Duration::from_secs(50);
+    let outcome = tokio::task::spawn_blocking(move || rx.recv_timeout(GENERATION_WAIT))
+        .await
+        .map_err(|e| ApiError::internal(format!("title generation wait failed: {e}")))?;
+    let session = {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::get_session(&conn, &id)
+            .map_err(ApiError::internal)?
+            .expect("session row exists")
+    };
+    match outcome {
+        Ok(Ok(_)) => Ok((StatusCode::OK, Json(session))),
+        Ok(Err(e)) => Err(ApiError::internal(format!(
+            "title generation failed: {e:#}"
+        ))),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Ok((StatusCode::ACCEPTED, Json(session)))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(ApiError::internal("title generation thread died"))
+        }
+    }
 }
 
 /// GET /api/sessions/:id — detail plus a liveness check: a session marked
