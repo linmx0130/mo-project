@@ -564,6 +564,8 @@ the model):
 | `POST /api/sessions` `{workdir, prompt, model?, mode?, banned_tools?, skills?, defer_spawn?}` | create session + spawn worker (`model` = model name from `/api/models`, default when absent; `mode` = mode name from `/api/modes`, `build` when absent; `banned_tools` = the *toggleable* tools from `/api/tools` to disable for this session — disabled schemas are not injected into the prompt; absent/empty bans nothing, and fixed tools cannot be banned; `skills` = skill names from `/api/skills` to force-load — their full `SKILL.md` is injected into the system prompt at the first run; absent/empty force-loads nothing, and unknown names are rejected; `defer_spawn` = create the row only — no first message, no worker, no title — used by the New-session form's two-phase image flow: create, upload the images into the session folder, then send the first message via `POST /api/sessions/:id/messages`, which is what journals it and spawns the worker) |
 | `GET /api/sessions` | list root sessions (newest first; subagent sessions are hidden — they are reached through their parent's tool blocks) |
 | `GET /api/sessions/:id` | detail; liveness check flips dead workers to `failed` |
+| `PATCH /api/sessions/:id` `{prompt}` | rename the session (the `prompt` column doubles as the title): trims, rejects an empty title (400), caps at 256 characters (not bytes); allowed in any status — the title is display-only metadata |
+| `POST /api/sessions/:id/title/regenerate` | ask the model for a new title from the session's first user message. The handler waits (bounded, ~50s) for generation: `200 {title}` carries the finished title (possibly identical to the old one — a completed result, not a pending one) **without persisting it** — the client reviews it and saves via `PATCH`; when the model returned nothing usable, `title` is the current title; `500` on LLM failure; `202 {title: null}` when generation outlasts the wait (the title is then stored asynchronously and shows up in `GET /api/sessions` polling). Requires a user message in the journal (400 otherwise) |
 | `GET /api/sessions/:id/history?after_seq=N` | journal events after `N` |
 | `GET /api/sessions/:id/events` | SSE tail: new events + synthesized status changes |
 | `POST /api/sessions/:id/messages` `{content, images?}` | continue a terminal session: journal the user message (preceded by a `mode_change` notice when the mode was switched since the last run and/or a `model_change` notice when the model was), reset to `pending`, respawn the worker. `images` (optional) lists attached images as `[{path, mime}]` — `path` must be a path returned by `POST /api/sessions/:id/images`; the worker rebuilds them into base64 `image_url` parts for the LLM. Also accepts the first message of a `defer_spawn` session (a never-started pending session with no worker) |
@@ -630,7 +632,15 @@ sent. The gateway then makes a short, separate LLM call — using the default
 (first) model from `mo.toml` — to generate a simple title from the first
 user message and updates the DB — and with it the sidebar/header — when it
 lands. If no model is configured or the call fails, the timestamped
-placeholder stays.
+placeholder stays. Generated titles are capped at 256 characters.
+
+Titles are editable: the sidebar's pencil button (next to the delete
+button) opens a dialog with a text field (`PATCH /api/sessions/:id`, capped
+at 256 characters) and a **Regenerate with AI** option that re-runs the
+generator on the first user message (`POST /api/sessions/:id/title/regenerate`).
+Regeneration answers with the new title without persisting it: the dialog
+shows it for review, and **Save** is what renames the session — Cancel
+leaves the old title in place.
 
 ## Development
 

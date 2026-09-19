@@ -1,13 +1,19 @@
 //! Session title generation: a short, separate gateway-side LLM call.
 //!
 //! New sessions are created with a timestamped placeholder title
-//! (`New session - <time>`); a fire-and-forget call to the model then names
-//! the session from its first user message and the gateway updates the DB
-//! (the `prompt` column doubles as the title) when the result lands. This
-//! keeps the sidebar/header readable from the first second without letting
-//! a raw user message become the permanent title.
+//! (`New session - <time>`); a call to the model then names the session from
+//! its first user message and the gateway updates the DB (the `prompt`
+//! column doubles as the title) when the result lands. This keeps the
+//! sidebar/header readable from the first second without letting a raw user
+//! message become the permanent title.
+//!
+//! Generation runs on a dedicated OS thread with its own current-thread
+//! runtime (nah_chat's stream future is `!Send`). The initial creation flow
+//! is fire-and-forget; the regenerate endpoint waits on the outcome through
+//! a channel so it can answer with the finished title.
 
 use std::sync::Arc;
+use std::sync::mpsc;
 
 use anyhow::{Result, bail};
 use futures_util::{StreamExt, pin_mut};
@@ -18,6 +24,16 @@ use nah_chat::{
 };
 
 use crate::state::AppState;
+
+/// Maximum length of a stored session title, in characters (not bytes).
+/// Both generated and user-entered titles are capped here and by the
+/// rename endpoint.
+pub(crate) const MAX_TITLE_CHARS: usize = 256;
+
+/// Truncate a title to [`MAX_TITLE_CHARS`] characters.
+pub(crate) fn cap_title(title: &str) -> String {
+    title.chars().take(MAX_TITLE_CHARS).collect()
+}
 
 /// The model is asked for a bare title; the mock LLM keys on "short title"
 /// to recognize this request. The length restriction lives here, in the
@@ -35,42 +51,98 @@ pub fn placeholder_title() -> String {
     )
 }
 
-/// Kick off title generation for a freshly created session on a background
-/// thread and write the result back to the DB when it lands. Failures are
-/// logged and leave the placeholder title in place. The default (first)
-/// model from the config file is used.
-///
-/// A dedicated OS thread with its own current-thread runtime is used because
-/// nah_chat's stream future is `!Send` and cannot be driven by a
-/// `tokio::spawn` task on the shared gateway runtime.
+/// Kick off title generation on a background thread and write the result
+/// back to the DB when it lands. Failures are logged and leave the current
+/// title in place. The default (first) model from the config file is used.
+/// Used by the initial creation flow, where the result is picked up by the
+/// UI's session-list polling — see [`spawn_title_generation_wait`] for the
+/// regenerate endpoint, which needs the outcome itself.
 pub fn spawn_title_generation(state: Arc<AppState>, session_id: String, first_message: String) {
+    generate_title_on_thread(state, session_id, first_message, StoreMode::Always, None);
+}
+
+/// Whether a generated title is written to the session row.
+#[derive(Clone, Copy)]
+enum StoreMode {
+    /// Always store: the initial creation flow, where nobody waits for the
+    /// result and the DB write is how the title reaches the world.
+    Always,
+    /// Deliver-first: a caller is waiting on the outcome (regeneration), so
+    /// the title goes through the channel and the user reviews it in the UI
+    /// before saving. Only when the caller turns out to be gone (wait timed
+    /// out, client disconnected) does the thread fall back to storing, so a
+    /// late result is not lost entirely.
+    UnlessDelivered,
+}
+
+/// Like [`spawn_title_generation`], but the background thread reports its
+/// outcome on the returned receiver once generation finishes (or fails),
+/// and a successfully generated title is *delivered rather than stored*
+/// (see [`StoreMode::UnlessDelivered`]):
+/// `Ok(Some(title))` — a usable, already-capped title was generated;
+/// `Ok(None)` — nothing usable (no model configured, empty content, tool
+/// call); `Err` — the LLM call itself failed.
+///
+/// The receiver is bounded only by the generation itself: if the caller
+/// never receives, the send simply fails and the thread stores the title.
+pub fn spawn_title_generation_wait(
+    state: Arc<AppState>,
+    session_id: String,
+    first_message: String,
+) -> mpsc::Receiver<Result<Option<String>>> {
+    let (tx, rx) = mpsc::channel();
+    generate_title_on_thread(
+        state,
+        session_id,
+        first_message,
+        StoreMode::UnlessDelivered,
+        Some(tx),
+    );
+    rx
+}
+
+/// Run title generation on a dedicated OS thread, store the result on the
+/// session row when the store mode says so, and report the outcome to
+/// `done` when one was requested.
+fn generate_title_on_thread(
+    state: Arc<AppState>,
+    session_id: String,
+    first_message: String,
+    store_mode: StoreMode,
+    done: Option<mpsc::Sender<Result<Option<String>>>>,
+) {
     let Some(model) = state.default_model().cloned() else {
         tracing::debug!(
             session = %session_id,
             "no model configured; keeping placeholder title"
         );
+        if let Some(done) = done {
+            let _ = done.send(Ok(None));
+        }
         return;
     };
     std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                tracing::warn!(session = %session_id, "failed to build title-generation runtime: {e}");
-                return;
-            }
+        let result =
+            run_generation(&model, &first_message).map(|opt| opt.map(|title| cap_title(&title)));
+        // Pull out what the post-send logic needs — `result` itself moves
+        // into the send below (anyhow::Error is not clonable).
+        let generated = match &result {
+            Ok(Some(title)) => Some(title.clone()),
+            _ => None,
         };
-        match rt.block_on(generate_title(
-            &first_message,
-            &model.base_url,
-            &model.name,
-            model.token.clone(),
-        )) {
-            Ok(Some(generated)) => {
+        let empty = matches!(result, Ok(None));
+        let failure = match &result {
+            Err(e) => Some(format!("{e:#}")),
+            _ => None,
+        };
+        // Deliver the outcome to a waiting caller when there is one; the
+        // title (already capped) travels with it.
+        let delivered = done.as_ref().is_some_and(|tx| tx.send(result).is_ok());
+        if let Some(title) = generated {
+            let store = matches!(store_mode, StoreMode::Always) || !delivered;
+            if store {
                 let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
-                if let Err(e) = db::set_prompt(&conn, &session_id, &generated) {
+                if let Err(e) = db::set_prompt(&conn, &session_id, &title) {
                     tracing::warn!(
                         session = %session_id,
                         "failed to save generated session title: {e}"
@@ -78,24 +150,43 @@ pub fn spawn_title_generation(state: Arc<AppState>, session_id: String, first_me
                 } else {
                     tracing::info!(
                         session = %session_id,
-                        title = %generated,
+                        title = %title,
                         "generated session title"
                     );
                 }
-            }
-            Ok(None) => {
-                // No model configured, or the model returned nothing
-                // usable; the placeholder stays as the title.
+            } else {
                 tracing::debug!(
                     session = %session_id,
-                    "no generated session title; keeping placeholder"
+                    title = %title,
+                    "regenerated session title delivered to caller; not persisted"
                 );
             }
-            Err(e) => {
-                tracing::warn!(session = %session_id, "session title generation failed: {e:#}");
-            }
+        } else if empty {
+            // No model configured, or the model returned nothing
+            // usable; the current title stays.
+            tracing::debug!(
+                session = %session_id,
+                "no generated session title; keeping current title"
+            );
+        } else if let Some(e) = failure {
+            tracing::warn!(session = %session_id, "session title generation failed: {e}");
         }
     });
+}
+
+/// One title-generation run: build the thread-local runtime and drive the
+/// streaming LLM call to completion.
+fn run_generation(model: &mo_core::ModelConfig, first_message: &str) -> Result<Option<String>> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build title-generation runtime: {e}"))?;
+    rt.block_on(generate_title(
+        first_message,
+        &model.base_url,
+        &model.name,
+        model.token.clone(),
+    ))
 }
 
 /// Best-effort title generation from the session's first user message.

@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { Session } from './api'
-import { deleteSession, getMeta, listSessions } from './api'
+import { deleteSession, getMeta, listSessions, updateSession } from './api'
 import { clearDraft, loadDraft, saveDraft, type Draft } from './draft'
 import { applyThemeColor, type Theme } from './theme'
 import DraftSession from './components/DraftSession'
+import EditTitleModal from './components/EditTitleModal'
 import SessionList from './components/SessionList'
 import SessionView from './components/SessionView'
 
@@ -55,6 +56,8 @@ function App() {
   // Session currently being deleted (delete button shows a spinner and the
   // button is disabled while the request is in flight).
   const [deletingId, setDeletingId] = useState<string | null>(null)
+  // Session whose title is being edited in the modal (null = modal closed).
+  const [editingId, setEditingId] = useState<string | null>(null)
   // Sidebar-level error, e.g. a failed delete (surfaced above the list).
   const [listError, setListError] = useState<string | null>(null)
 
@@ -187,7 +190,19 @@ function App() {
     }
   }
 
+  /** Rename a session via the edit-title modal: persists the new title,
+   *  updates the local list so the sidebar reacts immediately (the 3s poll
+   *  keeps it consistent), and closes the modal. */
+  const handleSaveTitle = async (id: string, title: string) => {
+    await updateSession(id, title)
+    setSessions((prev) =>
+      prev.map((s) => (s.id === id ? { ...s, prompt: title } : s)),
+    )
+    setEditingId(null)
+  }
+
   const selected = sessions.find((s) => s.id === selectedId) ?? null
+  const editing = sessions.find((s) => s.id === editingId) ?? null
 
   return (
     <div className="app">
@@ -222,6 +237,7 @@ function App() {
               selectedId={selectedId}
               deletingId={deletingId}
               onSelect={selectSession}
+              onEdit={setEditingId}
               onDelete={(id) => void handleDelete(id)}
             />
           </div>
@@ -242,6 +258,13 @@ function App() {
         </div>
       </aside>
       <main className="main">
+        {editing && (
+          <EditTitleModal
+            session={editing}
+            onClose={() => setEditingId(null)}
+            onSave={handleSaveTitle}
+          />
+        )}
         {draftOpen ? (
           <DraftSession
             draft={draft}

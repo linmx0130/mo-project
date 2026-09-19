@@ -14,6 +14,7 @@ interface Props {
   /** Session currently being deleted (delete button shows a spinner). */
   deletingId: string | null
   onSelect: (id: string) => void
+  onEdit: (id: string) => void
   onDelete: (id: string) => void
 }
 
@@ -22,6 +23,7 @@ export default function SessionList({
   selectedId,
   deletingId,
   onSelect,
+  onEdit,
   onDelete,
 }: Props) {
   if (sessions.length === 0) {
@@ -42,6 +44,28 @@ export default function SessionList({
             <span className={`badge badge-${s.status}`}>{STATUS_LABEL[s.status]}</span>
             <span className="session-prompt">{s.prompt.slice(0, 80)}</span>
             <span className="session-time">{formatTime(s.created_at)}</span>
+          </button>
+          <button
+            type="button"
+            className="session-edit"
+            aria-label={`Edit title: ${s.prompt.slice(0, 80)}`}
+            title="Edit title"
+            disabled={deletingId === s.id}
+            onClick={() => onEdit(s.id)}
+          >
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
+            </svg>
           </button>
           <button
             type="button"

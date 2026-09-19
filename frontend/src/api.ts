@@ -277,7 +277,7 @@ export interface JournalEvent {
   kind: JournalEventKind
 }
 
-async function http<T>(url: string, init?: RequestInit): Promise<T> {
+async function request(url: string, init?: RequestInit): Promise<Response> {
   const res = await fetch(url, init)
   if (!res.ok) {
     let message = `HTTP ${res.status}`
@@ -289,6 +289,11 @@ async function http<T>(url: string, init?: RequestInit): Promise<T> {
     }
     throw new Error(message)
   }
+  return res
+}
+
+async function http<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await request(url, init)
   // 204 No Content (e.g. session deletion) has no JSON body.
   if (res.status === 204) return undefined as T
   return res.json() as Promise<T>
@@ -496,4 +501,36 @@ export function cancelSession(id: string): Promise<Session> {
 /** Permanently delete a session (worker killed, files + DB row removed). */
 export function deleteSession(id: string): Promise<void> {
   return http(`/api/sessions/${id}`, { method: 'DELETE' })
+}
+
+/** Rename a session (the `prompt` field doubles as the title). The backend
+ *  trims the title, rejects an empty one, and caps it at 256 characters. */
+export function updateSession(id: string, prompt: string): Promise<Session> {
+  return http(`/api/sessions/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt }),
+  })
+}
+
+/** Ask the backend for another LLM-generated title (from the session's
+ *  first user message). The server waits (bounded) for generation to
+ *  finish: status 200 carries the final title (possibly identical to the
+ *  old one — a finished result, not a pending one) and does NOT persist
+ *  it — the user reviews it and Save PATCHes it. When the model returned
+ *  nothing usable, `title` is the session's current title. Status 202
+ *  (`title: null`) means generation is still running; the server stores
+ *  the late result, which then shows up in `listSessions()` polling. */
+export async function regenerateTitle(
+  id: string,
+  signal?: AbortSignal,
+): Promise<{ status: number; title: string | null }> {
+  const res = await request(`/api/sessions/${id}/title/regenerate`, {
+    method: 'POST',
+    signal,
+  })
+  return {
+    status: res.status,
+    title: ((await res.json()) as { title: string | null }).title,
+  }
 }

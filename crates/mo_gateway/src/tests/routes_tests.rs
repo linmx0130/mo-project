@@ -20,6 +20,13 @@ struct TestApp {
 }
 
 fn test_app() -> TestApp {
+    test_app_with_base_url("http://127.0.0.1:9001")
+}
+
+/// Like `test_app`, but the default (first) model — the one title
+/// generation uses — points at the given base URL, so tests can stand up a
+/// real mock LLM and exercise the generate/wait path end to end.
+fn test_app_with_base_url(base_url: &str) -> TestApp {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
     // A real, executable no-op worker: `spawn_and_patch` spawns it and
@@ -43,10 +50,11 @@ fn test_app() -> TestApp {
         context_compression_threshold: mo_core::config::DEFAULT_CONTEXT_COMPRESSION_THRESHOLD,
         // Three models so the model-switch endpoint has something to switch
         // to/from (and a collapse test can go mock → other → third);
-        // sessions are inserted with `mock-model`.
+        // sessions are inserted with `mock-model`. The default model's URL
+        // comes from the caller (a live mock LLM or an unreachable port).
         models: vec![
             mo_core::ModelConfig {
-                base_url: "http://127.0.0.1:9001".into(),
+                base_url: base_url.into(),
                 name: "mock-model".into(),
                 token: None,
                 nickname: None,
@@ -2218,4 +2226,225 @@ async fn send_followup_json(
         .unwrap();
     let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, value)
+}
+
+/// PATCH /api/sessions/:id with a JSON body (`{"prompt": ...}`).
+async fn patch_title(
+    app: &Arc<AppState>,
+    id: &str,
+    prompt: &str,
+) -> (StatusCode, serde_json::Value) {
+    let router = create_router(app.clone());
+    let body = json!({ "prompt": prompt });
+    let request = Request::builder()
+        .method("PATCH")
+        .uri(format!("/api/sessions/{id}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
+/// Renaming a session trims the new title, updates the DB row, and returns
+/// the refreshed session. Allowed in any status — the title is display-only
+/// metadata, so even a running session can be renamed.
+#[tokio::test]
+async fn rename_session_updates_title() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    append_kinds(&session.journal_path, &[user_msg("hi")]);
+
+    let (status, body) = patch_title(&app.state, "s1", "  My new title  ").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["prompt"], "My new title", "body: {body}");
+
+    let row = {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::get_session(&conn, "s1").unwrap().unwrap()
+    };
+    assert_eq!(row.prompt, "My new title");
+
+    // A running session can be renamed too.
+    {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::update_status(&conn, "s1", SessionStatus::Running, None).unwrap();
+    }
+    let (status, body) = patch_title(&app.state, "s1", "renamed while running").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["prompt"], "renamed while running", "body: {body}");
+}
+
+/// Renaming validates its input: unknown session -> 404, empty/whitespace
+/// title -> 400, and overlong titles are truncated to 256 characters.
+#[tokio::test]
+async fn rename_session_validates_and_caps() {
+    let app = test_app();
+    insert_session(&app.state, "s1", Mode::Build);
+
+    let (status, _) = patch_title(&app.state, "nope", "x").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    for empty in ["", "   ", "\t\n"] {
+        let (status, body) = patch_title(&app.state, "s1", empty).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "prompt: {empty:?}");
+        assert!(
+            body.to_string().contains("must not be empty"),
+            "body: {body}"
+        );
+    }
+
+    // Multibyte input: the cap counts characters, not bytes.
+    let long = "标".repeat(300);
+    let (status, body) = patch_title(&app.state, "s1", &long).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let capped = body["prompt"].as_str().unwrap();
+    assert_eq!(capped.chars().count(), 256, "prompt: {capped}");
+    let row = {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::get_session(&conn, "s1").unwrap().unwrap()
+    };
+    assert_eq!(row.prompt.chars().count(), 256);
+}
+
+/// Regenerating a title waits for the background generation and answers
+/// with the finished title — which is NOT persisted: the client reviews it
+/// and saves it with a PATCH. (The mock LLM derives the title from the
+/// first user message.)
+#[tokio::test]
+async fn regenerate_title_waits_and_returns_new_title() {
+    let base_url = mock_llm().await;
+    let app = test_app_with_base_url(&base_url);
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    append_kinds(
+        &session.journal_path,
+        &[user_msg("Read notes.txt and summarize it")],
+    );
+
+    let (status, body) = post_empty_json(&app.state, "s1", "/title/regenerate").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["title"], "Explore notes.txt", "body: {body}");
+
+    // Review-then-save: the DB row still carries the OLD title.
+    let row = {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::get_session(&conn, "s1").unwrap().unwrap()
+    };
+    assert_eq!(row.prompt, "test session");
+
+    // Unknown session -> 404.
+    let (status, _) = post_empty_json(&app.state, "nope", "/title/regenerate").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// When the model returns nothing usable, regeneration is a completed
+/// no-op: 200 with the current title.
+#[tokio::test]
+async fn regenerate_title_with_empty_model_answer_keeps_title() {
+    let base_url = mock_llm().await;
+    let app = test_app_with_base_url(&base_url);
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    // The mock returns empty content for a user message containing "empty".
+    append_kinds(&session.journal_path, &[user_msg("empty answer please")]);
+
+    let (status, body) = post_empty_json(&app.state, "s1", "/title/regenerate").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["title"], "test session", "body: {body}");
+}
+
+/// When the LLM call itself fails, regeneration answers 500 and the current
+/// title is untouched.
+#[tokio::test]
+async fn regenerate_title_with_unreachable_model_fails() {
+    // Port 9 (discard) is guaranteed closed on the test host.
+    let app = test_app_with_base_url("http://127.0.0.1:9");
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    append_kinds(&session.journal_path, &[user_msg("hi")]);
+
+    let (status, body) = post_empty_json(&app.state, "s1", "/title/regenerate").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
+    assert!(
+        body.to_string().contains("title generation failed"),
+        "body: {body}"
+    );
+    let row = {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::get_session(&conn, "s1").unwrap().unwrap()
+    };
+    assert_eq!(row.prompt, "test session");
+}
+
+/// Regenerating a title requires a user message to generate from: a journal
+/// without any user message is a bad request (the placeholder title stays).
+#[tokio::test]
+async fn regenerate_title_requires_a_user_message() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    // The journal exists but holds no user message.
+    append_kinds(
+        &session.journal_path,
+        &[assistant_msg("only an assistant reply")],
+    );
+
+    let (status, body) = post_empty_json(&app.state, "s1", "/title/regenerate").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(body.to_string().contains("no user message"), "body: {body}");
+    // The title is untouched.
+    let row = {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::get_session(&conn, "s1").unwrap().unwrap()
+    };
+    assert_eq!(row.prompt, "test session");
+}
+
+fn sse_payload(deltas: &[serde_json::Value]) -> String {
+    let mut out = String::new();
+    for delta in deltas {
+        out.push_str(&format!(
+            "data: {}\n\n",
+            json!({ "choices": [{ "delta": delta }] })
+        ));
+    }
+    out.push_str("data: [DONE]\n\n");
+    out
+}
+
+/// A tiny mock LLM for the regenerate tests: title requests (a system
+/// prompt mentioning "short title") get a bare title derived from the first
+/// user message — "Explore notes.txt" for anything but "empty", which gets
+/// empty assistant content. Returns the bound base URL.
+async fn mock_llm() -> String {
+    let router = Router::new().route(
+        "/chat/completions",
+        axum::routing::post(|body: axum::extract::Json<serde_json::Value>| async move {
+            let user = body["messages"]
+                .as_array()
+                .and_then(|msgs| msgs.iter().find(|m| m["role"] == "user"))
+                .and_then(|m| m["content"].as_str())
+                .unwrap_or("");
+            let body = if user.contains("empty") {
+                sse_payload(&[json!({ "role": "assistant" })])
+            } else {
+                sse_payload(&[
+                    json!({ "role": "assistant" }),
+                    json!({ "content": "Explore notes.txt" }),
+                ])
+            };
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                body,
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    format!("http://{addr}")
 }

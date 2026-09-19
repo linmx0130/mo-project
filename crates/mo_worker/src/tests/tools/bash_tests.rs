@@ -259,7 +259,9 @@ async fn delta_stream_is_capped_with_marker() {
     )
     .await
     .unwrap();
-    // The marker replaced further deltas once the budget ran out.
+    // The marker replaced further deltas once the budget ran out. The cap is
+    // enforced per chunk (up to CHUNK_SIZE bytes), so the total may
+    // overshoot the cap by one straddling chunk plus the marker text.
     let streamed: usize = collected
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -267,12 +269,18 @@ async fn delta_stream_is_capped_with_marker() {
         .map(|s| s.len())
         .sum();
     assert!(
-        streamed < DELTA_STREAM_CAP + 4096,
+        streamed < DELTA_STREAM_CAP + CHUNK_SIZE + 128,
         "delta stream not capped: {streamed} bytes"
     );
     assert!(
         streamed >= DELTA_STREAM_CAP,
         "delta stream stopped early: {streamed} bytes"
+    );
+    let joined = collected.lock().unwrap_or_else(|e| e.into_inner()).concat();
+    assert!(
+        joined.contains("output capped at 10 MB"),
+        "missing cap marker in delta stream: tail {:?}",
+        &joined[joined.len().saturating_sub(120)..]
     );
     // The retained result is still bounded at ~1 MB.
     assert!(out.len() < 2 * 1024 * 1024, "result too big: {}", out.len());

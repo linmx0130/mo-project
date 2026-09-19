@@ -103,6 +103,31 @@ async fn placeholder_title_has_new_session_prefix() {
     assert!(title.len() > "New session - ".len());
 }
 
+#[test]
+fn cap_title_passes_short_titles_through() {
+    assert_eq!(cap_title("Explore notes.txt"), "Explore notes.txt");
+    let exact = "a".repeat(MAX_TITLE_CHARS);
+    assert_eq!(cap_title(&exact), exact);
+}
+
+#[test]
+fn cap_title_truncates_at_256_chars() {
+    let long = "a".repeat(MAX_TITLE_CHARS + 44);
+    let capped = cap_title(&long);
+    assert_eq!(capped.chars().count(), MAX_TITLE_CHARS);
+    assert_eq!(capped, "a".repeat(MAX_TITLE_CHARS));
+}
+
+#[test]
+fn cap_title_counts_chars_not_bytes() {
+    // CJK characters are 3 bytes each in UTF-8: capping by bytes would cut
+    // the title to ~85 characters. The cap must count characters.
+    let long = "标".repeat(MAX_TITLE_CHARS + 10);
+    let capped = cap_title(&long);
+    assert_eq!(capped.chars().count(), MAX_TITLE_CHARS);
+    assert!(capped.len() > MAX_TITLE_CHARS, "bytes: {}", capped.len());
+}
+
 #[tokio::test]
 async fn no_model_config_skips_generation() {
     let result = generate_title("hello", "", "", None).await.unwrap();
