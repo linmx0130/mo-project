@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { Session } from '../api'
 import { listSessions, regenerateTitle } from '../api'
+import { charLength, pollForChange } from '../title'
 
 /** Mirrors the backend's `title::MAX_TITLE_CHARS` (characters, not bytes). */
 const MAX_TITLE_CHARS = 256
@@ -24,13 +25,16 @@ interface Props {
  *  characters) plus a "regenerate with AI" option that re-runs the gateway's
  *  title generation from the session's first user message.
  *
- *  The regenerate request itself blocks (bounded, server-side) until
- *  generation finishes, so the spinner always resolves: the response either
- *  carries the final title (possibly identical to the old one — at
- *  temperature 0 the model often regenerates the same title, which is a
- *  finished result, not a pending one) or an error. Only if the server gives
- *  up waiting first (202) does the modal fall back to polling
- *  `listSessions` for a title change. The user always confirms with Save. */
+ *  The regenerate request blocks (bounded, server-side) until generation
+ *  finishes and returns the new title WITHOUT persisting it: the editbox
+ *  fills, the user reviews, and Save (PATCH) is what actually renames the
+ *  session — Cancel leaves the old title in place. The spinner always
+ *  resolves: the response carries the final title (possibly identical to
+ *  the old one — at temperature 0 the model often regenerates the same
+ *  title, which is a completed result, not a pending one), or an error.
+ *  Only if the server gives up waiting first (202) does the modal fall back
+ *  to polling `listSessions`; generation completing with an unchanged title
+ *  is detected through `updated_at`, not just the prompt. */
 export default function EditTitleModal({ session, onClose, onSave }: Props) {
   const [title, setTitle] = useState(session.prompt)
   const [saving, setSaving] = useState(false)
@@ -74,6 +78,7 @@ export default function EditTitleModal({ session, onClose, onSave }: Props) {
     setRegenerating(true)
     setError(null)
     const before = session.prompt
+    const beforeUpdatedAt = session.updated_at
     const controller = new AbortController()
     abortRef.current = controller
     const abortTimer = window.setTimeout(
@@ -81,35 +86,39 @@ export default function EditTitleModal({ session, onClose, onSave }: Props) {
       REGEN_ABORT_MS,
     )
     try {
-      const { status, session: result } = await regenerateTitle(
+      const { status, title: generated } = await regenerateTitle(
         session.id,
         controller.signal,
       )
       if (status !== 202) {
         // 200: generation finished (the title may be identical to the old
-        // one — that is a completed result, not a pending one); 500 already
-        // threw. Fill the editbox only when the title actually changed.
-        if (result.prompt !== before) setTitle(result.prompt)
+        // one — a completed result, not a pending one); 500 already threw.
+        // The title is not persisted yet; Save PATCHes it.
+        if (generated && generated !== before) setTitle(generated)
         return
       }
-      // 202: the server stopped waiting before generation finished — fall
-      // back to watching the session list for the title change.
-      const deadline = Date.now() + REGEN_TIMEOUT_MS
-      for (;;) {
-        await new Promise((r) => setTimeout(r, REGEN_POLL_MS))
-        if (closedRef.current) return
-        if (Date.now() >= deadline) {
-          setError("Title generation didn't finish in time — try again.")
-          return
-        }
-        const sessions = await listSessions()
-        if (closedRef.current) return
-        const updated = sessions.find((s) => s.id === session.id)
-        if (updated && updated.prompt !== before) {
-          setTitle(updated.prompt)
-          return
-        }
+      // 202: the server stopped waiting before generation finished — the
+      // thread stores the late result, so watch the session list for it.
+      // `updated_at` (bumped by every session-row write) detects completion
+      // even when the regenerated title equals the old one; unrelated
+      // writes (heartbeats, status) may end the wait early, which is
+      // harmless — the prompt is then unchanged and the editbox keeps it.
+      const updated = await pollForChange(
+        async () =>
+          (await listSessions()).find((s) => s.id === session.id) ?? null,
+        (s) => s !== null && (s.prompt !== before || s.updated_at !== beforeUpdatedAt),
+        {
+          timeoutMs: REGEN_TIMEOUT_MS,
+          pollMs: REGEN_POLL_MS,
+          isCancelled: () => closedRef.current,
+        },
+      )
+      if (closedRef.current) return
+      if (updated === null) {
+        setError("Title generation didn't finish in time — try again.")
+        return
       }
+      if (updated.prompt !== before) setTitle(updated.prompt)
     } catch (err) {
       if (!closedRef.current)
         setError(err instanceof Error ? err.message : String(err))
@@ -171,7 +180,7 @@ export default function EditTitleModal({ session, onClose, onSave }: Props) {
         />
         <div className="edit-title-foot">
           <span className="dialog-hint">
-            {title.length}/{MAX_TITLE_CHARS}
+            {charLength(title)}/{MAX_TITLE_CHARS}
           </span>
           {error && (
             <span className="dialog-error" role="alert">

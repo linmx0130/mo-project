@@ -1318,23 +1318,34 @@ async fn rename_session(
     Ok(Json(session))
 }
 
+#[derive(Serialize)]
+struct RegenerateTitleResponse {
+    /// The generated title, or the session's current title when generation
+    /// produced nothing usable (both 200, completed). Null only on 202,
+    /// when generation is still running.
+    title: Option<String>,
+}
+
 /// POST /api/sessions/:id/title/regenerate — ask the model for a new title
 /// from the session's first user message. The handler waits (bounded) for
-/// the background generation to finish and answers with the refreshed
-/// session:
+/// the background generation and answers:
 ///
-/// * `200` — generation finished; the body carries the final title (which
-///   may equal the old one: at temperature 0 the model often regenerates an
-///   identical title, and that is a completed result, not a pending one).
+/// * `200 { "title": ... }` — generation finished. Unlike the initial
+///   creation flow, the regenerated title is *not* persisted: it goes back
+///   to the caller for review, and the client persists it with a PATCH on
+///   Save (temperature-0 models often regenerate an identical title, which
+///   is a completed result, not a pending one). When the model returned
+///   nothing usable, `title` is the current title.
 /// * `500` — the LLM call failed; the current title is untouched.
-/// * `202` — generation did not finish within the wait; the title lands
-///   asynchronously and shows up in `GET /api/sessions` polling.
+/// * `202 { "title": null }` — generation did not finish within the wait;
+///   the generation thread stores the title when it lands, so it shows up
+///   in `GET /api/sessions` polling.
 ///
 /// Allowed in any status.
 async fn regenerate_title(
     State(state): State<Arc<AppState>>,
     PathParam(id): PathParam<String>,
-) -> ApiResult<(StatusCode, Json<Session>)> {
+) -> ApiResult<(StatusCode, Json<RegenerateTitleResponse>)> {
     let journal_path = {
         let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
         match db::get_session(&conn, &id).map_err(ApiError::internal)? {
@@ -1355,25 +1366,39 @@ async fn regenerate_title(
     let rx = crate::title::spawn_title_generation_wait(state.clone(), id.clone(), first_message);
     // Wait for the generation thread without blocking the shared runtime.
     // The bound keeps a slow/unreachable model from holding the request
-    // forever; past it, the client falls back to list-polling (202).
+    // forever; past it, the client falls back to list-polling (202) while
+    // the thread stores the late result.
     const GENERATION_WAIT: std::time::Duration = std::time::Duration::from_secs(50);
     let outcome = tokio::task::spawn_blocking(move || rx.recv_timeout(GENERATION_WAIT))
         .await
         .map_err(|e| ApiError::internal(format!("title generation wait failed: {e}")))?;
-    let session = {
-        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
-        db::get_session(&conn, &id)
-            .map_err(ApiError::internal)?
-            .expect("session row exists")
-    };
     match outcome {
-        Ok(Ok(_)) => Ok((StatusCode::OK, Json(session))),
+        Ok(Ok(Some(title))) => Ok((
+            StatusCode::OK,
+            Json(RegenerateTitleResponse { title: Some(title) }),
+        )),
+        Ok(Ok(None)) => {
+            // Nothing usable generated: answer with the current title so the
+            // client treats regeneration as a completed no-op.
+            let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+            match db::get_session(&conn, &id).map_err(ApiError::internal)? {
+                Some(session) => Ok((
+                    StatusCode::OK,
+                    Json(RegenerateTitleResponse {
+                        title: Some(session.prompt),
+                    }),
+                )),
+                // Deleted while generating.
+                None => Err(ApiError::not_found("session not found")),
+            }
+        }
         Ok(Err(e)) => Err(ApiError::internal(format!(
             "title generation failed: {e:#}"
         ))),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            Ok((StatusCode::ACCEPTED, Json(session)))
-        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok((
+            StatusCode::ACCEPTED,
+            Json(RegenerateTitleResponse { title: None }),
+        )),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             Err(ApiError::internal("title generation thread died"))
         }

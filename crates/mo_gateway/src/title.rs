@@ -58,33 +58,57 @@ pub fn placeholder_title() -> String {
 /// UI's session-list polling — see [`spawn_title_generation_wait`] for the
 /// regenerate endpoint, which needs the outcome itself.
 pub fn spawn_title_generation(state: Arc<AppState>, session_id: String, first_message: String) {
-    generate_title_on_thread(state, session_id, first_message, None);
+    generate_title_on_thread(state, session_id, first_message, StoreMode::Always, None);
+}
+
+/// Whether a generated title is written to the session row.
+#[derive(Clone, Copy)]
+enum StoreMode {
+    /// Always store: the initial creation flow, where nobody waits for the
+    /// result and the DB write is how the title reaches the world.
+    Always,
+    /// Deliver-first: a caller is waiting on the outcome (regeneration), so
+    /// the title goes through the channel and the user reviews it in the UI
+    /// before saving. Only when the caller turns out to be gone (wait timed
+    /// out, client disconnected) does the thread fall back to storing, so a
+    /// late result is not lost entirely.
+    UnlessDelivered,
 }
 
 /// Like [`spawn_title_generation`], but the background thread reports its
-/// outcome on the returned receiver once generation finishes (or fails):
-/// `Ok(Some(title))` — a title was generated and stored (already capped);
+/// outcome on the returned receiver once generation finishes (or fails),
+/// and a successfully generated title is *delivered rather than stored*
+/// (see [`StoreMode::UnlessDelivered`]):
+/// `Ok(Some(title))` — a usable, already-capped title was generated;
 /// `Ok(None)` — nothing usable (no model configured, empty content, tool
 /// call); `Err` — the LLM call itself failed.
 ///
 /// The receiver is bounded only by the generation itself: if the caller
-/// never receives, the send simply fails silently on drop.
+/// never receives, the send simply fails and the thread stores the title.
 pub fn spawn_title_generation_wait(
     state: Arc<AppState>,
     session_id: String,
     first_message: String,
 ) -> mpsc::Receiver<Result<Option<String>>> {
     let (tx, rx) = mpsc::channel();
-    generate_title_on_thread(state, session_id, first_message, Some(tx));
+    generate_title_on_thread(
+        state,
+        session_id,
+        first_message,
+        StoreMode::UnlessDelivered,
+        Some(tx),
+    );
     rx
 }
 
 /// Run title generation on a dedicated OS thread, store the result on the
-/// session row, and report the outcome to `done` when one was requested.
+/// session row when the store mode says so, and report the outcome to
+/// `done` when one was requested.
 fn generate_title_on_thread(
     state: Arc<AppState>,
     session_id: String,
     first_message: String,
+    store_mode: StoreMode,
     done: Option<mpsc::Sender<Result<Option<String>>>>,
 ) {
     let Some(model) = state.default_model().cloned() else {
@@ -98,12 +122,27 @@ fn generate_title_on_thread(
         return;
     };
     std::thread::spawn(move || {
-        let result = run_generation(&model, &first_message);
-        match &result {
-            Ok(Some(generated)) => {
-                let generated = cap_title(generated);
+        let result =
+            run_generation(&model, &first_message).map(|opt| opt.map(|title| cap_title(&title)));
+        // Pull out what the post-send logic needs — `result` itself moves
+        // into the send below (anyhow::Error is not clonable).
+        let generated = match &result {
+            Ok(Some(title)) => Some(title.clone()),
+            _ => None,
+        };
+        let empty = matches!(result, Ok(None));
+        let failure = match &result {
+            Err(e) => Some(format!("{e:#}")),
+            _ => None,
+        };
+        // Deliver the outcome to a waiting caller when there is one; the
+        // title (already capped) travels with it.
+        let delivered = done.as_ref().is_some_and(|tx| tx.send(result).is_ok());
+        if let Some(title) = generated {
+            let store = matches!(store_mode, StoreMode::Always) || !delivered;
+            if store {
                 let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
-                if let Err(e) = db::set_prompt(&conn, &session_id, &generated) {
+                if let Err(e) = db::set_prompt(&conn, &session_id, &title) {
                     tracing::warn!(
                         session = %session_id,
                         "failed to save generated session title: {e}"
@@ -111,25 +150,26 @@ fn generate_title_on_thread(
                 } else {
                     tracing::info!(
                         session = %session_id,
-                        title = %generated,
+                        title = %title,
                         "generated session title"
                     );
                 }
-            }
-            Ok(None) => {
-                // No model configured, or the model returned nothing
-                // usable; the current title stays.
+            } else {
                 tracing::debug!(
                     session = %session_id,
-                    "no generated session title; keeping current title"
+                    title = %title,
+                    "regenerated session title delivered to caller; not persisted"
                 );
             }
-            Err(e) => {
-                tracing::warn!(session = %session_id, "session title generation failed: {e:#}");
-            }
-        }
-        if let Some(done) = done {
-            let _ = done.send(result);
+        } else if empty {
+            // No model configured, or the model returned nothing
+            // usable; the current title stays.
+            tracing::debug!(
+                session = %session_id,
+                "no generated session title; keeping current title"
+            );
+        } else if let Some(e) = failure {
+            tracing::warn!(session = %session_id, "session title generation failed: {e}");
         }
     });
 }

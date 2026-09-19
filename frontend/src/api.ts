@@ -515,17 +515,22 @@ export function updateSession(id: string, prompt: string): Promise<Session> {
 
 /** Ask the backend for another LLM-generated title (from the session's
  *  first user message). The server waits (bounded) for generation to
- *  finish: status 200 means the returned session carries the final title
- *  (possibly identical to the old one — a finished result, not a pending
- *  one); status 202 means generation is still running and the title lands
- *  asynchronously, visible on the next `listSessions()` poll. */
+ *  finish: status 200 carries the final title (possibly identical to the
+ *  old one — a finished result, not a pending one) and does NOT persist
+ *  it — the user reviews it and Save PATCHes it. When the model returned
+ *  nothing usable, `title` is the session's current title. Status 202
+ *  (`title: null`) means generation is still running; the server stores
+ *  the late result, which then shows up in `listSessions()` polling. */
 export async function regenerateTitle(
   id: string,
   signal?: AbortSignal,
-): Promise<{ status: number; session: Session }> {
+): Promise<{ status: number; title: string | null }> {
   const res = await request(`/api/sessions/${id}/title/regenerate`, {
     method: 'POST',
     signal,
   })
-  return { status: res.status, session: (await res.json()) as Session }
+  return {
+    status: res.status,
+    title: ((await res.json()) as { title: string | null }).title,
+  }
 }

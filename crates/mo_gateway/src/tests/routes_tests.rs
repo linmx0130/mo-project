@@ -2313,9 +2313,9 @@ async fn rename_session_validates_and_caps() {
 }
 
 /// Regenerating a title waits for the background generation and answers
-/// with the finished title: the response carries the new title and the DB
-/// row is updated. (The mock LLM derives the title from the first user
-/// message.)
+/// with the finished title — which is NOT persisted: the client reviews it
+/// and saves it with a PATCH. (The mock LLM derives the title from the
+/// first user message.)
 #[tokio::test]
 async fn regenerate_title_waits_and_returns_new_title() {
     let base_url = mock_llm().await;
@@ -2328,14 +2328,14 @@ async fn regenerate_title_waits_and_returns_new_title() {
 
     let (status, body) = post_empty_json(&app.state, "s1", "/title/regenerate").await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(body["prompt"], "Explore notes.txt", "body: {body}");
+    assert_eq!(body["title"], "Explore notes.txt", "body: {body}");
 
-    // The DB row carries the generated title.
+    // Review-then-save: the DB row still carries the OLD title.
     let row = {
         let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
         db::get_session(&conn, "s1").unwrap().unwrap()
     };
-    assert_eq!(row.prompt, "Explore notes.txt");
+    assert_eq!(row.prompt, "test session");
 
     // Unknown session -> 404.
     let (status, _) = post_empty_json(&app.state, "nope", "/title/regenerate").await;
@@ -2343,7 +2343,7 @@ async fn regenerate_title_waits_and_returns_new_title() {
 }
 
 /// When the model returns nothing usable, regeneration is a completed
-/// no-op: 200 with the title unchanged.
+/// no-op: 200 with the current title.
 #[tokio::test]
 async fn regenerate_title_with_empty_model_answer_keeps_title() {
     let base_url = mock_llm().await;
@@ -2354,7 +2354,7 @@ async fn regenerate_title_with_empty_model_answer_keeps_title() {
 
     let (status, body) = post_empty_json(&app.state, "s1", "/title/regenerate").await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(body["prompt"], "test session", "body: {body}");
+    assert_eq!(body["title"], "test session", "body: {body}");
 }
 
 /// When the LLM call itself fails, regeneration answers 500 and the current
