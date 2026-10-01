@@ -74,6 +74,14 @@ impl JournalWriter {
         self.next_seq += 1;
         Ok(event)
     }
+
+    /// Flush the underlying buffer. Every `append` already flushes; this is
+    /// for callers that copy a batch of events and want a flush error to
+    /// surface rather than be swallowed by the drop.
+    pub fn flush(&mut self) -> Result<()> {
+        self.file.flush()?;
+        Ok(())
+    }
 }
 
 /// Parse the whole journal into events. Non-JSON lines are skipped so a
@@ -105,6 +113,45 @@ pub fn read_events_after(path: &Path, after_seq: u64) -> Result<Vec<JournalEvent
         .into_iter()
         .filter(|e| e.seq > after_seq)
         .collect())
+}
+
+/// Copy the events of `src` with `seq < until_seq` into a journal at `dst`,
+/// used when a session is forked at one of its user messages: the fork keeps
+/// the history *before* that message, so the user can edit the message and
+/// let the model generate a fresh answer from the same earlier context.
+///
+/// The copied events get fresh `seq`/`ts` values (assigned by the
+/// [`JournalWriter`], so `dst` starts at seq 0 and stays contiguous) — `dst`
+/// is expected to be a fresh journal. `SystemPrompt` events are **skipped**:
+/// the system prompt embeds the session-specific scratch dir
+/// (`<data_dir>/sessions/<id>/tmp`), so copying it verbatim would point the
+/// forked session's model at the source session's scratch dir. Without a
+/// journaled prompt the worker builds (and journals) a fresh one for the new
+/// session on its first run.
+///
+/// Copies everything else verbatim, streaming `*_delta` previews included
+/// (the UI folds them into their canonical events and the worker ignores
+/// them). A missing `src` reads as an empty journal, so forking at the very
+/// first message yields a session with an empty journal — exactly a fresh
+/// session in the same setup. Returns the events written to `dst`.
+pub fn copy_events_before(src: &Path, dst: &Path, until_seq: u64) -> Result<Vec<JournalEvent>> {
+    let events = read_events(src)?;
+    let mut writer = JournalWriter::open(dst)?;
+    let mut copied = Vec::new();
+    for event in events {
+        if event.seq >= until_seq {
+            break;
+        }
+        if matches!(
+            event.kind,
+            crate::types::JournalEventKind::SystemPrompt { .. }
+        ) {
+            continue;
+        }
+        copied.push(writer.append(event.kind)?);
+    }
+    writer.flush()?;
+    Ok(copied)
 }
 
 /// Incremental journal tail reader for the gateway SSE endpoint: reads only

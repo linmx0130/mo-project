@@ -169,25 +169,88 @@ export function EventRow({ event }: { event: JournalEvent }) {
 export function MessageRow({
   message,
   sessionId,
+  onFork,
+  forkingSeq = null,
 }: {
   message: MessageBlock
   /** The session the message belongs to, for rendering attached images
    *  (`GET /api/sessions/:id/images/<file>`). Optional: a subagent modal
    *  never renders user messages with images. */
   sessionId?: string
+  /** Start a new session from this user message (the history before it is
+   *  preserved and the message goes into the new composer for editing).
+   *  Omitted where forking makes no sense (the subagent modal). */
+  onFork?: (message: MessageBlock) => void
+  /** The seq of the message whose fork request is in flight: that row shows
+   *  "Creating…" and every fork button is disabled until it settles. */
+  forkingSeq?: number | null
 }) {
   const role = message.role
   if (role === 'tool') {
     return (
       <div className="msg msg-tool">
+        <div className="msg-head">
+          <div className="msg-label">tool</div>
+          {message.content && <CopyButton content={message.content} />}
+        </div>
         <pre className="tool-output">{message.content}</pre>
       </div>
     )
   }
   if (role === 'user') {
+    // The journal seq of this message is what the fork endpoint cuts at
+    // ("everything before this message"); synthetic/legacy events without
+    // one cannot be forked.
+    const canFork = onFork !== undefined && typeof message.seq === 'number'
+    const forking = canFork && forkingSeq === message.seq
     return (
       <div className="msg msg-user">
-        <div className="msg-label">user</div>
+        <div className="msg-head">
+          <div className="msg-label">user</div>
+          <div className="msg-actions">
+            {message.content && <CopyButton content={message.content} />}
+            {canFork && (
+              // Its own button next to the copy button, styled the same way
+              // (`.icon-btn`): the two read as a pair of message actions,
+              // and only the glyph tells them apart.
+              <button
+                type="button"
+                className="icon-btn fork-btn"
+                onClick={() => onFork(message)}
+                disabled={forkingSeq !== null}
+                aria-label="New session from here"
+                title="Start a new session with the history before this message; the message itself goes into the input box so you can edit it"
+              >
+                {/* A git-fork glyph (two branches joining into one) — the
+                    action continues the conversation down a new branch, like
+                    the sidebar's edit / delete icons. The '…' while a fork
+                    request is in flight matches the delete button's busy
+                    state. */}
+                {forking ? (
+                  '…'
+                ) : (
+                  <svg
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <circle cx="12" cy="18" r="3" />
+                    <circle cx="6" cy="6" r="3" />
+                    <circle cx="18" cy="6" r="3" />
+                    <path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9" />
+                    <path d="M12 12v3" />
+                  </svg>
+                )}
+              </button>
+            )}
+          </div>
+        </div>
         {message.content && (
           <div className="msg-content">{message.content}</div>
         )}
@@ -287,6 +350,15 @@ export function ToolBlockRow({
         {block.ok !== undefined && (
           <span className={`tool-status ${block.ok ? 'ok' : 'err'}`}>
             {block.ok ? 'ok' : 'error'}
+          </span>
+        )}
+        {block.output !== undefined && block.output.length > 0 && (
+          // Copy the tool's output (what the model received). The wrapper
+          // stops the click from toggling the surrounding <details>, like
+          // the "view subagent" button below. Disabled while output is still
+          // streaming so the user can't grab a partial result.
+          <span className="tool-copy" onClick={(e) => e.stopPropagation()}>
+            <CopyButton content={block.output} disabled={block.streaming} />
           </span>
         )}
         {block.childId && (

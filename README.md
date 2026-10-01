@@ -394,6 +394,44 @@ reorders them the same way, so the model-facing context is deterministic
 regardless of completion order. Dependent calls should still be sent in
 separate messages.
 
+## Copying messages & forking a session
+
+Every message row carries a clipboard **copy** button: assistant replies (the
+raw Markdown source), user messages and tool outputs (the exact text the
+model sent or received). The button copies to the clipboard where the
+browser allows it — turning into a check mark while the "copied" feedback
+shows — and falls back to a dialog with the text pre-selected otherwise.
+Copying a still-streaming message or tool output is disabled, so a partial
+result can never be grabbed by accident.
+
+A user message additionally offers a git-fork **New session from here**
+button: it starts a *new* session from that point of the conversation, so
+one of your old messages can be edited and re-sent with the model
+generating a fresh answer on top of everything that came before it. Both
+buttons are icon-only (inline SVGs, like the sidebar's edit / delete
+buttons) with the action in their tooltip and accessible label.
+
+* `POST /api/sessions/:id/fork {until_seq}` copies the source journal's
+  events *before* the message at `until_seq` into a new session
+  (re-sequenced from 0; the source's `images/` folder is copied along so
+  the copied messages' attachments keep resolving). The journaled
+  `system_prompt` is deliberately **not** copied: the prompt embeds the
+  session's scratch dir (`<data_dir>/sessions/<id>/tmp`), so the fork
+  rebuilds its own on the first run.
+* The fork inherits the source's workdir, model, mode, tools and skills,
+  and its title is the source title plus " (fork)". It is an ordinary root
+  session in the sidebar — nothing else links it to the source.
+* No worker runs yet: the session is created `pending` with no pid (like a
+  `defer_spawn` session) and the UI opens it with the forked message's text
+  — and its attached images — in the composer. Editing and sending there
+  journals the message and starts the run, which rebuilds its model context
+  from the copied history. The source session is untouched.
+* Forking a session's *first* message therefore yields a session with an
+  empty journal: the same setup with that message in the input box (and a
+  freshly generated title once it is sent).
+* An abandoned fork is just a never-started session: it sits in the sidebar
+  as `pending` until you send something or delete it.
+
 ## Image content
 
 The composer has an **Upload image** button left of **Send** (in the
@@ -429,17 +467,26 @@ journals it, spawns the worker and triggers the session title generation.
 If that flow fails partway, the deferred session is deleted again so no
 empty pending session is left behind.
 
+Forking a session (see "Copying messages & forking a session") copies the
+source's `images/` folder into the new session — filenames preserved — so
+the copied history's attachments keep rendering, and the message being
+edited can carry its own images back into the new composer's strip (they
+are re-sent with the edited message).
+
 ## Status bar
 
 The session view has a status bar pinned to the bottom showing a mode
-picker (`build` / `plan` / `explore` — switching a terminal session's mode
+picker (`build` / `plan` / `explore` — switching a session's mode
 changes only the write sandbox of subsequent runs) with the **model
 picker** side-by-side (switching only affects the next run — the respawned
 worker is spawned with the new model and receives the full journal
 history), a **Load a skill…** picker (sends the chosen skill's full
 `SKILL.md` to the session as a new user message and respawns the worker —
 see "Loading skills"; disabled while the session is running), the session
-status badge and the current context length in tokens. The length comes
+status badge and the current context length in tokens. Both pickers are
+disabled while a run is queued or running; a never-started session — a fork
+waiting for its first message, or one created by the New-session image
+flow — has no run in flight, so they stay usable there. The length comes
 from the LLM API — the worker requests
 `stream_options.include_usage` and journals the reported
 `usage.prompt_tokens` after every LLM call as a `context_usage` event, so
@@ -569,11 +616,12 @@ the model):
 | `GET /api/sessions/:id/history?after_seq=N` | journal events after `N` |
 | `GET /api/sessions/:id/events` | SSE tail: new events + synthesized status changes |
 | `POST /api/sessions/:id/messages` `{content, images?}` | continue a terminal session: journal the user message (preceded by a `mode_change` notice when the mode was switched since the last run and/or a `model_change` notice when the model was), reset to `pending`, respawn the worker. `images` (optional) lists attached images as `[{path, mime}]` — `path` must be a path returned by `POST /api/sessions/:id/images`; the worker rebuilds them into base64 `image_url` parts for the LLM. Also accepts the first message of a `defer_spawn` session (a never-started pending session with no worker) |
+| `POST /api/sessions/:id/fork` `{until_seq}` | start a **new session** from one of this session's user messages: the new session's journal is a copy of the source's events *before* the event at `until_seq` (re-sequenced from 0, the journaled `system_prompt` is skipped so the fork rebuilds its own, and the source's `images/` folder is copied with the filenames preserved). It inherits the source's workdir, model, mode, tools and skills, its title is the source title plus `" (fork)"`, and it is created `pending` with **no worker and no title generation** — a `defer_spawn`-shaped session that `POST /api/sessions/:id/messages` (the edited message) starts. `until_seq` must name a user `message` event (400 otherwise); unknown session → 404. Used by the timeline's "New session from here" button |
 | `POST /api/sessions/:id/images` `?name=<file>` (body = raw image bytes, `Content-Type: image/*`) | upload an image file into the session's transaction-history folder (`<session_dir>/images/`, gateway-generated `<uuid>.<ext>` name; 10 MB cap; extensions png/jpg/jpeg/gif/webp/bmp): returns `201 {path, name, mime, size}` — `path` is relative to the session dir (`images/<uuid>.<ext>`) and is what the journal records |
 | `GET /api/sessions/:id/images/:filename` | serve a stored image (composer thumbnails and timeline rendering; only gateway-generated filenames are served) |
 | `POST /api/sessions/:id/skills/load` `{name}` | load a skill from the status bar: journal the skill's full `SKILL.md` as a new user message (wrapped in a marker) and respawn the worker — exactly like a followup, but nothing is persisted on the session row (unknown skill → 400; running session → 409) |
-| `POST /api/sessions/:id/mode` `{mode}` | switch a terminal session's mode (409 while running): changes only the write sandbox of subsequent runs — the journaled system prompt never changes; the switch surfaces as a `mode_change` notice before the next user message |
-| `POST /api/sessions/:id/model` `{model}` | switch a terminal session's model (409 while running): only the next run is affected — the respawned worker is spawned with the new model and receives the full journal history; the switch surfaces as a `model_change` notice before the next run that uses it |
+| `POST /api/sessions/:id/mode` `{mode}` | switch the session's mode (409 while a run is queued or running; a never-started `pending` session with no pid — a fork or `defer_spawn` session — can still switch, since nothing is racing it): changes only the write sandbox of subsequent runs — the journaled system prompt never changes; the switch surfaces as a `mode_change` notice before the next user message |
+| `POST /api/sessions/:id/model` `{model}` | switch the session's model (409 while a run is queued or running; a never-started `pending` session with no pid can still switch and simply uses the new model for its first run): only the next run is affected — the respawned worker is spawned with the new model and receives the full journal history; the switch surfaces as a `model_change` notice before the next run that uses it |
 | `POST /api/sessions/:id/mode/approve` | approve a pending `mode_change_request` (the agent called `request_mode_change`): switch the session's mode to the requested one and continue the run with a single `mode_change` notice (409 unless the journal's last mode marker is a pending request) |
 | `POST /api/sessions/:id/mode/reject` | reject a pending `mode_change_request`: journal a `mode_change_request_declined` marker, no mode switch, nothing sent to the model (409 unless a request is pending) |
 | `POST /api/sessions/:id/ask/answer` `{answers}` | the user answered a pending `ask_user_request` (the agent asked a clarification question via `ask_user`): `answers` is a JSON object keyed by `question_id` whose values are the chosen option's title or the user's typed text; journals an `ask_user_answered` event and resumes the run (409 unless a request is pending) |

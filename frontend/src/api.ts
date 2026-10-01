@@ -459,6 +459,25 @@ export function imageUrl(sessionId: string, path: string): string {
   return `/api/sessions/${sessionId}/images/${encodeURIComponent(filename ?? '')}`
 }
 
+/** An already-uploaded image shown in the composer's thumbnail strip (a
+ *  forked message's attachment): the journaled reference plus the URL that
+ *  previews it. */
+export interface AttachedImage {
+  image: JournalImage
+  /** Preview URL — `imageUrl(sessionId, image.path)`. */
+  url: string
+}
+
+/** The composer content a freshly forked session comes up with: the text of
+ *  the user message the fork was cut before, plus that message's
+ *  attachments. Both are editable/removable, and neither is journaled until
+ *  the user sends — the fork itself copies only the history *before* the
+ *  message. */
+export interface ForkPrefill {
+  text: string
+  images: JournalImage[]
+}
+
 /** Send a followup message to a terminal session; the worker respawns and
  *  continues the conversation from the journal history. `images` lists the
  *  attached images (paths returned by `uploadImage`); the worker rebuilds
@@ -486,6 +505,26 @@ export function loadSkill(id: string, name: string): Promise<Session> {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name }),
+  })
+}
+
+/** Start a **new session** from one of an existing session's user messages
+ *  ("edit an old message and try again"): the new session's journal is a
+ *  copy of the source's events *before* the message at `untilSeq` (the
+ *  journaled system prompt is left out — the fork rebuilds its own — and the
+ *  source's images are copied too), and it inherits the source's workdir,
+ *  model, mode, tools and skills with a "«title» (fork)" title.
+ *
+ *  No worker is spawned: the fork is created pending with no pid, like a
+ *  `defer_spawn` session, and the caller opens it with the message's text
+ *  prefilled in the composer. Sending there (`postMessage`) is what journals
+ *  the edited message and starts the run. Requires `untilSeq` to name a user
+ *  message event, else 400; unknown session 404. */
+export function forkSession(id: string, untilSeq: number): Promise<Session> {
+  return http(`/api/sessions/${id}/fork`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ until_seq: untilSeq }),
   })
 }
 

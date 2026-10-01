@@ -74,13 +74,44 @@ export default function CopyButton({ content, disabled = false }: Props) {
     <>
       <button
         type="button"
-        className={`copy-btn${copied ? ' copied' : ''}`}
+        className={`icon-btn copy-btn${copied ? ' copied' : ''}`}
         onClick={() => void copy()}
         disabled={disabled}
         aria-label={copied ? 'Copied to clipboard' : 'Copy raw content'}
         title={copied ? 'Copied to clipboard' : 'Copy raw content'}
       >
-        {copied ? '✅' : '📋'}
+        {/* Inline SVGs, same construction as the sidebar's edit / delete
+            icons: 14px, stroked with `currentColor` (no emoji). */}
+        {copied ? (
+          <svg
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <polyline points="20 6 9 17 4 12" />
+          </svg>
+        ) : (
+          <svg
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+          </svg>
+        )}
       </button>
       {dialogOpen && (
         <div className="dialog-overlay" onClick={() => setDialogOpen(false)}>

@@ -1621,3 +1621,140 @@ async fn deferred_create_upload_then_message_with_image() {
     assert_eq!(messages[0]["kind"]["images"][0]["path"], image_path);
     assert_eq!(messages[0]["kind"]["images"][0]["mime"], "image/png");
 }
+
+/// Editing an old message by forking: `POST /api/sessions/:id/fork` starts a
+/// new root session that holds the source history *before* the chosen user
+/// message (re-sequenced, without the journaled system prompt) and inherits
+/// the source's setup, without spawning a worker. The followup endpoint then
+/// accepts the never-started pending fork, so the user can send the edited
+/// message and have the model continue from the copied history.
+#[tokio::test]
+async fn fork_from_an_old_message_copies_history_and_accepts_the_edit() {
+    let (_dir, app) = setup(false);
+    let workdir = _dir.path().join("work");
+
+    // A source session with two user messages (the stub worker exits
+    // immediately, so the followup is allowed after a cancel).
+    let (_, session) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({ "workdir": workdir.display().to_string(), "prompt": "first message" })),
+    )
+    .await;
+    let source_id = session["id"].as_str().unwrap().to_string();
+    let (_, _) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{source_id}/cancel"),
+        None,
+    )
+    .await;
+    let (status, _) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{source_id}/messages"),
+        Some(json!({ "content": "second message" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (_, source_history) = request(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{source_id}/history"),
+        None,
+    )
+    .await;
+    let second_seq = source_history
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"]["content"] == "second message")
+        .and_then(|e| e["seq"].as_u64())
+        .expect("the second user message must be journaled");
+
+    // Fork before that message.
+    let (status, forked) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{source_id}/fork"),
+        Some(json!({ "until_seq": second_seq })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {forked}");
+    let fork_id = forked["id"].as_str().unwrap().to_string();
+    assert_ne!(fork_id, source_id);
+    assert!(forked["parent_id"].is_null(), "the fork is a root session");
+    assert_eq!(forked["status"], "pending");
+    assert!(forked["pid"].is_null(), "no worker for a fork");
+    assert_eq!(forked["workdir"], session["workdir"]);
+    assert_eq!(forked["model"], session["model"]);
+    assert_eq!(forked["mode"], session["mode"]);
+
+    // Its journal holds only the history before the forked message.
+    let (_, fork_history) = request(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{fork_id}/history"),
+        None,
+    )
+    .await;
+    let fork_events = fork_history.as_array().unwrap();
+    assert_eq!(fork_events.len(), 1, "history: {fork_history}");
+    assert_eq!(fork_events[0]["seq"], 0, "the copy is re-sequenced from 0");
+    assert_eq!(fork_events[0]["kind"]["content"], "first message");
+
+    // The source is untouched.
+    let (_, source_after) = request(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{source_id}/history"),
+        None,
+    )
+    .await;
+    assert_eq!(source_after.as_array().unwrap().len(), 2);
+
+    // Both sessions are visible in the sidebar (root sessions).
+    let (_, list) = request(&app, Method::GET, "/api/sessions", None).await;
+    let ids: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["id"].as_str())
+        .collect();
+    assert!(ids.contains(&source_id.as_str()), "list: {list}");
+    assert!(ids.contains(&fork_id.as_str()), "list: {list}");
+
+    // Sending the edited message on the fork journals it after the copied
+    // history and spawns the worker.
+    let (status, resumed) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{fork_id}/messages"),
+        Some(json!({ "content": "second message, edited" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "body: {resumed}");
+    assert!(resumed["pid"].as_u64().is_some(), "body: {resumed}");
+    let (_, fork_history) = request(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{fork_id}/history"),
+        None,
+    )
+    .await;
+    let events = fork_history.as_array().unwrap();
+    assert_eq!(events.len(), 2, "history: {fork_history}");
+    assert_eq!(events[0]["kind"]["content"], "first message");
+    assert_eq!(events[1]["kind"]["content"], "second message, edited");
+
+    // An unknown cut point is a 400.
+    let (status, _) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{source_id}/fork"),
+        Some(json!({ "until_seq": 99 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

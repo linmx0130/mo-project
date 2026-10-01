@@ -1237,31 +1237,54 @@ p {
   margin-bottom: 0;
 }
 
-.copy-btn {
+/* Action cluster in a message head row (copy, fork, ...). */
+.msg-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Icon-only message action button (the clipboard copy and the git-fork "new
+   session from here"): a small bordered pill in the message head row, the
+   same construction as the sidebar's edit / delete icon buttons. Both
+   actions share this base so they read as one pair — the glyph says which is
+   which. */
+.icon-btn {
   flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   background: transparent;
   border: 1px solid var(--border);
   border-radius: 6px;
   color: var(--muted);
-  font-size: 14px;
+  font: inherit;
+  font-size: 13px;
   line-height: 1;
-  padding: 3px 7px;
+  padding: 4px 6px;
   cursor: pointer;
 }
 
-.copy-btn:hover:not(:disabled) {
+.icon-btn:hover:not(:disabled) {
   color: var(--accent);
   border-color: var(--accent);
 }
 
+.icon-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* The fork action keeps the copy button's box while its glyph is replaced by
+   the busy "…". */
+.fork-btn {
+  min-width: 26px;
+}
+
+/* "Copied ✓": the copy button's transient confirmation tint. */
 .copy-btn.copied {
   color: var(--status-completed);
   border-color: var(--status-completed);
-}
-
-.copy-btn:disabled {
-  opacity: 0.5;
-  cursor: default;
 }
 
 .msg-content {
@@ -1491,6 +1514,13 @@ p {
 
 .tool-block.tool-failed {
   border-color: var(--failed-border);
+}
+
+/* Wrapper for the tool block's copy button: stops the click from toggling
+   the surrounding <details> (the summary row is the toggle target). */
+.tool-copy {
+  flex-shrink: 0;
+  display: inline-flex;
 }
 
 .tool-output {

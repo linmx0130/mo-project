@@ -55,6 +55,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/history", get(history))
         .route("/api/sessions/{id}/events", get(sse::events))
         .route("/api/sessions/{id}/messages", post(send_message))
+        .route("/api/sessions/{id}/fork", post(fork_session))
         .route("/api/sessions/{id}/skills/load", post(load_skill))
         .route("/api/sessions/{id}/mode", post(switch_mode))
         .route("/api/sessions/{id}/model", post(switch_model))
@@ -771,6 +772,150 @@ async fn journal_followup_and_spawn(
 }
 
 #[derive(Deserialize)]
+struct ForkSessionRequest {
+    /// The `seq` of the user message to fork at: the new session's journal
+    /// holds exactly the events before it. The message itself is left out of
+    /// the copy — the user re-edits it and sends it from the new session.
+    until_seq: u64,
+}
+
+/// POST /api/sessions/:id/fork — start a **new session** from one of an
+/// existing session's user messages ("edit an old message and try again").
+///
+/// The forked session copies the source journal's events *before* the user
+/// message at `until_seq` (see `mo_core::copy_events_before`, which skips
+/// the journaled system prompt so the new session rebuilds its own — the
+/// prompt embeds the session-specific scratch dir) and inherits the source
+/// session's workdir, model, mode, tools and skills; its title is the source
+/// title plus " (fork)". The source's `images/` directory is copied too
+/// (filenames preserved), so the copied messages' image references — and the
+/// message being edited, whose attachments the client re-attaches — keep
+/// resolving.
+///
+/// The worker is **not** spawned: the session is created `pending` with no
+/// pid, exactly like a `defer_spawn` session, and the frontend opens it with
+/// the message's text prefilled in the composer. Sending there journals the
+/// (edited) message and spawns the worker, which rebuilds its context from
+/// the copied history. The fork is a *root* session (no `parent_id`), so it
+/// shows up in the sidebar like any other.
+///
+/// 400 unless `until_seq` names a user `message` event in the source
+/// journal; 404 for an unknown source session. Forking a running session is
+/// allowed: the cut is at an already-journaled message, so the copied prefix
+/// is always a completed earlier state of the conversation.
+async fn fork_session(
+    State(state): State<Arc<AppState>>,
+    PathParam(id): PathParam<String>,
+    Json(payload): Json<ForkSessionRequest>,
+) -> ApiResult<(StatusCode, Json<Session>)> {
+    let source = {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::get_session(&conn, &id)
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found("session not found"))?
+    };
+    // The cut point must be a user message: forking anywhere else would
+    // either split a tool-call / tool-result pair or start the new session
+    // after an assistant answer, which is not what the UI offers.
+    let source_events =
+        mo_core::read_events(Path::new(&source.journal_path)).map_err(ApiError::internal)?;
+    let cut = source_events
+        .iter()
+        .find(|e| e.seq == payload.until_seq)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("no journal event at seq {}", payload.until_seq))
+        })?;
+    match &cut.kind {
+        JournalEventKind::Message(m) if m.role == "user" => {}
+        _ => {
+            return Err(ApiError::bad_request(format!(
+                "the event at seq {} is not a user message",
+                payload.until_seq
+            )));
+        }
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let journal_path = state
+        .data_dir
+        .join("sessions")
+        .join(&id)
+        .join("journal.jsonl");
+    let session = Session {
+        id: id.clone(),
+        // Root session: the fork is a new conversation the user can see in
+        // the sidebar, not a subagent of the source.
+        parent_id: None,
+        workdir: source.workdir.clone(),
+        prompt: crate::title::cap_title(&format!("{} (fork)", source.prompt)),
+        model: source.model.clone(),
+        status: SessionStatus::Pending,
+        mode: source.mode,
+        tools: source.tools.clone(),
+        skills: source.skills.clone(),
+        pid: None,
+        journal_path: journal_path.display().to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        heartbeat_at: None,
+        error: None,
+    };
+
+    // Copy the history and the attachments *before* inserting the row: a
+    // failure here leaves nothing behind to roll back (no half-created
+    // session for the client to clean up).
+    mo_core::copy_events_before(
+        Path::new(&source.journal_path),
+        Path::new(&session.journal_path),
+        payload.until_seq,
+    )
+    .map_err(ApiError::internal)?;
+    copy_session_images(&state.data_dir, &source.id, &id).map_err(ApiError::internal)?;
+
+    {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::create_session(&conn, &session).map_err(ApiError::internal)?;
+    }
+    // No worker and no title generation: the session waits for the user to
+    // send the edited message (`POST /api/sessions/:id/messages` accepts a
+    // never-started pending session) and keeps the source's title, so the
+    // fork costs no LLM call.
+    Ok((StatusCode::CREATED, Json(session)))
+}
+
+/// Copy the source session's `images/` directory into the forked session's
+/// directory (filenames preserved). The copied journal's messages reference
+/// their images as `images/<uuid>.<ext>` relative to the session dir, so the
+/// same references must resolve in the new session — and the message the user
+/// re-edits carries its attachments back into the new composer. Only
+/// gateway-generated image names are copied (defense in depth), and a
+/// missing source directory is a no-op.
+fn copy_session_images(data_dir: &Path, from: &str, to: &str) -> std::io::Result<()> {
+    let src_dir = data_dir.join("sessions").join(from).join("images");
+    let entries = match std::fs::read_dir(&src_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let dst_dir = data_dir.join("sessions").join(to).join("images");
+    let mut created = false;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !valid_image_filename(&name) || !entry.file_type()?.is_file() {
+            continue;
+        }
+        if !created {
+            std::fs::create_dir_all(&dst_dir)?;
+            created = true;
+        }
+        std::fs::copy(entry.path(), dst_dir.join(&name))?;
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
 struct SwitchModeRequest {
     mode: String,
 }
@@ -780,6 +925,14 @@ struct SwitchModeRequest {
 /// rebuilt, so switching only changes the write-sandbox policy of
 /// subsequent runs (Build = codebase writable; Plan/Explore = codebase
 /// read-only, writes go to the session scratch dir).
+/// POST /api/sessions/:id/mode — switch the session's mode. The system
+/// prompt is journaled at the first run and is never rebuilt, so switching
+/// only changes the write-sandbox policy of subsequent runs (Build =
+/// codebase writable; Plan/Explore = codebase read-only, writes go to the
+/// session scratch dir). Refused while a run is queued or in flight —
+/// except for a never-started session (`pending` with no pid: a forked or
+/// `defer_spawn` session waiting for its first message), which has no run to
+/// protect and whose first run builds its prompt from the new mode.
 async fn switch_mode(
     State(state): State<Arc<AppState>>,
     PathParam(id): PathParam<String>,
@@ -789,14 +942,16 @@ async fn switch_mode(
         .mode
         .parse::<Mode>()
         .map_err(ApiError::bad_request)?;
-    let status = {
+    let (status, pid) = {
         let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
         match db::get_session(&conn, &id).map_err(ApiError::internal)? {
-            Some(session) => session.status,
+            Some(session) => (session.status, session.pid),
             None => return Err(ApiError::not_found("session not found")),
         }
     };
-    if status == SessionStatus::Running || status == SessionStatus::Pending {
+    // Same rule as `ensure_followup_allowed`: a `pending` session with no
+    // pid has not started yet (nothing to race with).
+    if status == SessionStatus::Running || (status == SessionStatus::Pending && pid.is_some()) {
         return Err(ApiError::conflict(
             "cannot switch mode while the session is running",
         ));
@@ -818,13 +973,16 @@ struct SwitchModelRequest {
     model: String,
 }
 
-/// POST /api/sessions/:id/model — switch the session's model once it is
-/// terminal. Only the next run is affected: the worker respawned for the
-/// next followup (or the mode-approve continuation) is spawned with the new
-/// model's env, and the gateway injects a `ModelChange` notice into the
-/// journal right before that run when the model differs from the model of
-/// the last run. The journaled system prompt is model-agnostic and is never
-/// rebuilt, so switching only changes which endpoint the next run talks to.
+/// POST /api/sessions/:id/model — switch the session's model. Only the next
+/// run is affected: the worker respawned for the next followup (or the
+/// mode-approve continuation) is spawned with the new model's env, and the
+/// gateway injects a `ModelChange` notice into the journal right before that
+/// run when the model differs from the model of the last run. The journaled
+/// system prompt is model-agnostic and is never rebuilt, so switching only
+/// changes which endpoint the next run talks to. Refused while a run is
+/// queued or in flight — except for a never-started session (`pending` with
+/// no pid: a forked or `defer_spawn` session waiting for its first message),
+/// whose first run simply uses the new model.
 async fn switch_model(
     State(state): State<Arc<AppState>>,
     PathParam(id): PathParam<String>,
@@ -833,14 +991,17 @@ async fn switch_model(
     let model = state
         .find_model(&payload.model)
         .ok_or_else(|| ApiError::bad_request(format!("unknown model: {}", payload.model)))?;
-    let (status, current_model) = {
+    let (status, pid, current_model) = {
         let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
         match db::get_session(&conn, &id).map_err(ApiError::internal)? {
-            Some(session) => (session.status, session.model),
+            Some(session) => (session.status, session.pid, session.model),
             None => return Err(ApiError::not_found("session not found")),
         }
     };
-    if status == SessionStatus::Running || status == SessionStatus::Pending {
+    // Same rule as `ensure_followup_allowed`: a `pending` session with no
+    // pid (a fork waiting for its first message, a `defer_spawn` session)
+    // has no queued worker racing the switch.
+    if status == SessionStatus::Running || (status == SessionStatus::Pending && pid.is_some()) {
         return Err(ApiError::conflict(
             "cannot switch model while the session is running",
         ));

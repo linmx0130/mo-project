@@ -13,7 +13,10 @@ pub use config::{
     ConfigError, DEFAULT_PORT, FileConfig, MoConfig, ModelConfig, default_agents_dir,
 };
 pub use db::{DbError, open as open_db};
-pub use journal::{JournalError, JournalWriter, read_events, read_events_after, read_events_tail};
+pub use journal::{
+    JournalError, JournalWriter, copy_events_before, read_events, read_events_after,
+    read_events_tail,
+};
 pub use modes::{
     MODES, ModeInfo, ModeMarker, last_mode_marker, mode_change_approved_message,
     mode_change_message,

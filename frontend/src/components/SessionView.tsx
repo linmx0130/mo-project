@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type {
   AskUserQuestion,
+  ForkPrefill,
   JournalEvent,
+  JournalImage,
   Mode,
   ModelInfo,
   PermissionRequestItem,
@@ -14,10 +16,12 @@ import {
   answerPermission,
   approveModeChange,
   cancelSession,
+  forkSession,
   getHistory,
   getModels,
   getSession,
   getSkills,
+  imageUrl,
   loadSkill,
   postMessage,
   rejectModeChange,
@@ -30,20 +34,62 @@ import Composer from './Composer'
 import PermissionCard from './PermissionCard'
 import StatusBar from './StatusBar'
 import SubagentModal from './SubagentModal'
-import { buildTimeline, isTerminal } from '../timeline'
+import { buildTimeline, isTerminal, type MessageBlock } from '../timeline'
 import { EventRow, MessageRow, ToolBlockRow } from './Timeline'
 
 interface Props {
   session: Session
   onStatusChange: () => void
+  /** The content a freshly forked session's composer comes up with (the
+   *  message the fork was cut before, so the user can edit it). Set only for
+   *  the forked session and consumed once, on mount. */
+  prefill?: ForkPrefill | null
+  /** Report that `prefill` was taken over by the composer, so the parent
+   *  drops it (navigating back must not re-seed the box). */
+  onPrefillConsumed: () => void
+  /** A fork of this session was created: the parent selects the new session
+   *  and hands it the message to edit. */
+  onForked: (session: Session, prefill: ForkPrefill) => void
 }
 
-export default function SessionView({ session, onStatusChange }: Props) {
+export default function SessionView({
+  session,
+  onStatusChange,
+  prefill,
+  onPrefillConsumed,
+  onForked,
+}: Props) {
   const [status, setStatus] = useState<SessionStatus>(session.status)
+  // The worker pid, tracked next to the status: "is this session running?"
+  // is `running || (pending && pid != null)` — the backend's rule
+  // (`ensure_followup_allowed`) — and a never-started session (a fork
+  // waiting for its first message) is `pending` with no pid, so its
+  // composer stays usable. Local state is updated from every mutating API
+  // response; the prop keeps it in sync with the sidebar's polling. */
+  const [pid, setPid] = useState<number | null>(session.pid)
+  const [prevPid, setPrevPid] = useState<number | null>(session.pid)
+  if (prevPid !== session.pid) {
+    setPrevPid(session.pid)
+    setPid(session.pid)
+  }
   const [events, setEvents] = useState<JournalEvent[]>([])
   const [error, setError] = useState<string | null>(null)
   const [cancelling, setCancelling] = useState(false)
   const [sending, setSending] = useState(false)
+  // The seq of the user message whose fork request is in flight (the button
+  // shows "Creating…" and is disabled while it is set).
+  const [forkingSeq, setForkingSeq] = useState<number | null>(null)
+  // The prefill this view was opened with (a fork): captured once so later
+  // prop changes cannot re-seed the composer, and handed to the Composer
+  // below as its initial text/images.
+  const [initialPrefill] = useState<ForkPrefill | null>(prefill ?? null)
+  // A fork prefill is consumed by the mount that seeds the composer; tell
+  // the parent so it is not re-applied when the user comes back to this
+  // session. `initialPrefill` is mount-captured and the callback is stable
+  // (App memoizes it), so this fires exactly once.
+  useEffect(() => {
+    if (initialPrefill) onPrefillConsumed()
+  }, [initialPrefill, onPrefillConsumed])
   // A subagent session whose messages are shown in a read-only modal
   // (opened from a `spawn_subagent` tool block's "view subagent" button).
   const [subagentId, setSubagentId] = useState<string | null>(null)
@@ -122,6 +168,7 @@ export default function SessionView({ session, onStatusChange }: Props) {
         ])
         if (cancelled) return
         setStatus(current.status)
+        setPid(current.pid)
         setEvents(history)
         lastSeqRef.current =
           history.length > 0 ? history[history.length - 1].seq : null
@@ -164,13 +211,20 @@ export default function SessionView({ session, onStatusChange }: Props) {
     }
   }, [session.id, onStatusChange, runId])
 
+  /** Adopt the row a mutating endpoint returned: status + worker pid (the
+   *  two fields the view derives "is this session running?" from). */
+  const applySession = (updated: Session) => {
+    setStatus(updated.status)
+    setPid(updated.pid)
+  }
+
   /** Stop the running worker (SIGTERM → SIGKILL the process group; the
    *  session's subagents die with it). */
   const stop = async () => {
     setCancelling(true)
     try {
       const updated = await cancelSession(session.id)
-      setStatus(updated.status)
+      applySession(updated)
       terminalSeenRef.current = true
       onStatusChange()
     } catch (err) {
@@ -184,16 +238,25 @@ export default function SessionView({ session, onStatusChange }: Props) {
    *  session, continuing from the journal history. Picked image files are
    *  uploaded into the session's transaction-history folder first, and the
    *  message carries their journaled paths (the worker rebuilds them into
-   *  base64 image_url parts for the LLM). */
-  const send = async (text: string, files: File[]): Promise<boolean> => {
+   *  base64 image_url parts for the LLM). `attached` are already-uploaded
+   *  images still in the composer's strip — a forked session's composer
+   *  starts with the edited message's attachments. */
+  const send = async (
+    text: string,
+    files: File[],
+    attached: JournalImage[] = [],
+  ): Promise<boolean> => {
     setSending(true)
     try {
-      const images =
+      const uploaded =
         files.length > 0
           ? await Promise.all(files.map((f) => uploadImage(session.id, f)))
           : []
-      const updated = await postMessage(session.id, text, images)
-      setStatus(updated.status)
+      const updated = await postMessage(session.id, text, [
+        ...attached,
+        ...uploaded,
+      ])
+      applySession(updated)
       // The previous SSE stream closed at the terminal status; re-arm it so
       // the new run streams in.
       setRunId((r) => r + 1)
@@ -204,6 +267,28 @@ export default function SessionView({ session, onStatusChange }: Props) {
       return false
     } finally {
       setSending(false)
+    }
+  }
+
+  /** Start a new session from one of this session's user messages: the
+   *  backend copies the history *before* it and the parent opens the fork
+   *  with the message prefilled in the composer, so the user can edit it and
+   *  let the model generate a fresh answer from the same earlier context.
+   *  The source session is untouched. */
+  const handleFork = async (message: MessageBlock) => {
+    if (typeof message.seq !== 'number' || forkingSeq !== null) return
+    setForkingSeq(message.seq)
+    setError(null)
+    try {
+      const forked = await forkSession(session.id, message.seq)
+      onForked(forked, {
+        text: message.content,
+        images: message.images ?? [],
+      })
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setForkingSeq(null)
     }
   }
 
@@ -243,7 +328,7 @@ export default function SessionView({ session, onStatusChange }: Props) {
     if (running) return
     try {
       const updated = await loadSkill(session.id, name)
-      setStatus(updated.status)
+      applySession(updated)
       // The previous SSE stream closed at the terminal status; re-arm it
       // so the new run streams in.
       setRunId((r) => r + 1)
@@ -253,7 +338,12 @@ export default function SessionView({ session, onStatusChange }: Props) {
     }
   }
 
-  const running = status === 'running' || status === 'pending'
+  // "Running" mirrors the backend's `ensure_followup_allowed`: a session is
+  // busy while its worker runs — including the `pending` window right after
+  // a send — but a `pending` session with *no* pid has not started yet (a
+  // fork waiting for its first message, or a deferred creation), so its
+  // composer stays usable.
+  const running = status === 'running' || (status === 'pending' && pid !== null)
   const timeline = buildTimeline(events)
   // The status bar shows the latest context_usage event (the worker journals
   // one per LLM call; the last one reflects the deepest context, tool
@@ -384,7 +474,7 @@ export default function SessionView({ session, onStatusChange }: Props) {
     setSending(true)
     try {
       const updated = await approveModeChange(session.id)
-      setStatus(updated.status)
+      applySession(updated)
       // Re-arm the SSE stream (the run continues in the new mode); the
       // effect also refetches the history, which now resolves the request.
       setRunId((r) => r + 1)
@@ -403,7 +493,7 @@ export default function SessionView({ session, onStatusChange }: Props) {
     setSending(true)
     try {
       const updated = await rejectModeChange(session.id)
-      setStatus(updated.status)
+      applySession(updated)
       // Re-arm the SSE stream / refetch history so the declined marker
       // lands in the timeline and the request stops being pending.
       setRunId((r) => r + 1)
@@ -422,7 +512,7 @@ export default function SessionView({ session, onStatusChange }: Props) {
     setSending(true)
     try {
       const updated = await answerAskUser(session.id, answers)
-      setStatus(updated.status)
+      applySession(updated)
       // Re-arm the SSE stream (the run continues with the answer); the
       // effect also refetches the history, which now resolves the request.
       setRunId((r) => r + 1)
@@ -451,7 +541,7 @@ export default function SessionView({ session, onStatusChange }: Props) {
         pendingPermission.request_id,
         typeof decisions === 'boolean' ? { allowed: decisions } : { decisions },
       )
-      setStatus(updated.status)
+      applySession(updated)
       // Re-arm the SSE stream (the run continues with the decisions); the
       // effect also refetches the history, which now resolves the request.
       setRunId((r) => r + 1)
@@ -500,6 +590,8 @@ export default function SessionView({ session, onStatusChange }: Props) {
                   key={`msg-${i}`}
                   message={item.message}
                   sessionId={session.id}
+                  onFork={(message) => void handleFork(message)}
+                  forkingSeq={forkingSeq}
                 />
               )
             case 'tool':
@@ -578,6 +670,15 @@ export default function SessionView({ session, onStatusChange }: Props) {
           busy={sending || cancelling}
           onStop={() => void stop()}
           onSubmit={send}
+          // A forked session's composer opens with the message the fork was
+          // cut before (text + its attachments), so the user can edit it in
+          // place and send. Both are mount seeds: later sends clear the
+          // composer's own state, and the parent drops the prefill.
+          initialText={initialPrefill?.text}
+          initialImages={initialPrefill?.images.map((image) => ({
+            image,
+            url: imageUrl(session.id, image.path),
+          }))}
         />
       )}
 
