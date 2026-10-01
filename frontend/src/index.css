@@ -1249,13 +1249,20 @@ p {
    composer for editing. */
 .fork-btn {
   flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  /* Wide enough for the 14px glyph + padding, so the button does not shrink
+     when the busy "…" replaces it. */
+  min-width: 26px;
   background: transparent;
   border: 1px solid var(--accent);
   border-radius: 6px;
   color: var(--accent);
   font: inherit;
-  font-size: 12px;
-  padding: 2px 9px;
+  font-size: 13px;
+  line-height: 1;
+  padding: 3px 5px;
   cursor: pointer;
   white-space: nowrap;
 }
@@ -1271,13 +1278,16 @@ p {
 
 .copy-btn {
   flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   background: transparent;
   border: 1px solid var(--border);
   border-radius: 6px;
   color: var(--muted);
-  font-size: 14px;
+  font-size: 13px;
   line-height: 1;
-  padding: 3px 7px;
+  padding: 4px 6px;
   cursor: pointer;
 }
 

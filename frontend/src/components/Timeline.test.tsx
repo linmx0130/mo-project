@@ -33,15 +33,21 @@ describe('MessageRow — copy and fork affordances', () => {
       />,
     )
     expect(html).toContain('copy-btn')
-    expect(html).toContain('New session from here')
-    // The forked message's own row is not the one in flight.
-    expect(html).not.toContain('Creating…')
+    // Icon-only, like the sidebar's edit / delete buttons: the label lives
+    // in aria-label / title, and the glyph is an inline SVG (no emoji).
+    expect(html).toContain('fork-btn')
+    expect(html).toContain('aria-label="New session from here"')
+    expect(html).toContain('<svg')
+    expect(html).not.toContain('📋')
+    expect(html).not.toContain('✅')
+    // This row is not the one whose fork request is in flight.
+    expect(html).not.toContain('disabled')
   })
 
   it('hides the fork action without a handler or a journal seq', () => {
     const noHandler = renderToStaticMarkup(<MessageRow message={userMessage} />)
     expect(noHandler).toContain('copy-btn')
-    expect(noHandler).not.toContain('New session from here')
+    expect(noHandler).not.toContain('fork-btn')
 
     const synthetic = renderToStaticMarkup(
       <MessageRow
@@ -49,7 +55,7 @@ describe('MessageRow — copy and fork affordances', () => {
         onFork={() => {}}
       />,
     )
-    expect(synthetic).not.toContain('New session from here')
+    expect(synthetic).not.toContain('fork-btn')
   })
 
   it('marks the message being forked and disables the other fork buttons', () => {
@@ -60,7 +66,10 @@ describe('MessageRow — copy and fork affordances', () => {
         forkingSeq={4}
       />,
     )
-    expect(html).toContain('Creating…')
+    // The busy state swaps the glyph for the same '…' the delete button
+    // shows, and every fork button is disabled while the request is in
+    // flight.
+    expect(html).toContain('…')
     expect(html).toContain('disabled')
   })
 

@@ -396,17 +396,20 @@ separate messages.
 
 ## Copying messages & forking a session
 
-Every message row carries a 📋 **copy** button: assistant replies (the raw
-Markdown source), user messages and tool outputs (the exact text the model
-sent or received). The button copies to the clipboard where the browser
-allows it and falls back to a dialog with the text pre-selected otherwise.
+Every message row carries a clipboard **copy** button: assistant replies (the
+raw Markdown source), user messages and tool outputs (the exact text the
+model sent or received). The button copies to the clipboard where the
+browser allows it — turning into a check mark while the "copied" feedback
+shows — and falls back to a dialog with the text pre-selected otherwise.
 Copying a still-streaming message or tool output is disabled, so a partial
 result can never be grabbed by accident.
 
-A user message additionally offers **New session from here**: it starts a
-*new* session from that point of the conversation, so one of your old
-messages can be edited and re-sent with the model generating a fresh answer
-on top of everything that came before it.
+A user message additionally offers a git-fork **New session from here**
+button: it starts a *new* session from that point of the conversation, so
+one of your old messages can be edited and re-sent with the model
+generating a fresh answer on top of everything that came before it. Both
+buttons are icon-only (inline SVGs, like the sidebar's edit / delete
+buttons) with the action in their tooltip and accessible label.
 
 * `POST /api/sessions/:id/fork {until_seq}` copies the source journal's
   events *before* the message at `until_seq` into a new session

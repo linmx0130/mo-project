@@ -215,9 +215,35 @@ export function MessageRow({
                 className="fork-btn"
                 onClick={() => onFork(message)}
                 disabled={forkingSeq !== null}
+                aria-label="New session from here"
                 title="Start a new session with the history before this message; the message itself goes into the input box so you can edit it"
               >
-                {forking ? 'Creating…' : 'New session from here'}
+                {/* A git-fork glyph (two branches joining into one) — the
+                    action continues the conversation down a new branch.
+                    Built like the sidebar's edit / delete icons; the '…'
+                    while a fork request is in flight matches the delete
+                    button's busy state. */}
+                {forking ? (
+                  '…'
+                ) : (
+                  <svg
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <circle cx="12" cy="18" r="3" />
+                    <circle cx="6" cy="6" r="3" />
+                    <circle cx="18" cy="6" r="3" />
+                    <path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9" />
+                    <path d="M12 12v3" />
+                  </svg>
+                )}
               </button>
             )}
           </div>
