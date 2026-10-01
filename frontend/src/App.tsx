@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { Session } from './api'
+import type { ForkPrefill, Session } from './api'
 import { deleteSession, getMeta, listSessions, updateSession } from './api'
 import { clearDraft, loadDraft, saveDraft, type Draft } from './draft'
 import { applyThemeColor, type Theme } from './theme'
@@ -60,6 +60,13 @@ function App() {
   const [editingId, setEditingId] = useState<string | null>(null)
   // Sidebar-level error, e.g. a failed delete (surfaced above the list).
   const [listError, setListError] = useState<string | null>(null)
+  // The composer content a freshly forked session is opened with: the user
+  // message the fork was cut before, so the user can edit it and send it
+  // again on the new session (which copies the history before that message).
+  // Consumed by the fork's `SessionView` on mount, and never persisted.
+  const [forkPrefill, setForkPrefill] = useState<
+    ({ sessionId: string } & ForkPrefill) | null
+  >(null)
 
   // Theme: applied to <html data-theme> so CSS vars switch; persisted so the
   // choice survives reloads.
@@ -171,6 +178,27 @@ function App() {
     void refresh()
   }
 
+  /** A fork of a session was created (the "New session from here" button on
+   *  one of its user messages): open it with the message prefilled in the
+   *  composer. The new session is inserted into the list right away so
+   *  selecting it does not flash the empty state before the next poll
+   *  returns it. */
+  const handleForked = (session: Session, prefill: ForkPrefill) => {
+    setSessions((prev) => [
+      session,
+      ...prev.filter((s) => s.id !== session.id),
+    ])
+    setForkPrefill({ sessionId: session.id, ...prefill })
+    selectSession(session.id)
+    void refresh()
+  }
+
+  /** The fork's `SessionView` took over the prefill (it seeded its
+   *  composer): drop it, so coming back to the session later does not
+   *  re-fill the input box. Stable identity: the fork's mount effect
+   *  depends on it. */
+  const consumeForkPrefill = useCallback(() => setForkPrefill(null), [])
+
   /** Permanently delete a session: clears the selection if the deleted one
    *  was open, then refreshes the list. Failures are surfaced in the
    *  sidebar (the row reappears on the next poll if the delete didn't go
@@ -277,6 +305,11 @@ function App() {
             key={selected.id}
             session={selected}
             onStatusChange={refresh}
+            prefill={
+              forkPrefill?.sessionId === selected.id ? forkPrefill : null
+            }
+            onPrefillConsumed={consumeForkPrefill}
+            onForked={handleForked}
           />
         ) : (
           <div className="empty muted">

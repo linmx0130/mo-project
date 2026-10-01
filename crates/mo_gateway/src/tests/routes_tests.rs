@@ -2448,3 +2448,295 @@ async fn mock_llm() -> String {
     });
     format!("http://{addr}")
 }
+
+/// POST /api/sessions/:id/fork with a JSON body (`{"until_seq": ...}`).
+async fn post_fork(
+    app: &Arc<AppState>,
+    id: &str,
+    until_seq: u64,
+) -> (StatusCode, serde_json::Value) {
+    let router = create_router(app.clone());
+    let body = json!({ "until_seq": until_seq });
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/sessions/{id}/fork"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
+/// Forking at a user message creates a new *root* session that inherits the
+/// source's setup and holds exactly the history before that message — with
+/// no journaled system prompt (the fork rebuilds its own: the prompt embeds
+/// the session-specific scratch dir) and no worker (the user edits the
+/// message and sends it from the new session).
+#[tokio::test]
+async fn fork_session_copies_prefix_and_inherits_setup() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Plan);
+    // Give the source a distinctive setup (title, model, enabled tools and
+    // forced skills) so the fork's inheritance is visible.
+    {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "UPDATE sessions SET prompt = 'plan the thing', model = 'other-model', \
+             tools = '[\"read_file\"]', skills = '[\"superpowers\"]' WHERE id = 's1'",
+            [],
+        )
+        .unwrap();
+    }
+    append_kinds(
+        &session.journal_path,
+        &[
+            system_prompt(Mode::Build),
+            user_msg("first"),
+            assistant_msg("answer"),
+            user_msg("second"),
+            assistant_msg("later"),
+        ],
+    );
+
+    // Fork before the user message at seq 3 ("second").
+    let (status, body) = post_fork(&app.state, "s1", 3).await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let new_id = body["id"].as_str().unwrap().to_string();
+    assert_ne!(new_id, "s1");
+    assert!(body["parent_id"].is_null(), "the fork is a root session");
+    assert_eq!(body["status"], "pending");
+    assert!(body["pid"].is_null(), "no worker is spawned for a fork");
+    assert_eq!(body["workdir"], session.workdir);
+    assert_eq!(body["model"], "other-model");
+    assert_eq!(body["mode"], "plan");
+    assert_eq!(body["tools"], json!(["read_file"]));
+    assert_eq!(body["skills"], json!(["superpowers"]));
+    assert_eq!(body["prompt"], "plan the thing (fork)");
+
+    // The copied journal is exactly the prefix, re-sequenced from 0, with
+    // the system prompt dropped.
+    let kinds = read_kinds(&app, &new_id);
+    assert_eq!(kinds.len(), 2, "kinds: {kinds:#?}");
+    assert_eq!(kinds[0], user_msg("first"));
+    assert_eq!(kinds[1], assistant_msg("answer"));
+
+    // The source journal is untouched.
+    assert_eq!(read_kinds(&app, "s1").len(), 5);
+}
+
+/// Forking at the session's first message yields an empty journal: a fresh
+/// session in the same setup (the Send there is what triggers the first run
+/// — and, via the never-started rule, title generation).
+#[tokio::test]
+async fn fork_session_at_first_message_yields_empty_journal() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    append_kinds(
+        &session.journal_path,
+        &[
+            system_prompt(Mode::Build),
+            user_msg("first"),
+            assistant_msg("answer"),
+        ],
+    );
+
+    let (status, body) = post_fork(&app.state, "s1", 1).await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let new_id = body["id"].as_str().unwrap().to_string();
+    assert!(read_kinds(&app, &new_id).is_empty());
+}
+
+/// The source's `images/` directory is copied into the fork (filenames
+/// preserved), so the copied messages' image references — and the attachment
+/// of the message being re-edited — keep resolving there. Files that are not
+/// gateway-generated image names are skipped.
+#[tokio::test]
+async fn fork_session_copies_images() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    let src_images = app
+        .state
+        .data_dir
+        .join("sessions")
+        .join("s1")
+        .join("images");
+    std::fs::create_dir_all(&src_images).unwrap();
+    let image_name = "000000000000000000000000000000000000.png";
+    std::fs::write(src_images.join(image_name), b"png").unwrap();
+    std::fs::write(src_images.join("notes.txt"), b"nope").unwrap();
+    append_kinds(
+        &session.journal_path,
+        &[
+            user_msg("look at the image"),
+            assistant_msg("seen"),
+            user_msg("second"),
+        ],
+    );
+
+    let (status, body) = post_fork(&app.state, "s1", 2).await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let new_id = body["id"].as_str().unwrap().to_string();
+    let dst_images = app
+        .state
+        .data_dir
+        .join("sessions")
+        .join(&new_id)
+        .join("images");
+    assert_eq!(std::fs::read(dst_images.join(image_name)).unwrap(), b"png");
+    assert!(!dst_images.join("notes.txt").exists());
+}
+
+/// The cut point must name a user `message` event: an unknown seq and a seq
+/// pointing at another kind of event are both rejected, and nothing is
+/// created.
+#[tokio::test]
+async fn fork_session_validates_the_cut_point() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    append_kinds(
+        &session.journal_path,
+        &[
+            system_prompt(Mode::Build),
+            user_msg("first"),
+            assistant_msg("answer"),
+        ],
+    );
+
+    // No event at all at that seq.
+    let (status, body) = post_fork(&app.state, "s1", 99).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"].as_str().unwrap().contains("no journal event"),
+        "body: {body}"
+    );
+    // An event that is not a user message (the assistant answer at seq 2).
+    let (status, body) = post_fork(&app.state, "s1", 2).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("not a user message"),
+        "body: {body}"
+    );
+    // The system prompt at seq 0 is not a valid cut point either.
+    let (status, _) = post_fork(&app.state, "s1", 0).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Nothing was created: the list still holds only the source session.
+    let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+    let sessions = db::list_sessions(&conn).unwrap();
+    assert_eq!(sessions.len(), 1, "sessions: {sessions:#?}");
+}
+
+/// An unknown source session is a 404.
+#[tokio::test]
+async fn fork_session_unknown_source_is_404() {
+    let app = test_app();
+    let (status, _) = post_fork(&app.state, "nope", 0).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A fork is a never-started pending session: the followup endpoint accepts
+/// it (this is what sends the edited message), journals it after the copied
+/// history and spawns the worker.
+#[tokio::test]
+async fn fork_session_accepts_the_edited_message() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    append_kinds(
+        &session.journal_path,
+        &[
+            system_prompt(Mode::Build),
+            user_msg("first"),
+            assistant_msg("answer"),
+            user_msg("second"),
+        ],
+    );
+
+    let (status, body) = post_fork(&app.state, "s1", 3).await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let new_id = body["id"].as_str().unwrap().to_string();
+
+    let (status, resumed) =
+        send_followup_json(&app.state, &new_id, &json!({ "content": "second, edited" })).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "body: {resumed}");
+    assert_eq!(resumed["status"], "pending");
+    assert!(resumed["pid"].is_number(), "the followup spawns a worker");
+
+    let kinds = read_kinds(&app, &new_id);
+    assert_eq!(kinds.len(), 3, "kinds: {kinds:#?}");
+    assert_eq!(kinds[0], user_msg("first"));
+    assert_eq!(kinds[1], assistant_msg("answer"));
+    assert_eq!(kinds[2], user_msg("second, edited"));
+}
+
+/// POST /api/sessions/:id/mode with a JSON body (`{"mode": ...}`).
+async fn post_mode_switch(
+    app: &Arc<AppState>,
+    id: &str,
+    mode: Mode,
+) -> (StatusCode, serde_json::Value) {
+    let router = create_router(app.clone());
+    let body = json!({ "mode": mode.as_str() });
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/sessions/{id}/mode"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
+/// A never-started session (`pending` with no pid — a fork waiting for its
+/// first message, or a `defer_spawn` session) has no queued worker racing the
+/// switch, so its mode and model can be changed before the first run: the
+/// first run then builds its prompt / talks to the endpoint from the new
+/// values. A `pending` session *with* a pid (a queued run) is still refused.
+#[tokio::test]
+async fn never_started_session_accepts_mode_and_model_switches() {
+    let app = test_app();
+    let session = insert_session(&app.state, "s1", Mode::Build);
+    append_kinds(
+        &session.journal_path,
+        &[
+            system_prompt(Mode::Build),
+            user_msg("first"),
+            assistant_msg("answer"),
+        ],
+    );
+
+    // Fork at the first user message: pending, no pid.
+    let (status, body) = post_fork(&app.state, "s1", 1).await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let fork_id = body["id"].as_str().unwrap().to_string();
+
+    let (status, body) = post_mode_switch(&app.state, &fork_id, Mode::Plan).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["mode"], "plan");
+
+    let (status, body) = post_model_switch(&app.state, &fork_id, "other-model").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["model"], "other-model");
+
+    // A queued run (pending with a pid) is refused, like a running one.
+    {
+        let conn = app.state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db::set_pid(&conn, &fork_id, std::process::id()).unwrap();
+    }
+    let (status, _) = post_model_switch(&app.state, &fork_id, "third-model").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = post_mode_switch(&app.state, &fork_id, Mode::Explore).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}

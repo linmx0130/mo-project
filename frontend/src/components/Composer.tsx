@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent, FormEvent, KeyboardEvent } from 'react'
+import type { AttachedImage, JournalImage } from '../api'
 
 interface Props {
   /** A session run is in progress: the input is frozen and Stop is shown. */
@@ -13,13 +14,23 @@ interface Props {
    *  message survives navigation). Omit for fully internal state. */
   value?: string
   onTextChange?: (text: string) => void
+  /** Seed for the *internal* text state, for the one case where the box
+   *  starts non-empty: a forked session, whose composer comes up carrying
+   *  the edited message. Ignored in controlled mode (`value`). */
+  initialText?: string
+  /** Already-uploaded images (a forked message's attachments) shown in the
+   *  thumbnail strip from the start and sent with the next message. */
+  initialImages?: AttachedImage[]
   /** Resolve `false` to keep the typed text and the picked images (e.g.
    *  validation failed or the send/upload failed). `files` are the locally
    *  picked image files, shown as thumbnails below the textarea; the view
-   *  uploads them into the session folder when the message is sent. */
+   *  uploads them into the session folder when the message is sent.
+   *  `attached` are the already-uploaded images still in the strip (those
+   *  passed in via `initialImages` and not removed). */
   onSubmit: (
     text: string,
     files: File[],
+    attached: JournalImage[],
   ) => Promise<boolean | void> | boolean | void
 }
 
@@ -35,10 +46,16 @@ export default function Composer({
   onStop,
   value,
   onTextChange,
+  initialText,
+  initialImages,
   onSubmit,
 }: Props) {
-  const [text, setText] = useState('')
+  const [text, setText] = useState(initialText ?? '')
   const [files, setFiles] = useState<File[]>([])
+  // Already-uploaded images the composer started with (a forked message's
+  // attachments); removing one just drops it from the strip, the file stays
+  // in the session folder.
+  const [attached, setAttached] = useState<AttachedImage[]>(initialImages ?? [])
   const [uploadError, setUploadError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const currentText = value !== undefined ? value : text
@@ -75,15 +92,25 @@ export default function Composer({
     setFiles((prev) => prev.filter((_, i) => i !== index))
   }
 
+  const removeAttached = (index: number) => {
+    setAttached((prev) => prev.filter((_, i) => i !== index))
+  }
+
   const send = async () => {
     const trimmed = currentText.trim()
-    if ((!trimmed && files.length === 0) || running || busy) return
-    const keep = await onSubmit(trimmed, files)
+    const empty = !trimmed && files.length === 0 && attached.length === 0
+    if (empty || running || busy) return
+    const keep = await onSubmit(
+      trimmed,
+      files,
+      attached.map((a) => a.image),
+    )
     if (keep === false) return
     // No-op in controlled mode: the parent owns the value (the draft view
     // clears it by dropping the whole draft on session creation).
     setText('')
     setFiles([])
+    setAttached([])
     setUploadError(null)
   }
 
@@ -111,8 +138,25 @@ export default function Composer({
         disabled={running}
         spellCheck={false}
       />
-      {(files.length > 0 || uploadError) && (
+      {(files.length > 0 || attached.length > 0 || uploadError) && (
         <div className="composer-images">
+          {attached.map((a, i) => (
+            <span
+              className="composer-thumb"
+              key={`attached-${a.image.path}-${i}`}
+            >
+              <img src={a.url} alt={a.image.path} title={a.image.path} />
+              <button
+                type="button"
+                className="thumb-remove"
+                onClick={() => removeAttached(i)}
+                aria-label={`Remove ${a.image.path}`}
+                title="Remove"
+              >
+                ×
+              </button>
+            </span>
+          ))}
           {files.map((file, i) => (
             <span className="composer-thumb" key={`${file.name}-${i}`}>
               <img src={previews[i]} alt={file.name} title={file.name} />
@@ -166,7 +210,10 @@ export default function Composer({
             <button
               type="submit"
               className="send"
-              disabled={busy || (!currentText.trim() && files.length === 0)}
+              disabled={
+                busy ||
+                (!currentText.trim() && files.length === 0 && attached.length === 0)
+              }
             >
               {busy ? 'Sending…' : 'Send'}
             </button>

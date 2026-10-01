@@ -408,3 +408,99 @@ fn legacy_system_prompt_without_mode_defaults_to_build() {
         other => panic!("expected system_prompt, got: {other:?}"),
     }
 }
+
+#[test]
+fn copy_events_before_copies_only_the_prefix_with_fresh_seqs() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.jsonl");
+    let dst = dir.path().join("dst.jsonl");
+    let mut writer = JournalWriter::open(&src).unwrap();
+    writer.append(msg_event("user", "first")).unwrap();
+    writer.append(msg_event("assistant", "answer")).unwrap();
+    writer.append(msg_event("user", "second")).unwrap();
+    writer.append(msg_event("assistant", "later")).unwrap();
+    drop(writer);
+
+    // Fork before the event at seq 2 ("second"): everything before it.
+    let copied = copy_events_before(&src, &dst, 2).unwrap();
+    assert_eq!(copied.len(), 2);
+    assert_eq!(copied[0].seq, 0, "dst is re-sequenced from 0");
+    assert_eq!(copied[1].seq, 1);
+    let events = read_events(&dst).unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].seq, 0);
+    assert_eq!(events[1].seq, 1);
+    match (&events[0].kind, &events[1].kind) {
+        (JournalEventKind::Message(a), JournalEventKind::Message(b)) => {
+            assert_eq!((a.role.as_str(), a.content.as_str()), ("user", "first"));
+            assert_eq!(
+                (b.role.as_str(), b.content.as_str()),
+                ("assistant", "answer")
+            );
+        }
+        other => panic!("expected messages, got: {other:?}"),
+    }
+}
+
+#[test]
+fn copy_events_before_skips_system_prompts() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.jsonl");
+    let dst = dir.path().join("dst.jsonl");
+    let mut writer = JournalWriter::open(&src).unwrap();
+    writer
+        .append(JournalEventKind::SystemPrompt {
+            content: "You are in Plan mode. Scratch: /data/sessions/src/tmp".to_string(),
+            mode: crate::types::Mode::Plan,
+            model: "mock-model".to_string(),
+        })
+        .unwrap();
+    writer.append(msg_event("user", "first")).unwrap();
+    writer.append(msg_event("user", "second")).unwrap();
+    drop(writer);
+
+    // A second SystemPrompt (journaled after a context compression) is
+    // skipped too.
+    let copied = copy_events_before(&src, &dst, 2).unwrap();
+    assert_eq!(copied.len(), 1);
+    let events = read_events(&dst).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].seq, 0);
+    assert!(
+        matches!(&events[0].kind, JournalEventKind::Message(m) if m.content == "first"),
+        "the prompt must be dropped and the user message re-sequenced to 0"
+    );
+}
+
+#[test]
+fn copy_events_before_at_zero_and_past_the_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.jsonl");
+    let mut writer = JournalWriter::open(&src).unwrap();
+    writer.append(msg_event("user", "first")).unwrap();
+    writer.append(msg_event("assistant", "answer")).unwrap();
+    drop(writer);
+
+    // Forking at the first message (seq 0) copies nothing: the forked
+    // session starts as a fresh session with the same setup.
+    let dst0 = dir.path().join("dst0.jsonl");
+    assert!(copy_events_before(&src, &dst0, 0).unwrap().is_empty());
+    assert!(read_events(&dst0).unwrap().is_empty());
+
+    // A cut past the end copies the whole journal.
+    let dst_all = dir.path().join("dst_all.jsonl");
+    assert_eq!(copy_events_before(&src, &dst_all, 99).unwrap().len(), 2);
+}
+
+#[test]
+fn copy_events_before_missing_source_is_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let dst = dir.path().join("nested/dst.jsonl");
+    assert!(
+        copy_events_before(&dir.path().join("nope.jsonl"), &dst, 3)
+            .unwrap()
+            .is_empty()
+    );
+    // The destination (and its parent directory) is still created.
+    assert!(read_events(&dst).unwrap().is_empty());
+}

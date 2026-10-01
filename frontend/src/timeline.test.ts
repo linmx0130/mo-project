@@ -353,3 +353,27 @@ describe('buildTimeline — messages with images', () => {
     ).toBe(true)
   })
 })
+
+describe('buildTimeline — the journal seq on message blocks', () => {
+  it('exposes the seq of a user message, so a fork can cut before it', () => {
+    const first = userMsg('first')
+    const second = userMsg('second')
+    const items = buildTimeline([first, asstMsg('answer'), second])
+    const users = items.filter(
+      (i) => i.type === 'message' && i.message.role === 'user',
+    )
+    if (users[0]?.type !== 'message' || users[1]?.type !== 'message') {
+      throw new Error('expected two user message items')
+    }
+    expect(users[0].message.seq).toBe(first.seq)
+    expect(users[1].message.seq).toBe(second.seq)
+  })
+
+  it('finalizes a delta-built preview with the canonical message seq', () => {
+    const message = asstMsg('final')
+    const items = buildTimeline([delta('fi'), delta('nal'), message])
+    const [asst] = assistantMessages(items)
+    expect(asst.content).toBe('final')
+    expect(asst.seq).toBe(message.seq)
+  })
+})

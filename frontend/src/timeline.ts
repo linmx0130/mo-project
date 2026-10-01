@@ -29,10 +29,14 @@ export interface ToolBlock {
  *  content is still being assembled from `message_delta` events, and
  *  `truncated` marks a streaming preview that was closed by a turn
  *  boundary before its final `message` event arrived (the run died
- *  mid-stream) — it keeps its partial text but is no longer streaming. */
+ *  mid-stream) — it keeps its partial text but is no longer streaming.
+ *  `seq` is the journal seq of the message event (null for synthesized
+ *  events), which the "New session from here" action uses to address the
+ *  cut point of a fork. */
 export type MessageBlock = JournalMessage & {
   streaming?: boolean
   truncated?: boolean
+  seq?: number | null
 }
 
 export type TimelineItem =
@@ -141,6 +145,7 @@ export function buildTimeline(events: JournalEvent[]): TimelineItem[] {
             content: kind.content,
             reasoning_content: reasoning || null,
             streaming: true,
+            seq: ev.seq,
           }
           openMessage = block
           openIdx = items.length
@@ -155,6 +160,7 @@ export function buildTimeline(events: JournalEvent[]): TimelineItem[] {
           openMessage.reasoning_content = kind.reasoning_content ?? null
           openMessage.tool_call_id = kind.tool_call_id ?? null
           openMessage.tool_calls = kind.tool_calls ?? null
+          openMessage.seq = ev.seq
           openMessage.streaming = false
           openMessage.truncated = false
           if (!isRenderableMessage(openMessage)) {
@@ -181,6 +187,7 @@ export function buildTimeline(events: JournalEvent[]): TimelineItem[] {
               tool_call_id: kind.tool_call_id ?? null,
               tool_calls: kind.tool_calls ?? null,
               images: kind.images ?? [],
+              seq: ev.seq,
             },
           })
         }

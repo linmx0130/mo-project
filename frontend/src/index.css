@@ -1237,6 +1237,38 @@ p {
   margin-bottom: 0;
 }
 
+/* Action cluster in a message head row (copy, fork, ...). */
+.msg-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* "New session from here" on a user message: start a new session from that
+   message (the history before it is copied) with its text put in the new
+   composer for editing. */
+.fork-btn {
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  color: var(--accent);
+  font: inherit;
+  font-size: 12px;
+  padding: 2px 9px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.fork-btn:hover:not(:disabled) {
+  background: var(--accent-bg);
+}
+
+.fork-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .copy-btn {
   flex-shrink: 0;
   background: transparent;
@@ -1491,6 +1523,13 @@ p {
 
 .tool-block.tool-failed {
   border-color: var(--failed-border);
+}
+
+/* Wrapper for the tool block's copy button: stops the click from toggling
+   the surrounding <details> (the summary row is the toggle target). */
+.tool-copy {
+  flex-shrink: 0;
+  display: inline-flex;
 }
 
 .tool-output {

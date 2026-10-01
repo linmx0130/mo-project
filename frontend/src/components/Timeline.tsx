@@ -169,25 +169,59 @@ export function EventRow({ event }: { event: JournalEvent }) {
 export function MessageRow({
   message,
   sessionId,
+  onFork,
+  forkingSeq = null,
 }: {
   message: MessageBlock
   /** The session the message belongs to, for rendering attached images
    *  (`GET /api/sessions/:id/images/<file>`). Optional: a subagent modal
    *  never renders user messages with images. */
   sessionId?: string
+  /** Start a new session from this user message (the history before it is
+   *  preserved and the message goes into the new composer for editing).
+   *  Omitted where forking makes no sense (the subagent modal). */
+  onFork?: (message: MessageBlock) => void
+  /** The seq of the message whose fork request is in flight: that row shows
+   *  "Creating…" and every fork button is disabled until it settles. */
+  forkingSeq?: number | null
 }) {
   const role = message.role
   if (role === 'tool') {
     return (
       <div className="msg msg-tool">
+        <div className="msg-head">
+          <div className="msg-label">tool</div>
+          {message.content && <CopyButton content={message.content} />}
+        </div>
         <pre className="tool-output">{message.content}</pre>
       </div>
     )
   }
   if (role === 'user') {
+    // The journal seq of this message is what the fork endpoint cuts at
+    // ("everything before this message"); synthetic/legacy events without
+    // one cannot be forked.
+    const canFork = onFork !== undefined && typeof message.seq === 'number'
+    const forking = canFork && forkingSeq === message.seq
     return (
       <div className="msg msg-user">
-        <div className="msg-label">user</div>
+        <div className="msg-head">
+          <div className="msg-label">user</div>
+          <div className="msg-actions">
+            {message.content && <CopyButton content={message.content} />}
+            {canFork && (
+              <button
+                type="button"
+                className="fork-btn"
+                onClick={() => onFork(message)}
+                disabled={forkingSeq !== null}
+                title="Start a new session with the history before this message; the message itself goes into the input box so you can edit it"
+              >
+                {forking ? 'Creating…' : 'New session from here'}
+              </button>
+            )}
+          </div>
+        </div>
         {message.content && (
           <div className="msg-content">{message.content}</div>
         )}
@@ -287,6 +321,15 @@ export function ToolBlockRow({
         {block.ok !== undefined && (
           <span className={`tool-status ${block.ok ? 'ok' : 'err'}`}>
             {block.ok ? 'ok' : 'error'}
+          </span>
+        )}
+        {block.output !== undefined && block.output.length > 0 && (
+          // Copy the tool's output (what the model received). The wrapper
+          // stops the click from toggling the surrounding <details>, like
+          // the "view subagent" button below. Disabled while output is still
+          // streaming so the user can't grab a partial result.
+          <span className="tool-copy" onClick={(e) => e.stopPropagation()}>
+            <CopyButton content={block.output} disabled={block.streaming} />
           </span>
         )}
         {block.childId && (
