@@ -1244,39 +1244,12 @@ p {
   gap: 6px;
 }
 
-/* "New session from here" on a user message: start a new session from that
-   message (the history before it is copied) with its text put in the new
-   composer for editing. */
-.fork-btn {
-  flex-shrink: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  /* Wide enough for the 14px glyph + padding, so the button does not shrink
-     when the busy "…" replaces it. */
-  min-width: 26px;
-  background: transparent;
-  border: 1px solid var(--accent);
-  border-radius: 6px;
-  color: var(--accent);
-  font: inherit;
-  font-size: 13px;
-  line-height: 1;
-  padding: 3px 5px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-
-.fork-btn:hover:not(:disabled) {
-  background: var(--accent-bg);
-}
-
-.fork-btn:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-
-.copy-btn {
+/* Icon-only message action button (the clipboard copy and the git-fork "new
+   session from here"): a small bordered pill in the message head row, the
+   same construction as the sidebar's edit / delete icon buttons. Both
+   actions share this base so they read as one pair — the glyph says which is
+   which. */
+.icon-btn {
   flex-shrink: 0;
   display: inline-flex;
   align-items: center;
@@ -1285,25 +1258,33 @@ p {
   border: 1px solid var(--border);
   border-radius: 6px;
   color: var(--muted);
+  font: inherit;
   font-size: 13px;
   line-height: 1;
   padding: 4px 6px;
   cursor: pointer;
 }
 
-.copy-btn:hover:not(:disabled) {
+.icon-btn:hover:not(:disabled) {
   color: var(--accent);
   border-color: var(--accent);
 }
 
+.icon-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* The fork action keeps the copy button's box while its glyph is replaced by
+   the busy "…". */
+.fork-btn {
+  min-width: 26px;
+}
+
+/* "Copied ✓": the copy button's transient confirmation tint. */
 .copy-btn.copied {
   color: var(--status-completed);
   border-color: var(--status-completed);
-}
-
-.copy-btn:disabled {
-  opacity: 0.5;
-  cursor: default;
 }
 
 .msg-content {

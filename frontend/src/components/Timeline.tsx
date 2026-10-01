@@ -210,19 +210,22 @@ export function MessageRow({
           <div className="msg-actions">
             {message.content && <CopyButton content={message.content} />}
             {canFork && (
+              // Its own button next to the copy button, styled the same way
+              // (`.icon-btn`): the two read as a pair of message actions,
+              // and only the glyph tells them apart.
               <button
                 type="button"
-                className="fork-btn"
+                className="icon-btn fork-btn"
                 onClick={() => onFork(message)}
                 disabled={forkingSeq !== null}
                 aria-label="New session from here"
                 title="Start a new session with the history before this message; the message itself goes into the input box so you can edit it"
               >
                 {/* A git-fork glyph (two branches joining into one) — the
-                    action continues the conversation down a new branch.
-                    Built like the sidebar's edit / delete icons; the '…'
-                    while a fork request is in flight matches the delete
-                    button's busy state. */}
+                    action continues the conversation down a new branch, like
+                    the sidebar's edit / delete icons. The '…' while a fork
+                    request is in flight matches the delete button's busy
+                    state. */}
                 {forking ? (
                   '…'
                 ) : (

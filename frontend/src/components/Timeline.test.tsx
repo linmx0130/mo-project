@@ -40,6 +40,10 @@ describe('MessageRow — copy and fork affordances', () => {
     expect(html).toContain('<svg')
     expect(html).not.toContain('📋')
     expect(html).not.toContain('✅')
+    // Both actions share the `icon-btn` base: one identical pill style, only
+    // the glyph (and the fork's busy "…") differs.
+    expect(html).toContain('class="icon-btn copy-btn"')
+    expect(html).toContain('class="icon-btn fork-btn"')
     // This row is not the one whose fork request is in flight.
     expect(html).not.toContain('disabled')
   })

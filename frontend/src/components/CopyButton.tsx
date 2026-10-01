@@ -74,7 +74,7 @@ export default function CopyButton({ content, disabled = false }: Props) {
     <>
       <button
         type="button"
-        className={`copy-btn${copied ? ' copied' : ''}`}
+        className={`icon-btn copy-btn${copied ? ' copied' : ''}`}
         onClick={() => void copy()}
         disabled={disabled}
         aria-label={copied ? 'Copied to clipboard' : 'Copy raw content'}
