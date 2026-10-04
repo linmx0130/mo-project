@@ -89,7 +89,7 @@ pub fn tool_definitions(enabled: &[String]) -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": TOOL_EDIT_FILE,
-                "description": "Replace old_string with new_string in a file. The match must be unique unless replace_all is true. Returns a short confirmation on success — use read_file to inspect the changed content. Paths outside the working directory require the user's approval in the UI; the call is held until the user decides and then completes (or returns a denial error) like any other result. In plan/explore mode, create/edit/remove are only allowed in the session scratch dir and are otherwise denied without asking.",
+                "description": "Replace old_string with new_string in a file. The match must be unique unless replace_all is true. Returns a short confirmation on success — use read_file to inspect the changed content. Paths outside the working directory require the user's approval in the UI; the call is held until the user decides and then completes (or returns a denial error) like any other result. In plan/explore/review mode, create/edit/remove are only allowed in the session scratch dir and are otherwise denied without asking.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -107,7 +107,7 @@ pub fn tool_definitions(enabled: &[String]) -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": TOOL_CREATE_FILE,
-                "description": "Create a new file with the given content inside the working directory. The parent directory must already exist and the file must not exist (use edit_file to modify existing files). Returns the content written. Paths outside the working directory require the user's approval in the UI; the call is held until the user decides and then completes (or returns a denial error) like any other result. In plan/explore mode, create/edit/remove are only allowed in the session scratch dir and are otherwise denied without asking.",
+                "description": "Create a new file with the given content inside the working directory. The parent directory must already exist and the file must not exist (use edit_file to modify existing files). Returns the content written. Paths outside the working directory require the user's approval in the UI; the call is held until the user decides and then completes (or returns a denial error) like any other result. In plan/explore/review mode, create/edit/remove are only allowed in the session scratch dir and are otherwise denied without asking.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -123,7 +123,7 @@ pub fn tool_definitions(enabled: &[String]) -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": TOOL_REMOVE_FILE,
-                "description": "Remove a regular file inside the working directory. Directories and symlinks are refused. Returns a confirmation. Paths outside the working directory require the user's approval in the UI; the call is held until the user decides and then completes (or returns a denial error) like any other result. In plan/explore mode, create/edit/remove are only allowed in the session scratch dir and are otherwise denied without asking.",
+                "description": "Remove a regular file inside the working directory. Directories and symlinks are refused. Returns a confirmation. Paths outside the working directory require the user's approval in the UI; the call is held until the user decides and then completes (or returns a denial error) like any other result. In plan/explore/review mode, create/edit/remove are only allowed in the session scratch dir and are otherwise denied without asking.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -296,7 +296,7 @@ fn read_roots(ctx: &ToolContext) -> Vec<PathBuf> {
 /// combines the message's held items into one batched permission request
 /// and ends the run — nothing is sent to the model until the user decides).
 /// Non-file tools, unparseable arguments and policy errors (missing file,
-/// plan/explore denial, a remembered denial) are all `Run`: execution then
+/// non-Build mode denial, a remembered denial) are all `Run`: execution then
 /// produces the ordinary tool result or error.
 pub fn preflight(ctx: &ToolContext, name: &str, arguments: &str, call_id: &str) -> Preflight {
     match name {

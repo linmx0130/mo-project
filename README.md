@@ -33,7 +33,7 @@ Frontend  <->  Gateway Service  <->  Agent worker(s)
 
 | Piece | Role |
 | --- | --- |
-| `mo_core` | Shared types, JSONL journal I/O, SQLite metadata DB (WAL), TOML config, the session-mode registry (`build` / `plan` / `explore`), global skill discovery |
+| `mo_core` | Shared types, JSONL journal I/O, SQLite metadata DB (WAL), TOML config, the session-mode registry (`build` / `plan` / `explore` / `review`), global skill discovery |
 | `mo_gateway` | axum HTTP service: sessions CRUD, history, SSE live updates, worker spawn/kill, mode switching, the skill list + status-bar skill loading (port 3031) |
 | `mo_worker` | One process per session: runs the LLM agent loop (via `nah_chat`) with tools `read_file`, `edit_file`, `create_file`, `remove_file`, `bash`, `bash_in_background`, `spawn_subagent`, `load_skill`, `request_mode_change`, `ask_user`; journals the system prompt once and reuses it verbatim on every run. The tool set is chosen per session in the "New session" form: `bash` + the file operations are always available, the rest may be disabled — disabled tools' schemas are not injected into the prompt and the worker refuses to execute them. Skills the user force-loads in the same form have their full `SKILL.md` inlined into the system prompt |
 | `frontend` | React 19 + Vite + TS UI (Vite dev server on 3030, proxy `/api → :3031`) |
@@ -175,8 +175,8 @@ streaming path is exercised in smoke tests too.
 
 ## Modes
 
-Every session runs in one of three **modes** — `build` (the default),
-`plan` or `explore` — chosen in the "New session" form (and, for
+Every session runs in one of four **modes** — `build` (the default),
+`plan`, `explore` or `review` — chosen in the "New session" form (and, for
 subagents, via `spawn_subagent`'s `mode` argument, defaulting to the
 parent's current mode). The mode shapes two things:
 
@@ -196,9 +196,10 @@ the LLM on every run (prompt-cache friendly). A session never picks up
 | `build` | Full coding-agent instructions: modify the codebase, run commands, use subagents and skills. | The codebase (workdir) |
 | `plan` | Produce a clear, actionable implementation plan — do not implement yet. Codebase is **read-only**; use the scratch dir for drafts. `bash` and `bash_in_background` are available but should be treated as read-only (a soft restriction). Finish with the plan, then request `build` mode when the plan is ready and no must-answer questions remain. | The session scratch dir only |
 | `explore` | Investigate the codebase to answer questions / gather facts for a parent agent. Codebase is **read-only**; prefer `read_file`. | The session scratch dir only |
+| `review` | Review code and report findings — do not fix or modify it. Default scope: the changes against `main`/`master` (whole project when the checkout is cleanly on `main`/`master` or unversioned). Codebase is **read-only**; the scratch dir is for throwaway validation tests. Never posts to GitHub / review platforms unless the user explicitly asks. Finishes with a list of findings, a summary of actions, and a verdict on whether the changes are good to merge. | The session scratch dir only |
 
 The session scratch dir is `<data_dir>/sessions/<id>/tmp/` (created by the
-worker, removed with the session). In `plan`/`explore` mode a mutation that
+worker, removed with the session). In the non-`build` modes a mutation that
 would land inside the codebase is denied with an explicit error telling the
 model where it *may* write; writes inside the scratch dir use absolute
 paths. `bash` and `bash_in_background` remain available everywhere — a
@@ -223,7 +224,7 @@ outcomes as ordinary tool results and never has to "retry". Each decision
 is remembered for that exact `(tool, path)` for the rest of the session, so
 a later retry of an allowed path runs without prompting again and a retry
 of a denied path is refused outright. Reads ask in every mode; writes ask
-in `build` mode only — in `plan`/`explore` a write outside the scratch dir
+in `build` mode only — in the other modes a write outside the scratch dir
 is denied outright (never asked about, per the mode's write sandbox), and
 subagents never ask (their journal has no UI); they report the need to
 their parent agent.
@@ -274,16 +275,18 @@ New subagents inherit the parent's current model at spawn; existing
 subagents keep the model they were spawned with.
 
 **Requesting a mode change.** When the model needs a mode it does not have
-(e.g. a plan/explore session and the user asks it to build), it calls the
-`request_mode_change` tool instead of working around the sandbox. The tool
-takes the requested `mode` and a short `message` for the user — written in
-the user's language — journals a `mode_change_request` event, and tells the
-model to stop and wait. In plan mode the system prompt makes this the
-*default* exit once the plan is ready: finish the plan, and if it has no
-open questions the user must answer before implementation, call the tool
-with mode `build` (the request replaces a plain-text "shall I proceed?" —
-the user reviews the plan when approving); if the plan has must-answer
-questions, the model lists them and waits for the user's answers instead.
+(e.g. a plan/explore/review session and the user asks it to build), it
+calls the `request_mode_change` tool instead of working around the sandbox.
+The tool takes the requested `mode` and a short `message` for the user —
+written in the user's language — journals a `mode_change_request` event,
+and tells the model to stop and wait. In plan mode the system prompt makes
+this the *default* exit once the plan is ready: finish the plan, and if it
+has no open questions the user must answer before implementation, call the
+tool with mode `build` (the request replaces a plain-text "shall I
+proceed?" — the user reviews the plan when approving); if the plan has
+must-answer questions, the model lists them and waits for the user's
+answers instead. In review mode the model calls it when the user asks it to
+apply the findings it reported.
 The frontend shows an Agree / Reject banner and freezes the composer while
 the request is pending (resolved = a `mode_change` or
 `mode_change_request_declined` event after it). **Agree**
@@ -476,7 +479,7 @@ are re-sent with the edited message).
 ## Status bar
 
 The session view has a status bar pinned to the bottom showing a mode
-picker (`build` / `plan` / `explore` — switching a session's mode
+picker (`build` / `plan` / `explore` / `review` — switching a session's mode
 changes only the write sandbox of subsequent runs) with the **model
 picker** side-by-side (switching only affects the next run — the respawned
 worker is spawned with the new model and receives the full journal
@@ -605,7 +608,7 @@ the model):
 | --- | --- |
 | `GET /api/meta` | static gateway metadata: `{cwd, theme_color}` (`cwd` = gateway startup dir, used as the default session workdir; `theme_color` = the configured UI accent color from `mo.toml`, default `#009dc4`) |
 | `GET /api/models` | configured models from `mo.toml` (`[{nickname, name, base_url, default}]`; first one is `default`) |
-| `GET /api/modes` | built-in session modes: `[{name, label, description, tools, writable}]` (`build`, `plan`, `explore`) |
+| `GET /api/modes` | built-in session modes: `[{name, label, description, tools, writable}]` (`build`, `plan`, `explore`, `review`) |
 | `GET /api/tools` | the session tool registry for the "New session" checkbox list: `[{name, label, description, fixed}]` — `fixed` (bash + file operations) tools are always available, the rest may be disabled per session |
 | `GET /api/skills` | every discovered global skill (both layouts, sorted, deduplicated): `[{name, description}]` — for the "New session" skill checkbox list and the status-bar "load skill" picker |
 | `POST /api/sessions` `{workdir, prompt, model?, mode?, banned_tools?, skills?, defer_spawn?}` | create session + spawn worker (`model` = model name from `/api/models`, default when absent; `mode` = mode name from `/api/modes`, `build` when absent; `banned_tools` = the *toggleable* tools from `/api/tools` to disable for this session — disabled schemas are not injected into the prompt; absent/empty bans nothing, and fixed tools cannot be banned; `skills` = skill names from `/api/skills` to force-load — their full `SKILL.md` is injected into the system prompt at the first run; absent/empty force-loads nothing, and unknown names are rejected; `defer_spawn` = create the row only — no first message, no worker, no title — used by the New-session form's two-phase image flow: create, upload the images into the session folder, then send the first message via `POST /api/sessions/:id/messages`, which is what journals it and spawns the worker) |
