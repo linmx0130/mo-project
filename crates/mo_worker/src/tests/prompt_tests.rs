@@ -37,7 +37,7 @@ fn includes_workdir_and_agents_md() {
 fn all_modes_mention_permission_requests() {
     let dir = tempfile::tempdir().unwrap();
     let agents = tempfile::tempdir().unwrap();
-    for mode in [Mode::Build, Mode::Plan, Mode::Explore] {
+    for mode in [Mode::Build, Mode::Plan, Mode::Explore, Mode::Review] {
         let prompt = prompt_for(mode, &dir, &agents);
         assert!(
             prompt.contains("permission request"),
@@ -362,13 +362,48 @@ fn explore_mode_frames_investigation_and_readonly_codebase() {
     assert!(prompt.contains("request_mode_change"));
 }
 
+/// Review mode frames a read-only code review: the default scope is the
+/// diff against main/master, or the whole project when the checkout is
+/// clean on main/master or unversioned. Output is findings, then actions,
+/// then a merge verdict; no review-platform posts unless the user
+/// explicitly asks, and the scratch dir is for throwaway validation tests.
+#[test]
+fn review_mode_frames_review_readonly_and_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let agents = tempfile::tempdir().unwrap();
+    let prompt = prompt_for(Mode::Review, &dir, &agents);
+    assert!(prompt.contains("Review mode"));
+    assert!(prompt.contains("do not fix or modify the code"));
+    // Default scope: changes against main/master, whole project when the
+    // checkout is clean on main/master or there is no VCS.
+    assert!(prompt.contains("main"));
+    assert!(prompt.contains("master"));
+    assert!(prompt.contains("git merge-base"));
+    assert!(prompt.contains("whole project"));
+    assert!(prompt.contains("no version control"));
+    // Read-only codebase; the scratch dir is where validation tests go.
+    assert!(prompt.contains("READ-ONLY"));
+    assert!(prompt.contains(&scratch(&dir).display().to_string()));
+    assert!(prompt.contains("throwaway tests"));
+    assert!(prompt.contains("denied outright"));
+    // Never comment on a review platform unless explicitly asked.
+    assert!(prompt.contains("GitHub"));
+    assert!(prompt.contains("unless the user explicitly"));
+    // Output shape: findings, actions, merge verdict.
+    assert!(prompt.contains("list of findings"));
+    assert!(prompt.contains("good to merge"));
+    // And the escape hatch: asked to fix → request a switch to build.
+    assert!(prompt.contains("request_mode_change"));
+    assert!(prompt.contains("mode \"build\""));
+}
+
 /// Every mode's system prompt mentions context compression, so the
 /// model understands a handoff user message when one arrives mid-task.
 #[test]
 fn all_modes_mention_context_compression() {
     let dir = tempfile::tempdir().unwrap();
     let agents = tempfile::tempdir().unwrap();
-    for mode in [Mode::Build, Mode::Plan, Mode::Explore] {
+    for mode in [Mode::Build, Mode::Plan, Mode::Explore, Mode::Review] {
         let prompt = prompt_for(mode, &dir, &agents);
         assert!(prompt.contains("handoff prompt"), "mode {mode}: {prompt}");
         assert!(
@@ -385,7 +420,7 @@ fn all_modes_mention_context_compression() {
 fn all_modes_tell_the_model_to_ask_clarification() {
     let dir = tempfile::tempdir().unwrap();
     let agents = tempfile::tempdir().unwrap();
-    for mode in [Mode::Build, Mode::Plan, Mode::Explore] {
+    for mode in [Mode::Build, Mode::Plan, Mode::Explore, Mode::Review] {
         let prompt = prompt_for(mode, &dir, &agents);
         assert!(prompt.contains("`ask_user`"), "mode {mode}: {prompt}");
         assert!(
