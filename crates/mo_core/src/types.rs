@@ -69,16 +69,19 @@ impl std::fmt::Display for SessionStatus {
 
 /// The session mode: a different system prompt (journaled once at the first
 /// run) and a different write sandbox. `Build` may modify the codebase;
-/// `Plan` and `Explore` treat the codebase as read-only and may only
-/// create/edit/remove files inside the session scratch dir. All modes share
-/// the same tool set — the restriction is *where* writes land, not whether
-/// the tools exist.
+/// `Plan`, `Explore` and `Review` treat the codebase as read-only and may
+/// only create/edit/remove files inside the session scratch dir. All modes
+/// share the same tool set — the restriction is *where* writes land, not
+/// whether the tools exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     Build,
     Plan,
     Explore,
+    /// Code review: read-only codebase, findings + merge verdict as output;
+    /// the scratch dir is available for throwaway validation tests.
+    Review,
 }
 
 impl Mode {
@@ -87,6 +90,7 @@ impl Mode {
             Mode::Build => "build",
             Mode::Plan => "plan",
             Mode::Explore => "explore",
+            Mode::Review => "review",
         }
     }
 }
@@ -99,8 +103,9 @@ impl FromStr for Mode {
             "build" => Ok(Mode::Build),
             "plan" => Ok(Mode::Plan),
             "explore" => Ok(Mode::Explore),
+            "review" => Ok(Mode::Review),
             other => Err(format!(
-                "unknown mode: {other} (expected build, plan or explore)"
+                "unknown mode: {other} (expected build, plan, explore or review)"
             )),
         }
     }
