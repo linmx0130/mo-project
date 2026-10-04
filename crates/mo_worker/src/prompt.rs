@@ -293,8 +293,9 @@ fn mode_framing(mode: Mode, workdir: &Path, scratch: &Path) -> String {
              references and why it matters, focused on what can be improved; (2) a \
              summary of the actions that should be performed; (3) a clear verdict on \
              whether the changes are good to merge.\n\
-             If the user asks you to fix something, call the `request_mode_change` tool \
-             with mode \"build\" to ask the user to switch this session to build mode.\n\n",
+             If the user asks you to fix something — e.g. apply the findings you \
+             reported — call the `request_mode_change` tool with mode \"build\" to ask \
+             the user to switch this session to build mode.\n\n",
             workdir.display(),
             scratch.display()
         ),

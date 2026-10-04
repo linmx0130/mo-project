@@ -19,6 +19,10 @@
   --status-failed: #f87171;
   --status-cancelled: #8b93a3;
 
+  /* Review mode's own color (orange): kept distinct from the status
+     colors so a review badge never reads as a failure. */
+  --mode-review: #fb923c;
+
   --failed-border: rgba(248, 113, 113, 0.4);
 
   --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
@@ -50,6 +54,8 @@
   --status-completed: #059669;
   --status-failed: #dc2626;
   --status-cancelled: #6b7280;
+
+  --mode-review: #ea580c;
 
   --failed-border: rgba(220, 38, 38, 0.45);
 
@@ -988,7 +994,7 @@ p {
 }
 
 .mode-review {
-  color: var(--status-failed);
+  color: var(--mode-review);
 }
 
 /* ---------- draft (new session placeholder) ---------- */
@@ -1588,8 +1594,9 @@ p {
   border-radius: 6px;
 }
 
-/* The mode-change badge is colored like the mode picker select; `mode-plan`
-   and `mode-explore` already set their color above (mode-select section). */
+/* The mode-change badge is colored like the mode picker select; `mode-plan`,
+   `mode-explore` and `mode-review` already set their color above (mode-select
+   section). */
 .badge.mode-build {
   color: var(--accent);
   border: 1px solid var(--accent);
@@ -1604,7 +1611,7 @@ p {
 }
 
 .badge.mode-review {
-  border: 1px solid var(--status-failed);
+  border: 1px solid var(--mode-review);
 }
 
 /* ---------- streaming ---------- */

@@ -2,9 +2,9 @@
 //! session, wait for it to finish, and return its final assistant message.
 //!
 //! The parent picks the subagent's mode: `build` (full access), or
-//! `plan`/`explore` (codebase read-only, writes go to the subagent's own
-//! scratch dir). The child journals its own system prompt on its first run,
-//! built from the chosen mode.
+//! `plan`/`explore`/`review` (codebase read-only, writes go to the
+//! subagent's own scratch dir). The child journals its own system prompt on
+//! its first run, built from the chosen mode.
 //!
 //! Subagents are *leaves*: the depth hard limit is 1, so a session that is
 //! itself a subagent (`parent_id` set) can never spawn further subagents.

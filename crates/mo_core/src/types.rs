@@ -486,8 +486,8 @@ pub enum JournalEventKind {
     /// Journaled by the worker when a file tool call (`read_file`,
     /// `edit_file`, `create_file`, `remove_file`) targets such a path and
     /// the mode permits asking (reads in any mode; writes in `build` mode
-    /// only — `plan`/`explore` writes outside the scratch dir are denied
-    /// outright, never asked about). The frontend renders it as a
+    /// only — `plan`/`explore`/`review` writes outside the scratch dir are
+    /// denied outright, never asked about). The frontend renders it as a
     /// permission card (Allow / Deny per path) and freezes the composer
     /// while it is pending.
     ///
