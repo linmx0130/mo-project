@@ -59,7 +59,7 @@ fn roots(ctx: &ToolContext) -> Vec<PathBuf> {
 /// an existing file outside both asks the user — in every mode.
 #[test]
 fn read_policy_allowed_roots_and_ask_outside() {
-    for mode in [Mode::Build, Mode::Plan, Mode::Explore] {
+    for mode in [Mode::Build, Mode::Plan, Mode::Explore, Mode::Review] {
         let dir = tempfile::tempdir().unwrap();
         let ctx = make_ctx(&dir, mode, None);
         std::fs::write(dir.path().join("secret.txt"), "secret\n").unwrap();
@@ -110,8 +110,8 @@ fn write_policy_build_allows_roots_and_asks_outside() {
 /// with a mode-aware message) and any path outside the scratch dir is
 /// denied outright — never a permission request.
 #[test]
-fn write_policy_plan_denies_without_asking() {
-    for mode in [Mode::Plan, Mode::Explore] {
+fn write_policy_non_build_denies_without_asking() {
+    for mode in [Mode::Plan, Mode::Explore, Mode::Review] {
         let dir = tempfile::tempdir().unwrap();
         let ctx = make_ctx(&dir, mode, None);
         let scratch_file = ctx.scratch.join("draft.md");
@@ -292,6 +292,27 @@ fn preflight_plan_write_runs_and_build_write_holds() {
             &roots(&ctx_build)
         ),
         Preflight::Permission(_)
+    ));
+}
+
+/// Review mode is a non-Build mode: its preflight never holds a
+/// permission request — writes outside the scratch dir are denied
+/// outright instead (same path as Plan/Explore).
+#[test]
+fn preflight_review_write_denies_outside_paths_without_asking() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = make_ctx(&dir, Mode::Review, None);
+    assert!(matches!(
+        preflight(
+            &ctx,
+            TOOL_CREATE_FILE,
+            "write",
+            "/tmp/outside.txt",
+            r#"{"path":"/tmp/outside.txt","content":"x"}"#,
+            "c1",
+            &roots(&ctx)
+        ),
+        Preflight::Run
     ));
 }
 

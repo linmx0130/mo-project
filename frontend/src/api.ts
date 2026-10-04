@@ -8,9 +8,9 @@ export type SessionStatus =
   | 'failed'
   | 'cancelled'
 
-/** Session modes (GET /api/modes): build (full access), plan and explore
- *  (codebase read-only, writes go to the session scratch dir). */
-export type Mode = 'build' | 'plan' | 'explore'
+/** Session modes (GET /api/modes): build (full access), plan, explore and
+ *  review (codebase read-only, writes go to the session scratch dir). */
+export type Mode = 'build' | 'plan' | 'explore' | 'review'
 
 export interface Session {
   id: string
@@ -312,7 +312,7 @@ export function getModels(): Promise<ModelInfo[]> {
   return http('/api/models')
 }
 
-/** The built-in session modes (build / plan / explore). */
+/** The built-in session modes (build / plan / explore / review). */
 export function getModes(): Promise<ModeInfo[]> {
   return http('/api/modes')
 }

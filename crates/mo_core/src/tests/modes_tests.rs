@@ -7,7 +7,7 @@ use crate::TOOL_NAMES;
 
 #[test]
 fn every_mode_has_a_registry_entry() {
-    for mode in [Mode::Build, Mode::Plan, Mode::Explore] {
+    for mode in [Mode::Build, Mode::Plan, Mode::Explore, Mode::Review] {
         let info = mode.info();
         assert_eq!(info.name, mode.as_str());
         assert!(!info.description.is_empty());
@@ -17,21 +17,37 @@ fn every_mode_has_a_registry_entry() {
 }
 
 #[test]
-fn build_is_writable_and_plan_explore_are_scratch_only() {
+fn build_is_writable_and_the_other_modes_are_scratch_only() {
     assert_eq!(Mode::Build.info().writable, "codebase");
     assert_eq!(Mode::Plan.info().writable, "scratch only");
     assert_eq!(Mode::Explore.info().writable, "scratch only");
+    assert_eq!(Mode::Review.info().writable, "scratch only");
 }
 
 #[test]
 fn mode_round_trips() {
-    for mode in [Mode::Build, Mode::Plan, Mode::Explore] {
+    for mode in [Mode::Build, Mode::Plan, Mode::Explore, Mode::Review] {
         assert_eq!(mode.as_str().parse::<Mode>().unwrap(), mode);
         assert_eq!(mode.to_string(), mode.as_str());
     }
     assert!("nope".parse::<Mode>().is_err());
     assert!(serde_json::from_str::<Mode>("\"build\"").is_ok());
     assert_eq!(serde_json::to_string(&Mode::Plan).unwrap(), "\"plan\"");
+    // `review` is part of the wire vocabulary (POST bodies, /api/modes).
+    assert_eq!(serde_json::to_string(&Mode::Review).unwrap(), "\"review\"");
+    assert_eq!(
+        serde_json::from_str::<Mode>("\"review\"").unwrap(),
+        Mode::Review
+    );
+}
+
+#[test]
+fn review_mode_is_labelled_and_described() {
+    let info = Mode::Review.info();
+    assert_eq!(info.name, "review");
+    assert_eq!(info.label, "Review");
+    assert!(info.description.contains("read-only"));
+    assert!(info.description.contains("scratch"));
 }
 
 #[test]
@@ -65,6 +81,22 @@ fn mode_change_message_states_mode_restriction_and_goal() {
     assert!(explore.contains("READ-ONLY"));
     assert!(explore.contains("Prefer read_file"));
     assert!(explore.contains(scratch.to_str().unwrap()));
+
+    // Review: read-only review of the changes, with the default scope
+    // (diff vs main/master, whole project when clean or no VCS), the
+    // no-review-platform rule, the findings + verdict output shape, and
+    // the scratch dir for throwaway validation tests.
+    let review = mode_change_message(Mode::Review, scratch);
+    assert!(review.starts_with("[Session mode changed to review]"));
+    assert!(review.contains("Review mode"));
+    assert!(review.contains("READ-ONLY"));
+    assert!(review.contains("main"));
+    assert!(review.contains("master"));
+    assert!(review.contains("whole project"));
+    assert!(review.contains("GitHub"));
+    assert!(review.contains("good to merge"));
+    assert!(review.contains(scratch.to_str().unwrap()));
+    assert!(review.contains("request_mode_change"));
 }
 
 #[test]
@@ -80,7 +112,7 @@ fn approved_message_adds_approval_sentence() {
 #[test]
 fn tool_names_include_request_mode_change() {
     assert!(TOOL_NAMES.contains(&"request_mode_change"));
-    for mode in [Mode::Build, Mode::Plan, Mode::Explore] {
+    for mode in [Mode::Build, Mode::Plan, Mode::Explore, Mode::Review] {
         assert!(mode.info().tools.contains(&"request_mode_change"));
     }
 }
@@ -88,7 +120,7 @@ fn tool_names_include_request_mode_change() {
 #[test]
 fn tool_names_include_bash_in_background() {
     assert!(TOOL_NAMES.contains(&"bash_in_background"));
-    for mode in [Mode::Build, Mode::Plan, Mode::Explore] {
+    for mode in [Mode::Build, Mode::Plan, Mode::Explore, Mode::Review] {
         assert!(mode.info().tools.contains(&"bash_in_background"));
     }
 }

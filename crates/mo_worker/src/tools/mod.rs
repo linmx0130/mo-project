@@ -89,7 +89,7 @@ pub fn tool_definitions(enabled: &[String]) -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": TOOL_EDIT_FILE,
-                "description": "Replace old_string with new_string in a file. The match must be unique unless replace_all is true. Returns a short confirmation on success — use read_file to inspect the changed content. Paths outside the working directory require the user's approval in the UI; the call is held until the user decides and then completes (or returns a denial error) like any other result. In plan/explore mode, create/edit/remove are only allowed in the session scratch dir and are otherwise denied without asking.",
+                "description": "Replace old_string with new_string in a file. The match must be unique unless replace_all is true. Returns a short confirmation on success — use read_file to inspect the changed content. Paths outside the working directory require the user's approval in the UI; the call is held until the user decides and then completes (or returns a denial error) like any other result. In plan/explore/review mode, create/edit/remove are only allowed in the session scratch dir and are otherwise denied without asking.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -107,7 +107,7 @@ pub fn tool_definitions(enabled: &[String]) -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": TOOL_CREATE_FILE,
-                "description": "Create a new file with the given content inside the working directory. The parent directory must already exist and the file must not exist (use edit_file to modify existing files). Returns the content written. Paths outside the working directory require the user's approval in the UI; the call is held until the user decides and then completes (or returns a denial error) like any other result. In plan/explore mode, create/edit/remove are only allowed in the session scratch dir and are otherwise denied without asking.",
+                "description": "Create a new file with the given content inside the working directory. The parent directory must already exist and the file must not exist (use edit_file to modify existing files). Returns the content written. Paths outside the working directory require the user's approval in the UI; the call is held until the user decides and then completes (or returns a denial error) like any other result. In plan/explore/review mode, create/edit/remove are only allowed in the session scratch dir and are otherwise denied without asking.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -123,7 +123,7 @@ pub fn tool_definitions(enabled: &[String]) -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": TOOL_REMOVE_FILE,
-                "description": "Remove a regular file inside the working directory. Directories and symlinks are refused. Returns a confirmation. Paths outside the working directory require the user's approval in the UI; the call is held until the user decides and then completes (or returns a denial error) like any other result. In plan/explore mode, create/edit/remove are only allowed in the session scratch dir and are otherwise denied without asking.",
+                "description": "Remove a regular file inside the working directory. Directories and symlinks are refused. Returns a confirmation. Paths outside the working directory require the user's approval in the UI; the call is held until the user decides and then completes (or returns a denial error) like any other result. In plan/explore/review mode, create/edit/remove are only allowed in the session scratch dir and are otherwise denied without asking.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -170,12 +170,12 @@ pub fn tool_definitions(enabled: &[String]) -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": TOOL_SPAWN_SUBAGENT,
-                "description": "Spawn a subagent (a nested agent session with the same working directory) to work on a self-contained subtask, and wait for its final answer. Subagents cannot spawn further subagents (the depth hard limit is 1). The subagent runs in the given mode (default: this session's current mode) — build has full access; plan and explore keep the codebase read-only (writes go to the subagent's own scratch dir).",
+                "description": "Spawn a subagent (a nested agent session with the same working directory) to work on a self-contained subtask, and wait for its final answer. Subagents cannot spawn further subagents (the depth hard limit is 1). The subagent runs in the given mode (default: this session's current mode) — build has full access; plan, explore and review keep the codebase read-only (writes go to the subagent's own scratch dir).",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "prompt": { "type": "string", "description": "Self-contained instructions for the subagent." },
-                        "mode": { "type": "string", "enum": ["build", "plan", "explore"], "description": "Mode for the subagent: build (default, full access), plan (plan-only, codebase read-only), explore (investigate, codebase read-only). Defaults to this session's current mode." }
+                        "mode": { "type": "string", "enum": ["build", "plan", "explore", "review"], "description": "Mode for the subagent: build (default, full access), plan (plan-only, codebase read-only), explore (investigate, codebase read-only), review (code review, codebase read-only). Defaults to this session's current mode." }
                     },
                     "required": ["prompt"],
                     "additionalProperties": false
@@ -201,11 +201,11 @@ pub fn tool_definitions(enabled: &[String]) -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": TOOL_REQUEST_MODE_CHANGE,
-                "description": "Request the user (in the UI) to switch this session's mode. Use this when the task needs a mode you do not have — e.g. you are in plan/explore mode and need to modify the codebase, or you are in build mode and only need to plan/explore. In plan mode, call this once the plan is ready and has no open questions the user must answer; if the plan has must-answer questions, list them and wait for the user's answers instead. The user approves or rejects the request in the UI; on approval the session switches mode and continues the run, so you can then do the work. Root sessions only: subagents must ask their parent agent instead. Write `message` in the user's language (the language the user writes in).",
+                "description": "Request the user (in the UI) to switch this session's mode. Use this when the task needs a mode you do not have — e.g. you are in plan/explore/review mode and need to modify the codebase, or you are in build mode and only need to plan/explore. In plan mode, call this once the plan is ready and has no open questions the user must answer; if the plan has must-answer questions, list them and wait for the user's answers instead. In review mode, call this when the user asks you to apply the findings you reported. The user approves or rejects the request in the UI; on approval the session switches mode and continues the run, so you can then do the work. Root sessions only: subagents must ask their parent agent instead. Write `message` in the user's language (the language the user writes in).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "mode": { "type": "string", "enum": ["build", "plan", "explore"], "description": "The mode to switch to." },
+                        "mode": { "type": "string", "enum": ["build", "plan", "explore", "review"], "description": "The mode to switch to." },
                         "message": { "type": "string", "description": "A short message for the user, in the user's language, explaining why the mode switch is needed and what you will do once approved." }
                     },
                     "required": ["mode", "message"],
@@ -296,7 +296,7 @@ fn read_roots(ctx: &ToolContext) -> Vec<PathBuf> {
 /// combines the message's held items into one batched permission request
 /// and ends the run — nothing is sent to the model until the user decides).
 /// Non-file tools, unparseable arguments and policy errors (missing file,
-/// plan/explore denial, a remembered denial) are all `Run`: execution then
+/// non-Build mode denial, a remembered denial) are all `Run`: execution then
 /// produces the ordinary tool result or error.
 pub fn preflight(ctx: &ToolContext, name: &str, arguments: &str, call_id: &str) -> Preflight {
     match name {
@@ -379,7 +379,7 @@ struct BashInBackgroundArgs {
 #[derive(Deserialize)]
 struct SpawnSubagentArgs {
     prompt: String,
-    /// Optional mode for the subagent (`build` | `plan` | `explore`);
+    /// Optional mode for the subagent (`build` | `plan` | `explore` | `review`);
     /// defaults to this session's current mode.
     mode: Option<String>,
 }

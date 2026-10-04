@@ -8,7 +8,7 @@ interface Props {
   /** The model's configured context window at session time; null =
    *  unlimited (only the current length is shown). */
   contextWindow: number | null
-  /** The session's current mode (build / plan / explore). */
+  /** The session's current mode (build / plan / explore / review). */
   mode: Mode
   /** True when the mode picker may be used (the session is not running);
    *  switching only changes the write sandbox of subsequent runs — the
@@ -83,6 +83,7 @@ export default function StatusBar({
           <option value="build">Build</option>
           <option value="plan">Plan</option>
           <option value="explore">Explore</option>
+          <option value="review">Review</option>
         </select>
       </label>
       <label

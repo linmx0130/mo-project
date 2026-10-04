@@ -67,7 +67,7 @@ fn definitions_cover_all_tools() {
         .unwrap();
     assert_eq!(
         def["function"]["parameters"]["properties"]["mode"]["enum"],
-        json!(["build", "plan", "explore"])
+        json!(["build", "plan", "explore", "review"])
     );
     assert!(
         def["function"]["parameters"]["required"]
@@ -296,8 +296,8 @@ fn plan_ctx(dir: &tempfile::TempDir, mode: Mode) -> ToolContext {
 
 /// Non-Build modes deny codebase mutations but allow them in scratch.
 #[tokio::test]
-async fn plan_mode_denies_codebase_writes_and_allows_scratch() {
-    for mode in [Mode::Plan, Mode::Explore] {
+async fn non_build_modes_deny_codebase_writes_and_allow_scratch() {
+    for mode in [Mode::Plan, Mode::Explore, Mode::Review] {
         let dir = tempfile::tempdir().unwrap();
         let ctx = plan_ctx(&dir, mode);
         let no_event = |_: JournalEventKind| {};

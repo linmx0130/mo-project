@@ -4,8 +4,8 @@
 //!
 //! All modes expose the same tool set; what differs is the system prompt
 //! (journaled at the first run) and the *write sandbox*: `Build` may modify
-//! the codebase, while `Plan` and `Explore` treat it as read-only and may
-//! only create/edit/remove files inside the session scratch dir.
+//! the codebase, while `Plan`, `Explore` and `Review` treat it as read-only
+//! and may only create/edit/remove files inside the session scratch dir.
 
 use std::path::Path;
 
@@ -19,7 +19,7 @@ use crate::types::Mode;
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub struct ModeInfo {
     /// Mode id, as used in `POST /api/sessions` and `POST .../mode`
-    /// (`"build" | "plan" | "explore"`).
+    /// (`"build" | "plan" | "explore" | "review"`).
     pub name: &'static str,
     /// Human-readable label shown in the UI.
     pub label: &'static str,
@@ -39,7 +39,7 @@ pub struct ModeInfo {
 /// — what the worker can execute); which of those tools a *session* may use
 /// is chosen per session in the "New session" form (the `Session::tools`
 /// list) and is independent of the mode.
-pub const MODES: [ModeInfo; 3] = [
+pub const MODES: [ModeInfo; 4] = [
     ModeInfo {
         name: "build",
         label: "Build",
@@ -58,6 +58,13 @@ pub const MODES: [ModeInfo; 3] = [
         name: "explore",
         label: "Explore",
         description: "Understand the codebase and answer questions: the codebase is read-only; write notes to the session scratch dir.",
+        tools: crate::tools::TOOL_NAMES,
+        writable: "scratch only",
+    },
+    ModeInfo {
+        name: "review",
+        label: "Review",
+        description: "Review code changes and report findings: the codebase is read-only; write validation tests to the session scratch dir.",
         tools: crate::tools::TOOL_NAMES,
         writable: "scratch only",
     },
@@ -118,6 +125,36 @@ pub fn mode_change_message(mode: Mode, scratch: &Path) -> String {
              Prefer read_file; run read-only bash or bash_in_background commands when \
              helpful.\n\
              Report concise findings as your final answer.\n",
+            scratch.display()
+        ),
+        Mode::Review => format!(
+            "[Session mode changed to review]\n\n\
+             You are now in Review mode. Your job is to review code and report findings — \
+             you do not fix or modify the code.\n\
+             Scope: if the user has not explicitly said what to review, review the current \
+             changes against the main/master branch (e.g. \
+             `git diff $(git merge-base HEAD main)...`, uncommitted changes included). If \
+             the checkout is cleanly on main/master, or there is no version control, \
+             review the whole project instead. When the user names a scope (a PR, branch, \
+             file list, diff), review exactly that.\n\
+             The codebase is READ-ONLY: create/edit/remove are denied there.\n\
+             You may create, edit and remove temporary files under the session scratch \
+             directory {} (use absolute paths) to write throwaway tests or scripts that \
+             validate the correctness of what you are reviewing — never add tests or \
+             fixes to the repo itself.\n\
+             bash and bash_in_background are available but treat them as read-only (a soft \
+             restriction): use them to gather facts (git, builds, tests, greps), not to \
+             change anything.\n\
+             Never post comments to GitHub or any other code-review platform (no \
+             `gh pr review`, no review-API calls, no pushes) unless the user explicitly \
+             asks you to.\n\
+             Structure your final answer as: (1) a list of findings — each with file/line \
+             references and why it matters, focused on what can be improved; (2) a \
+             summary of the actions that should be performed; (3) a clear verdict on \
+             whether the changes are good to merge.\n\
+             If the user asks you to fix something — e.g. apply the findings you \
+             reported — call the `request_mode_change` tool with mode \"build\" to ask \
+             the user to switch this session to build mode.\n",
             scratch.display()
         ),
     }

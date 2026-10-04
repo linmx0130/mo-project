@@ -15,7 +15,7 @@
 //!   decision is remembered per `(tool, path)`, so a retry of an allowed
 //!   path runs without prompting again and a retry of a denied path is
 //!   refused outright.
-//! - **writes in `plan`/`explore` mode**: denied outright, never asked
+//! - **writes in `plan`/`explore`/`review` mode**: denied outright, never asked
 //!   about (only the session scratch dir is writable for them).
 //! - **subagents**: never ask (their journal has no UI) — a plain error
 //!   telling them to report the need to their parent agent.
@@ -71,7 +71,7 @@ pub fn read_policy(ctx: &ToolContext, raw: &str, roots: &[PathBuf]) -> Result<Pa
 pub fn write_policy(ctx: &ToolContext, tool: &str, raw: &str) -> Result<PathPolicy, String> {
     match fs::classify_write(&ctx.workdir, raw)? {
         // Inside the codebase: writable in build mode; the codebase is
-        // read-only in plan/explore (denied with a mode-aware message, as
+        // read-only in plan/explore/review (denied with a mode-aware message, as
         // before — never a permission request).
         PathClass::Allowed(resolved) => {
             if ctx.session.mode == Mode::Build {
@@ -87,7 +87,7 @@ pub fn write_policy(ctx: &ToolContext, tool: &str, raw: &str) -> Result<PathPoli
         // Outside the codebase: the session scratch dir is writable in
         // every mode (reads already carry it as an extra root). Everything
         // else asks the user in build mode and is denied outright in
-        // plan/explore.
+        // the other modes.
         PathClass::Outside(resolved) => {
             if let PathClass::Allowed(scratch_resolved) = fs::classify_write(&ctx.scratch, raw)? {
                 return Ok(PathPolicy::Run(scratch_resolved));
@@ -137,8 +137,8 @@ pub fn preflight(
             path: raw.to_string(),
             arguments: arguments.to_string(),
         }),
-        // Policy errors (missing file, plan/explore denial, remembered
-        // denial) are ordinary tool errors: execute normally so the error
+        // Policy errors (missing file, a non-Build mode denial, a
+        // remembered denial) are ordinary tool errors: execute normally so the error
         // reaches the model as a tool result.
         Err(_) => Preflight::Run,
     }

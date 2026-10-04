@@ -82,7 +82,7 @@ pub fn request_mode_change(
 /// Arguments of the `request_mode_change` tool call.
 #[derive(serde::Deserialize)]
 pub struct RequestModeChangeArgs {
-    /// The mode to switch to (`build` | `plan` | `explore`).
+    /// The mode to switch to (`build` | `plan` | `explore` | `review`).
     pub mode: String,
     /// A short message for the user explaining why the switch is needed,
     /// written in the user's language.
