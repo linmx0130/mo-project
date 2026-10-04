@@ -1074,14 +1074,14 @@ async fn spawn_worker_passes_context_window_env() {
 }
 
 #[tokio::test]
-async fn modes_endpoint_lists_the_three_modes() {
+async fn modes_endpoint_lists_the_four_modes() {
     let (_dir, app) = setup(false);
     let (status, modes) = request(&app, Method::GET, "/api/modes", None).await;
     assert_eq!(status, StatusCode::OK);
     let modes = modes.as_array().unwrap();
-    assert_eq!(modes.len(), 3);
+    assert_eq!(modes.len(), 4);
     let names: Vec<&str> = modes.iter().map(|m| m["name"].as_str().unwrap()).collect();
-    assert_eq!(names, vec!["build", "plan", "explore"]);
+    assert_eq!(names, vec!["build", "plan", "explore", "review"]);
     // The UI picker shows a description and the tool set (which now
     // includes request_mode_change and ask_user in every mode).
     for m in modes {
@@ -1142,6 +1142,21 @@ async fn create_session_accepts_and_defaults_mode() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(session["mode"], "plan");
+
+    // The review mode is part of the wire vocabulary too.
+    let (status, session) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({
+            "workdir": workdir.display().to_string(),
+            "prompt": "review it",
+            "mode": "review",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(session["mode"], "review");
 
     // Unknown mode -> 400.
     let (status, _) = request(
@@ -1204,6 +1219,19 @@ async fn switch_mode_updates_terminal_session_and_rejects_running() {
     // The new mode persists on the row (list + detail see it).
     let (_, detail) = request(&app, Method::GET, &format!("/api/sessions/{id}"), None).await;
     assert_eq!(detail["mode"], "explore");
+
+    // Switching to review works too, and persists.
+    let (status, switched) = request(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{id}/mode"),
+        Some(json!({ "mode": "review" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(switched["mode"], "review");
+    let (_, detail) = request(&app, Method::GET, &format!("/api/sessions/{id}"), None).await;
+    assert_eq!(detail["mode"], "review");
 
     // Unknown mode -> 400; unknown session -> 404.
     let (status, _) = request(

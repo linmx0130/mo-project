@@ -65,6 +65,36 @@ describe('loadDraft / saveDraft', () => {
     expect(loadDraft()).toEqual(draft)
   })
 
+  it('round-trips the review mode', () => {
+    stubStorage()
+    const draft = {
+      workdir: '/work',
+      model: 'm',
+      mode: 'review' as const,
+      bannedTools: [],
+      skills: [],
+      text: 'review the diff',
+    }
+    saveDraft(draft)
+    expect(loadDraft()).toEqual(draft)
+  })
+
+  it('falls back to build for an unknown stored mode', () => {
+    const store = stubStorage()
+    store.set(
+      'mo-new-session-draft',
+      JSON.stringify({ workdir: '/w', model: 'm', mode: 'nope', text: 'hi' }),
+    )
+    expect(loadDraft()).toEqual({
+      workdir: '/w',
+      model: 'm',
+      mode: 'build',
+      bannedTools: [],
+      skills: [],
+      text: 'hi',
+    })
+  })
+
   it('drafts saved before tool selection existed default to an empty ban list', () => {
     const store = stubStorage()
     // The pre-tool-selection draft shape: no bannedTools key at all.

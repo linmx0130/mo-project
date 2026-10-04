@@ -19,7 +19,7 @@ use crate::types::Mode;
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub struct ModeInfo {
     /// Mode id, as used in `POST /api/sessions` and `POST .../mode`
-    /// (`"build" | "plan" | "explore"`).
+    /// (`"build" | "plan" | "explore" | "review"`).
     pub name: &'static str,
     /// Human-readable label shown in the UI.
     pub label: &'static str,

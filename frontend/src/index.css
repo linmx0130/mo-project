@@ -987,6 +987,10 @@ p {
   color: var(--status-completed);
 }
 
+.mode-review {
+  color: var(--status-failed);
+}
+
 /* ---------- draft (new session placeholder) ---------- */
 
 .draft {
@@ -1597,6 +1601,10 @@ p {
 
 .badge.mode-explore {
   border: 1px solid var(--status-completed);
+}
+
+.badge.mode-review {
+  border: 1px solid var(--status-failed);
 }
 
 /* ---------- streaming ---------- */

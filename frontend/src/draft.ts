@@ -34,7 +34,10 @@ export function loadDraft(): Draft | null {
       workdir: typeof parsed.workdir === 'string' ? parsed.workdir : '',
       model: typeof parsed.model === 'string' ? parsed.model : '',
       mode:
-        parsed.mode === 'build' || parsed.mode === 'plan' || parsed.mode === 'explore'
+        parsed.mode === 'build' ||
+        parsed.mode === 'plan' ||
+        parsed.mode === 'explore' ||
+        parsed.mode === 'review'
           ? parsed.mode
           : 'build',
       // Drafts saved before tool selection existed carry no list: treat
