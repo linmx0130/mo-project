@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type {
   AskUserQuestion,
   ForkPrefill,
@@ -18,6 +18,7 @@ import {
   cancelSession,
   forkSession,
   getHistory,
+  getMessage,
   getModels,
   getSession,
   getSkills,
@@ -34,7 +35,7 @@ import Composer from './Composer'
 import PermissionCard from './PermissionCard'
 import StatusBar from './StatusBar'
 import SubagentModal from './SubagentModal'
-import { buildTimeline, isTerminal, type MessageBlock } from '../timeline'
+import { TimelineFolder, isTerminal, type MessageBlock, type TimelineItem } from '../timeline'
 import { EventRow, MessageRow, ToolBlockRow } from './Timeline'
 
 interface Props {
@@ -66,13 +67,26 @@ export default function SessionView({
   // waiting for its first message) is `pending` with no pid, so its
   // composer stays usable. Local state is updated from every mutating API
   // response; the prop keeps it in sync with the sidebar's polling. */
+  const [folder, setFolder] = useState(() => new TimelineFolder())
+  // Mirrors `folder` for the streaming effect (which must not depend on it);
+  // only ever touched from event handlers / effects, never during render.
+  const folderRef = useRef<TimelineFolder | null>(null)
   const [pid, setPid] = useState<number | null>(session.pid)
   const [prevPid, setPrevPid] = useState<number | null>(session.pid)
   if (prevPid !== session.pid) {
     setPrevPid(session.pid)
     setPid(session.pid)
   }
-  const [events, setEvents] = useState<JournalEvent[]>([])
+  // The folded timeline (`folder`, mutated in place by the incremental
+  // `applyEvent` path) is fed by the initial light history and the SSE tail
+  // alike; `version` ticks to re-render. This keeps a token-by-token stream
+  // from copying the event list and re-folding the whole history on every
+  // delta.
+  // The session id the folder was seeded for: a run re-arm (`runId` bump)
+  // reconnects the SSE tail but must not refetch/replace the history.
+  const loadedForRef = useRef<string | null>(null)
+  const [version, setVersion] = useState(0)
+  const bump = () => setVersion((v) => v + 1)
   const [error, setError] = useState<string | null>(null)
   const [cancelling, setCancelling] = useState(false)
   const [sending, setSending] = useState(false)
@@ -160,19 +174,61 @@ export default function SessionView({
     let es: EventSource | null = null
     terminalSeenRef.current = false
 
+    // One incremental path for every event: fold it into the timeline in
+    // place and tick `version` to re-render. Used by both the initial
+    // history load and the SSE tail, so the two can never disagree.
+    let activeFolder = folderRef.current
+    const ensureFolder = () => {
+      if (!activeFolder) {
+        activeFolder = new TimelineFolder()
+        folderRef.current = activeFolder
+        setFolder(activeFolder)
+      }
+      return activeFolder
+    }
+    const applyEvent = (ev: JournalEvent) => {
+      if (typeof ev.seq === 'number') lastSeqRef.current = ev.seq
+      ensureFolder().push(ev)
+      if (ev.kind.kind === 'status_change') {
+        setStatus(ev.kind.status)
+        if (isTerminal(ev.kind.status)) {
+          terminalSeenRef.current = true
+          onStatusChange()
+        }
+      }
+    }
+
     ;(async () => {
       try {
-        const [current, history] = await Promise.all([
-          getSession(session.id),
-          getHistory(session.id),
-        ])
-        if (cancelled) return
-        setStatus(current.status)
-        setPid(current.pid)
-        setEvents(history)
-        lastSeqRef.current =
-          history.length > 0 ? history[history.length - 1].seq : null
-        if (isTerminal(current.status)) terminalSeenRef.current = true
+        if (loadedForRef.current !== session.id) {
+          // First mount for this session: load the history *once*, in the
+          // light form (superseded streaming previews dropped, old
+          // messages' reasoning omitted). A run re-arm (`runId` bump) keeps
+          // this state and only reconnects the SSE tail below, so a live
+          // message is never downgraded to its light form.
+          const [current, history] = await Promise.all([
+            getSession(session.id),
+            getHistory(session.id),
+          ])
+          if (cancelled) return
+          setStatus(current.status)
+          setPid(current.pid)
+          activeFolder = null
+          folderRef.current = null
+          lastSeqRef.current = null
+          for (const ev of history) applyEvent(ev)
+          loadedForRef.current = session.id
+          if (isTerminal(current.status)) terminalSeenRef.current = true
+          setVersion((v) => v + 1)
+        } else {
+          // Re-arm: refresh the row (status/pid) only — the events the run
+          // journaled while the stream was closed are replayed by the SSE
+          // tail from the cursor, so there is nothing to refetch.
+          const current = await getSession(session.id)
+          if (cancelled) return
+          setStatus(current.status)
+          setPid(current.pid)
+        }
 
         const cursor =
           lastSeqRef.current !== null
@@ -180,16 +236,8 @@ export default function SessionView({
             : ''
         es = new EventSource(`/api/sessions/${session.id}/events${cursor}`)
         es.onmessage = (msg) => {
-          const ev = JSON.parse(msg.data) as JournalEvent
-          if (typeof ev.seq === 'number') lastSeqRef.current = ev.seq
-          setEvents((prev) => [...prev, ev])
-          if (ev.kind.kind === 'status_change') {
-            setStatus(ev.kind.status)
-            if (isTerminal(ev.kind.status)) {
-              terminalSeenRef.current = true
-              onStatusChange()
-            }
-          }
+          applyEvent(JSON.parse(msg.data) as JournalEvent)
+          setVersion((v) => v + 1)
         }
         es.onerror = () => {
           // The gateway closes the stream once the session is terminal and
@@ -344,70 +392,22 @@ export default function SessionView({
   // fork waiting for its first message, or a deferred creation), so its
   // composer stays usable.
   const running = status === 'running' || (status === 'pending' && pid !== null)
-  const timeline = buildTimeline(events)
+  const timeline = folder.items()
   // The status bar shows the latest context_usage event (the worker journals
   // one per LLM call; the last one reflects the deepest context, tool
   // outputs included). Null until the first call reports usage.
-  const contextUsage = useMemo(() => {
-    let latest: { tokens: number; context_window?: number | null } | null = null
-    for (const ev of events) {
-      if (ev.kind.kind === 'context_usage') {
-        latest = { tokens: ev.kind.tokens, context_window: ev.kind.context_window ?? null }
-      }
-    }
-    return latest
-  }, [events])
+  const contextUsage = latestContextUsage(timeline)
   // A pending mode-change request: the agent called `request_mode_change`
   // (journaled as `mode_change_request`) and the user has not answered yet.
   // Resolved by a `mode_change` (approved) or `mode_change_request_declined`
   // (rejected) event after it. While pending, the composer is frozen and the
   // Agree / Reject banner is shown instead.
-  const pendingRequest = useMemo(() => {
-    let lastRequest: { mode: Mode; message: string; seq: number } | null = null
-    let lastResolutionSeq: number | null = null
-    for (const ev of events) {
-      if (ev.kind.kind === 'mode_change_request') {
-        lastRequest = {
-          mode: ev.kind.mode,
-          message: ev.kind.message,
-          seq: ev.seq ?? -1,
-        }
-      } else if (
-        ev.kind.kind === 'mode_change' ||
-        ev.kind.kind === 'mode_change_request_declined'
-      ) {
-        lastResolutionSeq = ev.seq ?? -1
-      }
-    }
-    if (!lastRequest) return null
-    if (lastResolutionSeq !== null && lastResolutionSeq > lastRequest.seq) {
-      return null
-    }
-    return lastRequest
-  }, [events])
+  const pendingRequest = pendingModeRequest(timeline)
   // A pending clarification question: the agent called `ask_user` (journaled
   // as `ask_user_request`) and the user has not answered yet. Resolved by an
   // `ask_user_answered` event after it. While pending, the composer is frozen
   // and the question card (every option plus a free-text input) is shown.
-  const pendingQuestion = useMemo(() => {
-    let lastQuestion: { question: AskUserQuestion; seq: number } | null = null
-    let lastAnswerSeq: number | null = null
-    for (const ev of events) {
-      if (ev.kind.kind === 'ask_user_request') {
-        lastQuestion = {
-          question: ev.kind.question,
-          seq: ev.seq ?? -1,
-        }
-      } else if (ev.kind.kind === 'ask_user_answered') {
-        lastAnswerSeq = ev.seq ?? -1
-      }
-    }
-    if (!lastQuestion) return null
-    if (lastAnswerSeq !== null && lastAnswerSeq > lastQuestion.seq) {
-      return null
-    }
-    return lastQuestion
-  }, [events])
+  const pendingQuestion = pendingAskUser(timeline)
   // A pending file-access permission request: file tools asked to read or
   // write paths outside the auto-allowed roots (journaled as a batched
   // `permission_request` with one item per held call) and the user has not
@@ -415,38 +415,7 @@ export default function SessionView({
   // pending, the composer is frozen and the Allow / Deny card is shown
   // instead. Legacy single-item requests (pre-batch journals) are treated
   // as a one-item batch.
-  const pendingPermission = useMemo(() => {
-    let lastRequest: {
-      request_id: string
-      items: PermissionRequestItem[]
-      legacy?: { tool: string; operation: string; path: string }
-      seq: number
-    } | null = null
-    let lastAnswerSeq: number | null = null
-    for (const ev of events) {
-      if (ev.kind.kind === 'permission_request') {
-        const kind = ev.kind
-        lastRequest = {
-          request_id: kind.request_id,
-          items: kind.items ?? [],
-          legacy:
-            kind.tool !== undefined &&
-            kind.operation !== undefined &&
-            kind.path !== undefined
-              ? { tool: kind.tool, operation: kind.operation, path: kind.path }
-              : undefined,
-          seq: ev.seq ?? -1,
-        }
-      } else if (ev.kind.kind === 'permission_answered') {
-        lastAnswerSeq = ev.seq ?? -1
-      }
-    }
-    if (!lastRequest) return null
-    if (lastAnswerSeq !== null && lastAnswerSeq > lastRequest.seq) {
-      return null
-    }
-    return lastRequest
-  }, [events])
+  const pendingPermission = pendingPermissionRequest(timeline)
   // While any tool is still streaming, re-render once per second so the
   // elapsed badge ticks; stop when everything settles.
   const anyToolStreaming = timeline.some(
@@ -465,7 +434,19 @@ export default function SessionView({
     if (el && stickToBottomRef.current) {
       el.scrollTop = el.scrollHeight
     }
-  }, [events, now])
+  }, [version, now])
+
+  /** Load one light-history message's reasoning on demand (the history
+   *  load omits it) and patch the folded block in place, so the text renders
+   *  inside the already-open details element. */
+  const loadReasoning = async (seq: number): Promise<string | null> => {
+    const ev = await getMessage(session.id, seq)
+    const full =
+      ev.kind.kind === 'message' ? (ev.kind.reasoning_content ?? '') : ''
+    folder.patchMessage(seq, { reasoning_content: full })
+    bump()
+    return full
+  }
 
   /** Approve the pending mode-change request: the backend switches the
    *  session's mode to the requested one and continues the run with a
@@ -475,8 +456,8 @@ export default function SessionView({
     try {
       const updated = await approveModeChange(session.id)
       applySession(updated)
-      // Re-arm the SSE stream (the run continues in the new mode); the
-      // effect also refetches the history, which now resolves the request.
+      // Re-arm the SSE tail (the run continues in the new mode); it replays
+      // the journaled response events, which resolve the request.
       setRunId((r) => r + 1)
       onStatusChange()
     } catch (err) {
@@ -494,8 +475,8 @@ export default function SessionView({
     try {
       const updated = await rejectModeChange(session.id)
       applySession(updated)
-      // Re-arm the SSE stream / refetch history so the declined marker
-      // lands in the timeline and the request stops being pending.
+      // Re-arm the SSE tail so the declined marker lands in the timeline
+      // and the request stops being pending.
       setRunId((r) => r + 1)
       onStatusChange()
     } catch (err) {
@@ -513,8 +494,8 @@ export default function SessionView({
     try {
       const updated = await answerAskUser(session.id, answers)
       applySession(updated)
-      // Re-arm the SSE stream (the run continues with the answer); the
-      // effect also refetches the history, which now resolves the request.
+      // Re-arm the SSE tail (the run continues with the answer); it replays
+      // the journaled answer event, which resolves the request.
       setRunId((r) => r + 1)
       onStatusChange()
     } catch (err) {
@@ -542,8 +523,8 @@ export default function SessionView({
         typeof decisions === 'boolean' ? { allowed: decisions } : { decisions },
       )
       applySession(updated)
-      // Re-arm the SSE stream (the run continues with the decisions); the
-      // effect also refetches the history, which now resolves the request.
+      // Re-arm the SSE tail (the run continues with the decisions); it
+      // replays the journaled answer event, which resolves the request.
       setRunId((r) => r + 1)
       onStatusChange()
     } catch (err) {
@@ -592,6 +573,7 @@ export default function SessionView({
                   sessionId={session.id}
                   onFork={(message) => void handleFork(message)}
                   forkingSeq={forkingSeq}
+                  onLoadReasoning={(seq) => loadReasoning(seq)}
                 />
               )
             case 'tool':
@@ -743,4 +725,116 @@ function ModeChangeRequestBanner({
       </div>
     </div>
   )
+}
+
+/** The latest `context_usage` event in the folded timeline (the status bar
+ *  shows it against the model's context window). Null until the first call
+ *  reports usage. */
+function latestContextUsage(items: TimelineItem[]) {
+  let latest: { tokens: number; context_window?: number | null } | null = null
+  for (const item of items) {
+    if (item.type !== 'event') continue
+    const ev = item.event
+    if (ev.kind.kind === 'context_usage') {
+      latest = {
+        tokens: ev.kind.tokens,
+        context_window: ev.kind.context_window ?? null,
+      }
+    }
+  }
+  return latest
+}
+
+/** The pending mode-change request, if any: the agent called
+ *  `request_mode_change` (journaled as `mode_change_request`) and the user
+ *  has not answered yet — resolved by a `mode_change` (approved) or a
+ *  `mode_change_request_declined` (rejected) event after it. */
+function pendingModeRequest(items: TimelineItem[]) {
+  let lastRequest: { mode: Mode; message: string; seq: number } | null = null
+  let lastResolutionSeq: number | null = null
+  for (const item of items) {
+    if (item.type !== 'event') continue
+    const ev = item.event
+    if (ev.kind.kind === 'mode_change_request') {
+      lastRequest = {
+        mode: ev.kind.mode,
+        message: ev.kind.message,
+        seq: ev.seq ?? -1,
+      }
+    } else if (
+      ev.kind.kind === 'mode_change' ||
+      ev.kind.kind === 'mode_change_request_declined'
+    ) {
+      lastResolutionSeq = ev.seq ?? -1
+    }
+  }
+  if (!lastRequest) return null
+  if (lastResolutionSeq !== null && lastResolutionSeq > lastRequest.seq) {
+    return null
+  }
+  return lastRequest
+}
+
+/** The pending clarification question, if any: the agent called `ask_user`
+ *  (journaled as `ask_user_request`) and the user has not answered yet —
+ *  resolved by an `ask_user_answered` event after it. */
+function pendingAskUser(items: TimelineItem[]) {
+  let lastQuestion: { question: AskUserQuestion; seq: number } | null = null
+  let lastAnswerSeq: number | null = null
+  for (const item of items) {
+    if (item.type !== 'event') continue
+    const ev = item.event
+    if (ev.kind.kind === 'ask_user_request') {
+      lastQuestion = {
+        question: ev.kind.question,
+        seq: ev.seq ?? -1,
+      }
+    } else if (ev.kind.kind === 'ask_user_answered') {
+      lastAnswerSeq = ev.seq ?? -1
+    }
+  }
+  if (!lastQuestion) return null
+  if (lastAnswerSeq !== null && lastAnswerSeq > lastQuestion.seq) {
+    return null
+  }
+  return lastQuestion
+}
+
+/** The pending file-access permission request, if any (a batched
+ *  `permission_request` with one item per held call; legacy single-item
+ *  requests are treated as a one-item batch), resolved by a
+ *  `permission_answered` event after it. */
+function pendingPermissionRequest(items: TimelineItem[]) {
+  let lastRequest: {
+    request_id: string
+    items: PermissionRequestItem[]
+    legacy?: { tool: string; operation: string; path: string }
+    seq: number
+  } | null = null
+  let lastAnswerSeq: number | null = null
+  for (const item of items) {
+    if (item.type !== 'event') continue
+    const ev = item.event
+    if (ev.kind.kind === 'permission_request') {
+      const kind = ev.kind
+      lastRequest = {
+        request_id: kind.request_id,
+        items: kind.items ?? [],
+        legacy:
+          kind.tool !== undefined &&
+          kind.operation !== undefined &&
+          kind.path !== undefined
+            ? { tool: kind.tool, operation: kind.operation, path: kind.path }
+            : undefined,
+        seq: ev.seq ?? -1,
+      }
+    } else if (ev.kind.kind === 'permission_answered') {
+      lastAnswerSeq = ev.seq ?? -1
+    }
+  }
+  if (!lastRequest) return null
+  if (lastAnswerSeq !== null && lastAnswerSeq > lastRequest.seq) {
+    return null
+  }
+  return lastRequest
 }

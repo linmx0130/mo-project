@@ -382,7 +382,17 @@ tail forwards them as they land, and the frontend appends them to the
 in-flight message / tool block with a blinking caret and a `running` badge.
 When the turn completes, the worker journals the final
 `message`/`tool_result` events, and the frontend swaps the delta-built
-preview for the canonical, complete text. Delta events are skipped when the
+preview for the canonical, complete text.
+
+History loads are slimmed down for long sessions: `GET .../history` serves a
+*light* form by default (`detail=full` opts out) that drops superseded
+streaming previews and omits old messages' `reasoning_content` (marked
+`reasoning_omitted`), so opening a long chat is fast and light on client
+memory. Reasoning is only ever "live" while it streams — SSE events are never
+slimmed — and an old message's reasoning is loaded on demand via
+`GET /api/sessions/:id/messages/:seq` when its block is expanded. The
+frontend folds new events into the already-loaded history incrementally, so
+continuing a session never refetches (and never downgrades) it. Delta events are skipped when the
 worker rebuilds chat history from the journal, so the model context stays
 clean.
 

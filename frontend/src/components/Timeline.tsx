@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { imageUrl } from '../api'
@@ -171,6 +172,7 @@ export function MessageRow({
   sessionId,
   onFork,
   forkingSeq = null,
+  onLoadReasoning,
 }: {
   message: MessageBlock
   /** The session the message belongs to, for rendering attached images
@@ -184,6 +186,10 @@ export function MessageRow({
   /** The seq of the message whose fork request is in flight: that row shows
    *  "Creating…" and every fork button is disabled until it settles. */
   forkingSeq?: number | null
+  /** Load a light-history message's reasoning on demand (the history
+   *  endpoint omits it and marks the message `reasoning_omitted`); the
+   *  caller patches the message block with the loaded text. */
+  onLoadReasoning?: (seq: number) => Promise<string | null>
 }) {
   const role = message.role
   if (role === 'tool') {
@@ -282,14 +288,20 @@ export function MessageRow({
           <CopyButton content={message.content} disabled={message.streaming} />
         )}
       </div>
-      {message.reasoning_content && (
-        // While reasoning is streaming, force the block open so the tokens
-        // are visible as they arrive; once the run settles the `open` prop
-        // is removed and the details stay in whatever state the user left.
-        <details className="reasoning" open={message.streaming || undefined}>
-          <summary>reasoning</summary>
-          <pre>{message.reasoning_content}</pre>
-        </details>
+      {message.reasoning_omitted ? (
+        // A light-history message: the reasoning was omitted from the
+        // history load and is fetched the first time the block is expanded.
+        <LazyReasoning message={message} onLoad={onLoadReasoning} />
+      ) : (
+        message.reasoning_content && (
+          // While reasoning is streaming, force the block open so the tokens
+          // are visible as they arrive; once the run settles the `open` prop
+          // is removed and the details stay in whatever state the user left.
+          <details className="reasoning" open={message.streaming || undefined}>
+            <summary>reasoning</summary>
+            <pre>{message.reasoning_content}</pre>
+          </details>
+        )
       )}
       {message.content && (
         <div className="msg-content markdown">
@@ -309,6 +321,51 @@ export function MessageRow({
         <span className="stream-cursor" aria-hidden="true" />
       )}
     </div>
+  )
+}
+
+/** A light-history message's reasoning, loaded from
+ *  `GET /api/sessions/:id/messages/:seq` the first time the block is
+ *  expanded. The message stays `reasoning_omitted` after hydration (the
+ *  caller only patches `reasoning_content`), so the details element stays
+ *  mounted — and open — while the text appears. */
+function LazyReasoning({
+  message,
+  onLoad,
+}: {
+  message: MessageBlock
+  onLoad?: (seq: number) => Promise<string | null>
+}) {
+  const seq = message.seq
+  const [loading, setLoading] = useState(false)
+  const [failed, setFailed] = useState(false)
+  const [empty, setEmpty] = useState(false)
+  const load = () => {
+    if (loading || failed || empty || message.reasoning_content) return
+    if (!onLoad || typeof seq !== 'number') return
+    setLoading(true)
+    onLoad(seq)
+      .then((text) => {
+        if (!text) setEmpty(true)
+      })
+      .catch(() => setFailed(true))
+      .finally(() => setLoading(false))
+  }
+  return (
+    <details
+      className="reasoning"
+      onToggle={(e) => {
+        if ((e.target as HTMLDetailsElement).open) load()
+      }}
+    >
+      <summary>
+        {message.reasoning_content ? 'reasoning' : 'reasoning (click to load)'}
+      </summary>
+      {loading && <span className="muted">loading…</span>}
+      {failed && <span className="muted">failed to load reasoning</span>}
+      {empty && <span className="muted">(no reasoning)</span>}
+      {message.reasoning_content && <pre>{message.reasoning_content}</pre>}
+    </details>
   )
 }
 

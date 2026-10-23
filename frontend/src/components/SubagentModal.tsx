@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { JournalEvent, Mode, Session, SessionStatus } from '../api'
-import { getHistory, getSession } from '../api'
-import { buildTimeline, isTerminal } from '../timeline'
+import { getHistory, getMessage, getSession } from '../api'
+import { TimelineFolder, isTerminal } from '../timeline'
 import { EventRow, MessageRow, ToolBlockRow } from './Timeline'
 
 interface Props {
@@ -21,7 +21,11 @@ interface Props {
  */
 export default function SubagentModal({ childId, onClose }: Props) {
   const [session, setSession] = useState<Session | null>(null)
-  const [events, setEvents] = useState<JournalEvent[]>([])
+  // Incremental fold state (same pattern as the session view): the light
+  // history seeds the folder once, the SSE tail folds into it in place.
+  // The folder lives in state because it is read during render.
+  const [folder, setFolder] = useState(() => new TimelineFolder())
+  const [version, setVersion] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [now, setNow] = useState(() => Date.now())
   const lastSeqRef = useRef<number | null>(null)
@@ -33,18 +37,43 @@ export default function SubagentModal({ childId, onClose }: Props) {
     let es: EventSource | null = null
     terminalSeenRef.current = false
 
+    // The folder is created lazily on the first event (never synchronously
+    // in the effect body): a child switch re-runs the effect with a fresh
+    // closure and therefore a fresh folder.
+    let activeFolder: TimelineFolder | null = null
+    const ensureFolder = () => {
+      if (!activeFolder) {
+        activeFolder = new TimelineFolder()
+        setFolder(activeFolder)
+      }
+      return activeFolder
+    }
+    const applyEvent = (ev: JournalEvent) => {
+      if (typeof ev.seq === 'number') lastSeqRef.current = ev.seq
+      ensureFolder().push(ev)
+      if (ev.kind.kind === 'status_change') {
+        const newStatus = ev.kind.status
+        const newError = ev.kind.error ?? null
+        setSession((prev) =>
+          prev ? { ...prev, status: newStatus, error: newError } : prev,
+        )
+        if (isTerminal(newStatus)) terminalSeenRef.current = true
+      }
+    }
+
     ;(async () => {
       try {
+        // The light history (superseded previews dropped, old reasoning
+        // omitted — expandable per message via `getMessage`).
         const [current, history] = await Promise.all([
           getSession(childId),
           getHistory(childId),
         ])
         if (cancelled) return
         setSession(current)
-        setEvents(history)
-        lastSeqRef.current =
-          history.length > 0 ? history[history.length - 1].seq : null
+        for (const ev of history) applyEvent(ev)
         if (isTerminal(current.status)) terminalSeenRef.current = true
+        setVersion((v) => v + 1)
 
         const cursor =
           lastSeqRef.current !== null
@@ -52,17 +81,8 @@ export default function SubagentModal({ childId, onClose }: Props) {
             : ''
         es = new EventSource(`/api/sessions/${childId}/events${cursor}`)
         es.onmessage = (msg) => {
-          const ev = JSON.parse(msg.data) as JournalEvent
-          if (typeof ev.seq === 'number') lastSeqRef.current = ev.seq
-          setEvents((prev) => [...prev, ev])
-          if (ev.kind.kind === 'status_change') {
-            const newStatus = ev.kind.status
-            const newError = ev.kind.error ?? null
-            setSession((prev) =>
-              prev ? { ...prev, status: newStatus, error: newError } : prev,
-            )
-            if (isTerminal(newStatus)) terminalSeenRef.current = true
-          }
+          applyEvent(JSON.parse(msg.data) as JournalEvent)
+          setVersion((v) => v + 1)
         }
         es.onerror = () => {
           // The gateway closes the stream once the session is terminal and
@@ -95,9 +115,19 @@ export default function SubagentModal({ childId, onClose }: Props) {
   useEffect(() => {
     const el = timelineRef.current
     if (el) el.scrollTop = el.scrollHeight
-  }, [events])
+  }, [version])
 
-  const timeline = buildTimeline(events)
+  const timeline = folder.items()
+
+  /** Load one light-history message's reasoning on demand. */
+  const loadReasoning = async (seq: number): Promise<string | null> => {
+    const ev = await getMessage(childId, seq)
+    const full =
+      ev.kind.kind === 'message' ? (ev.kind.reasoning_content ?? '') : ''
+    folder.patchMessage(seq, { reasoning_content: full })
+    setVersion((v) => v + 1)
+    return full
+  }
   const anyToolStreaming = timeline.some(
     (item) => item.type === 'tool' && item.block.streaming,
   )
@@ -145,7 +175,13 @@ export default function SubagentModal({ childId, onClose }: Props) {
           {timeline.map((item, i) => {
             switch (item.type) {
               case 'message':
-                return <MessageRow key={`msg-${i}`} message={item.message} />
+                return (
+                  <MessageRow
+                    key={`msg-${i}`}
+                    message={item.message}
+                    onLoadReasoning={(seq) => loadReasoning(seq)}
+                  />
+                )
               case 'tool':
                 return (
                   <ToolBlockRow

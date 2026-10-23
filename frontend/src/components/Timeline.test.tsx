@@ -127,3 +127,52 @@ describe('ToolBlockRow — copy affordance', () => {
     expect(html).not.toContain('copy-btn')
   })
 })
+
+describe('MessageRow — lazy reasoning (light history)', () => {
+  const onLoad = async () => 'deep thoughts'
+
+  it('shows a click-to-load affordance instead of the omitted reasoning', () => {
+    const html = renderToStaticMarkup(
+      <MessageRow
+        message={{ role: 'assistant', content: 'ok', seq: 9, reasoning_omitted: true }}
+        onLoadReasoning={onLoad}
+      />,
+    )
+    expect(html).toContain('reasoning (click to load)')
+    expect(html).not.toContain('deep thoughts')
+  })
+
+  it('renders the loaded reasoning once hydrated (flag cleared)', () => {
+    const html = renderToStaticMarkup(
+      <MessageRow
+        message={{
+          role: 'assistant',
+          content: 'ok',
+          seq: 9,
+          reasoning_omitted: true,
+          reasoning_content: 'deep thoughts',
+        }}
+        onLoadReasoning={onLoad}
+      />,
+    )
+    expect(html).toContain('deep thoughts')
+    expect(html).not.toContain('click to load')
+  })
+
+  it('renders streamed reasoning without any loading affordance', () => {
+    const html = renderToStaticMarkup(
+      <MessageRow
+        message={{
+          role: 'assistant',
+          content: 'ok',
+          seq: 9,
+          reasoning_content: 'live thinking',
+          streaming: true,
+        }}
+        onLoadReasoning={onLoad}
+      />,
+    )
+    expect(html).toContain('live thinking')
+    expect(html).not.toContain('click to load')
+  })
+})
