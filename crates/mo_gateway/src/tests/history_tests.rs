@@ -131,3 +131,49 @@ fn empty_reasoning_gets_no_flag_and_plain_messages_are_verbatim() {
     assert!(light[1]["kind"].get("reasoning_omitted").is_none());
     assert_eq!(light[1]["kind"]["reasoning_content"], json!(""));
 }
+
+#[test]
+fn long_tool_output_is_slimmed_to_a_preview() {
+    let long = "x".repeat(TOOL_OUTPUT_LAZY_THRESHOLD + 10);
+    let light = light_history(vec![ev(0, tool_result("c1", &long))]);
+    let kind = &light[0]["kind"];
+    assert_eq!(
+        kind["output"].as_str().unwrap().chars().count(),
+        TOOL_OUTPUT_PREVIEW
+    );
+    assert_eq!(kind["output_omitted"], json!(true));
+    assert_eq!(kind["output_chars"], json!(TOOL_OUTPUT_LAZY_THRESHOLD + 10));
+    // The rest of the event is untouched.
+    assert_eq!(kind["kind"], json!("tool_result"));
+    assert_eq!(kind["ok"], json!(true));
+}
+
+#[test]
+fn short_tool_output_is_verbatim() {
+    let light = light_history(vec![ev(0, tool_result("c1", "exit code: 0"))]);
+    assert_eq!(light[0]["kind"]["output"], json!("exit code: 0"));
+    assert!(light[0]["kind"].get("output_omitted").is_none());
+    assert!(light[0]["kind"].get("output_chars").is_none());
+}
+
+#[test]
+fn output_at_the_threshold_is_verbatim() {
+    let at_limit = "y".repeat(TOOL_OUTPUT_LAZY_THRESHOLD);
+    let light = light_history(vec![ev(0, tool_result("c1", &at_limit))]);
+    assert_eq!(light[0]["kind"]["output"], json!(at_limit));
+    assert!(light[0]["kind"].get("output_omitted").is_none());
+}
+
+#[test]
+fn preview_cuts_on_char_boundaries() {
+    // Multibyte chars: a byte-wise cut would split a codepoint.
+    let long = "é".repeat(TOOL_OUTPUT_LAZY_THRESHOLD + 5);
+    let light = light_history(vec![ev(0, tool_result("c1", &long))]);
+    let preview = light[0]["kind"]["output"].as_str().unwrap();
+    assert_eq!(preview.chars().count(), TOOL_OUTPUT_PREVIEW);
+    assert!(preview.chars().all(|c| c == 'é'));
+    assert_eq!(
+        light[0]["kind"]["output_chars"],
+        json!(TOOL_OUTPUT_LAZY_THRESHOLD + 5)
+    );
+}
