@@ -14,7 +14,7 @@ pub use config::{
 };
 pub use db::{DbError, open as open_db};
 pub use journal::{
-    JournalError, JournalWriter, copy_events_before, read_events, read_events_after,
+    JournalError, JournalWriter, copy_events_before, read_event_at, read_events, read_events_after,
     read_events_tail,
 };
 pub use modes::{

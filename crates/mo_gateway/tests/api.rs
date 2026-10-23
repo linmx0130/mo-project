@@ -1786,3 +1786,181 @@ async fn fork_from_an_old_message_copies_history_and_accepts_the_edit() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+/// The history endpoint serves the *light* form by default: superseded
+/// streaming previews are dropped and finalized assistant messages lose
+/// `reasoning_content` (marked `reasoning_omitted`). `detail=full` restores
+/// the complete events; an unknown detail is a 400.
+#[tokio::test]
+async fn history_is_light_by_default() {
+    let (_dir, app) = setup(false);
+    let workdir = _dir.path().join("work");
+    let (_, session) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({ "workdir": workdir.display().to_string(), "prompt": "hi" })),
+    )
+    .await;
+    let id = session["id"].as_str().unwrap().to_string();
+    let journal_path = session["journal_path"].as_str().unwrap().to_string();
+
+    let mut journal = JournalWriter::open(Path::new(&journal_path)).unwrap();
+    // seq 0 is the user message the gateway journals at creation.
+    journal
+        .append(JournalEventKind::MessageDelta {
+            content: "he".into(),
+            reasoning_content: Some("thin".into()),
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::MessageDelta {
+            content: "llo".into(),
+            reasoning_content: Some("king".into()),
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::Message(mo_core::JournalMessage {
+            role: "assistant".into(),
+            content: "hello".into(),
+            reasoning_content: Some("thinking".into()),
+            tool_call_id: None,
+            tool_calls: None,
+            images: vec![],
+        }))
+        .unwrap();
+    journal
+        .append(JournalEventKind::Message(mo_core::JournalMessage {
+            role: "user".into(),
+            content: "next".into(),
+            reasoning_content: None,
+            tool_call_id: None,
+            tool_calls: None,
+            images: vec![],
+        }))
+        .unwrap();
+    drop(journal);
+
+    // Default (no `detail`): light.
+    let (status, light) = request(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{id}/history"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let light = light.as_array().unwrap();
+    let kinds: Vec<&str> = light
+        .iter()
+        .map(|e| e["kind"]["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["message", "message", "message"], "{light:?}");
+    assert_eq!(light[1]["kind"]["reasoning_omitted"], json!(true));
+    assert!(light[1]["kind"].get("reasoning_content").is_none());
+
+    // `detail=light` is the same as the default.
+    let (status, explicit) = request(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{id}/history?detail=light"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(explicit, json!(light));
+
+    // `detail=full`: the complete events, deltas and reasoning included.
+    let (status, full) = request(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{id}/history?detail=full"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let full = full.as_array().unwrap();
+    assert_eq!(full.len(), 5, "{full:?}");
+    assert_eq!(full[3]["kind"]["reasoning_content"], json!("thinking"));
+
+    // Unknown detail values are rejected.
+    let (status, body) = request(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{id}/history?detail=bogus"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// `GET /api/sessions/:id/messages/:seq` serves one complete message
+/// (reasoning included) for lazy hydration; anything else is a 404.
+#[tokio::test]
+async fn message_at_serves_the_complete_message() {
+    let (_dir, app) = setup(false);
+    let workdir = _dir.path().join("work");
+    let (_, session) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({ "workdir": workdir.display().to_string(), "prompt": "hi" })),
+    )
+    .await;
+    let id = session["id"].as_str().unwrap().to_string();
+    let journal_path = session["journal_path"].as_str().unwrap().to_string();
+
+    let mut journal = JournalWriter::open(Path::new(&journal_path)).unwrap();
+    journal
+        .append(JournalEventKind::MessageDelta {
+            content: "he".into(),
+            reasoning_content: Some("thin".into()),
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::Message(mo_core::JournalMessage {
+            role: "assistant".into(),
+            content: "hello".into(),
+            reasoning_content: Some("thinking".into()),
+            tool_call_id: None,
+            tool_calls: None,
+            images: vec![],
+        }))
+        .unwrap();
+    drop(journal);
+
+    // seq 2 is the assistant message (seq 0 is the gateway-journaled user
+    // message, seq 1 the delta): served complete.
+    let (status, message) = request(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{id}/messages/2"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(message["kind"]["kind"], "message");
+    assert_eq!(message["kind"]["reasoning_content"], json!("thinking"));
+
+    // seq 1 is a delta (not a message): 404.
+    let (status, _) = request(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{id}/messages/1"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Unknown seqs and sessions are 404s too.
+    let (status, _) = request(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{id}/messages/99"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = request(&app, Method::GET, "/api/sessions/unknown/messages/1", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
