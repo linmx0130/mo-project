@@ -386,15 +386,18 @@ preview for the canonical, complete text.
 
 History loads are slimmed down for long sessions: `GET .../history` serves a
 *light* form by default (`detail=full` opts out) that drops superseded
-streaming previews and omits old messages' `reasoning_content` (marked
-`reasoning_omitted`), so opening a long chat is fast and light on client
-memory. Reasoning is only ever "live" while it streams — SSE events are never
-slimmed — and an old message's reasoning is loaded on demand via
-`GET /api/sessions/:id/messages/:seq` when its block is expanded. The
-frontend folds new events into the already-loaded history incrementally, so
-continuing a session never refetches (and never downgrades) it. Delta events are skipped when the
-worker rebuilds chat history from the journal, so the model context stays
-clean.
+streaming previews, omits old messages' `reasoning_content` (marked
+`reasoning_omitted`) and trims a `tool_result` output longer than 4 000
+characters to a 1 000-character preview (marked `output_omitted`, with
+`output_chars`), so opening a long chat is fast and light on client memory.
+Reasoning and tool output are only ever "live" while they stream — SSE
+events are never slimmed — and both are loaded on demand via
+`GET /api/sessions/:id/history/:seq` (the complete journal event) when the
+message's reasoning block or the tool block is expanded. The frontend folds
+new events into the already-loaded history incrementally, so continuing a
+session never refetches (and never downgrades) it. Delta events are skipped
+when the worker rebuilds chat history from the journal, so the model context
+stays clean.
 
 **Parallel tool calls.** Tool calls in a single assistant message run
 *concurrently*, bounded by `max_tool_concurrency` (`mo.toml`, default 8).
@@ -626,8 +629,8 @@ the model):
 | `GET /api/sessions/:id` | detail; liveness check flips dead workers to `failed` |
 | `PATCH /api/sessions/:id` `{prompt}` | rename the session (the `prompt` column doubles as the title): trims, rejects an empty title (400), caps at 256 characters (not bytes); allowed in any status — the title is display-only metadata |
 | `POST /api/sessions/:id/title/regenerate` | ask the model for a new title from the session's first user message. The handler waits (bounded, ~50s) for generation: `200 {title}` carries the finished title (possibly identical to the old one — a completed result, not a pending one) **without persisting it** — the client reviews it and saves via `PATCH`; when the model returned nothing usable, `title` is the current title; `500` on LLM failure; `202 {title: null}` when generation outlasts the wait (the title is then stored asynchronously and shows up in `GET /api/sessions` polling). Requires a user message in the journal (400 otherwise) |
-| `GET /api/sessions/:id/history?after_seq=N&detail=light\|full` | journal events after `N`. **Light by default** (absent or `detail=light`): a slim form for long histories — superseded `message_delta`/`tool_output_delta` previews are dropped and finalized assistant messages have their `reasoning_content` replaced by `reasoning_omitted: true` (fetch it per message via `GET .../messages/:seq`; the currently streaming delta run is kept complete). `detail=full` = the complete events (opt-in) |
-| `GET /api/sessions/:id/messages/:seq` | the complete `message` journal event at `seq` (reasoning included) — lazy hydration for a light-history message (404 for unknown sessions, unknown seqs, non-message events) |
+| `GET /api/sessions/:id/history?after_seq=N&detail=light\|full` | journal events after `N`. **Light by default** (absent or `detail=light`): a slim form for long histories — superseded `message_delta`/`tool_output_delta` previews are dropped, finalized assistant messages have their `reasoning_content` replaced by `reasoning_omitted: true`, and a `tool_result` output longer than 4 000 chars is replaced by a 1 000-char preview with `output_omitted: true` + `output_chars` (both are fetched per event via `GET .../history/:seq`; a currently streaming delta run is kept complete). `detail=full` = the complete events (opt-in) |
+| `GET /api/sessions/:id/history/:seq` | the complete journal event at `seq` — any kind: a `message` with its reasoning, a `tool_result` with its full output, … — lazy hydration for a light-history row (404 for unknown sessions and seqs) |
 | `GET /api/sessions/:id/events` | SSE tail: new events + synthesized status changes |
 | `POST /api/sessions/:id/messages` `{content, images?}` | continue a terminal session: journal the user message (preceded by a `mode_change` notice when the mode was switched since the last run and/or a `model_change` notice when the model was), reset to `pending`, respawn the worker. `images` (optional) lists attached images as `[{path, mime}]` — `path` must be a path returned by `POST /api/sessions/:id/images`; the worker rebuilds them into base64 `image_url` parts for the LLM. Also accepts the first message of a `defer_spawn` session (a never-started pending session with no worker) |
 | `POST /api/sessions/:id/fork` `{until_seq}` | start a **new session** from one of this session's user messages: the new session's journal is a copy of the source's events *before* the event at `until_seq` (re-sequenced from 0, the journaled `system_prompt` is skipped so the fork rebuilds its own, and the source's `images/` folder is copied with the filenames preserved). It inherits the source's workdir, model, mode, tools and skills, its title is the source title plus `" (fork)"`, and it is created `pending` with **no worker and no title generation** — a `defer_spawn`-shaped session that `POST /api/sessions/:id/messages` (the edited message) starts. `until_seq` must name a user `message` event (400 otherwise); unknown session → 404. Used by the timeline's "New session from here" button |

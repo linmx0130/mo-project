@@ -55,7 +55,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/history", get(history))
         .route("/api/sessions/{id}/events", get(sse::events))
         .route("/api/sessions/{id}/messages", post(send_message))
-        .route("/api/sessions/{id}/messages/{seq}", get(message_at))
+        .route("/api/sessions/{id}/history/{seq}", get(event_at))
         .route("/api/sessions/{id}/fork", post(fork_session))
         .route("/api/sessions/{id}/skills/load", post(load_skill))
         .route("/api/sessions/{id}/mode", post(switch_mode))
@@ -1706,11 +1706,11 @@ async fn history(
     Ok(Json(body))
 }
 
-/// GET /api/sessions/:id/messages/:seq — the complete `message` event at
-/// `seq` (reasoning included), for the UI's lazy "reasoning" hydration of a
-/// light-history message. 404 for unknown sessions, unknown seqs and seqs
-/// that hold any other event kind.
-async fn message_at(
+/// GET /api/sessions/:id/history/:seq — the complete journal event at `seq`
+/// (any kind: a `message` with its reasoning, a `tool_result` with its full
+/// output, …), for the UI's lazy hydration of the light history. 404 for
+/// unknown sessions and unknown seqs.
+async fn event_at(
     State(state): State<Arc<AppState>>,
     PathParam((id, seq)): PathParam<(String, u64)>,
 ) -> ApiResult<Json<JournalEvent>> {
@@ -1722,8 +1722,8 @@ async fn message_at(
         }
     };
     match mo_core::read_event_at(Path::new(&journal_path), seq).map_err(ApiError::internal)? {
-        Some(event) if matches!(event.kind, JournalEventKind::Message(_)) => Ok(Json(event)),
-        _ => Err(ApiError::not_found("message not found")),
+        Some(event) => Ok(Json(event)),
+        None => Err(ApiError::not_found("event not found")),
     }
 }
 

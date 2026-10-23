@@ -1839,6 +1839,16 @@ async fn history_is_light_by_default() {
             images: vec![],
         }))
         .unwrap();
+    // A long tool output is trimmed to a preview in the light form.
+    let big_output = "line\n".repeat(2_000);
+    journal
+        .append(JournalEventKind::ToolResult {
+            id: "c9".into(),
+            name: "bash".into(),
+            ok: true,
+            output: big_output.clone(),
+        })
+        .unwrap();
     drop(journal);
 
     // Default (no `detail`): light.
@@ -1855,9 +1865,20 @@ async fn history_is_light_by_default() {
         .iter()
         .map(|e| e["kind"]["kind"].as_str().unwrap())
         .collect();
-    assert_eq!(kinds, ["message", "message", "message"], "{light:?}");
+    assert_eq!(
+        kinds,
+        ["message", "message", "message", "tool_result"],
+        "{light:?}"
+    );
     assert_eq!(light[1]["kind"]["reasoning_omitted"], json!(true));
     assert!(light[1]["kind"].get("reasoning_content").is_none());
+    // The long tool output is served as a bounded preview.
+    let slim = &light[3]["kind"];
+    assert_eq!(slim["output_omitted"], json!(true));
+    assert_eq!(slim["output_chars"], json!(big_output.chars().count()));
+    let preview = slim["output"].as_str().unwrap();
+    assert!(preview.chars().count() < big_output.chars().count());
+    assert!(big_output.starts_with(preview));
 
     // `detail=light` is the same as the default.
     let (status, explicit) = request(
@@ -1880,8 +1901,23 @@ async fn history_is_light_by_default() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let full = full.as_array().unwrap();
-    assert_eq!(full.len(), 5, "{full:?}");
+    assert_eq!(full.len(), 6, "{full:?}");
     assert_eq!(full[3]["kind"]["reasoning_content"], json!("thinking"));
+    // The complete tool output, no omission markers.
+    assert_eq!(full[5]["kind"]["output"], json!(big_output));
+    assert!(full[5]["kind"].get("output_omitted").is_none());
+
+    // The per-event endpoint hydrates it (complete event, any kind).
+    let (status, hydrated) = request(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{id}/history/5"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(hydrated["kind"]["output"], json!(big_output));
+    assert!(hydrated["kind"].get("output_omitted").is_none());
 
     // Unknown detail values are rejected.
     let (status, body) = request(
@@ -1894,10 +1930,11 @@ async fn history_is_light_by_default() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
-/// `GET /api/sessions/:id/messages/:seq` serves one complete message
-/// (reasoning included) for lazy hydration; anything else is a 404.
+/// `GET /api/sessions/:id/history/:seq` serves one complete journal event
+/// (any kind — message reasoning, full tool output, …) for lazy hydration.
+/// Only unknown sessions and unknown seqs are 404s.
 #[tokio::test]
-async fn message_at_serves_the_complete_message() {
+async fn event_at_serves_the_complete_event() {
     let (_dir, app) = setup(false);
     let workdir = _dir.path().join("work");
     let (_, session) = request(
@@ -1934,7 +1971,7 @@ async fn message_at_serves_the_complete_message() {
     let (status, message) = request(
         &app,
         Method::GET,
-        &format!("/api/sessions/{id}/messages/2"),
+        &format!("/api/sessions/{id}/history/2"),
         None,
     )
     .await;
@@ -1942,25 +1979,27 @@ async fn message_at_serves_the_complete_message() {
     assert_eq!(message["kind"]["kind"], "message");
     assert_eq!(message["kind"]["reasoning_content"], json!("thinking"));
 
-    // seq 1 is a delta (not a message): 404.
-    let (status, _) = request(
+    // seq 1 is a delta: the endpoint is generic, so it comes back too.
+    let (status, delta) = request(
         &app,
         Method::GET,
-        &format!("/api/sessions/{id}/messages/1"),
+        &format!("/api/sessions/{id}/history/1"),
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(delta["kind"]["kind"], "message_delta");
+    assert_eq!(delta["kind"]["reasoning_content"], json!("thin"));
 
-    // Unknown seqs and sessions are 404s too.
+    // Unknown seqs and sessions are 404s.
     let (status, _) = request(
         &app,
         Method::GET,
-        &format!("/api/sessions/{id}/messages/99"),
+        &format!("/api/sessions/{id}/history/99"),
         None,
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let (status, _) = request(&app, Method::GET, "/api/sessions/unknown/messages/1", None).await;
+    let (status, _) = request(&app, Method::GET, "/api/sessions/unknown/history/1", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
