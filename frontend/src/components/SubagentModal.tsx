@@ -23,8 +23,9 @@ export default function SubagentModal({ childId, onClose }: Props) {
   const [session, setSession] = useState<Session | null>(null)
   // Incremental fold state (same pattern as the session view): the light
   // history seeds the folder once, the SSE tail folds into it in place.
-  // The folder lives in state because it is read during render.
-  const [folder, setFolder] = useState(() => new TimelineFolder())
+  // The folder lives in state because it is read during render; it stays
+  // null until this child's history has arrived (see the effect).
+  const [folder, setFolder] = useState<TimelineFolder | null>(null)
   const [version, setVersion] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [now, setNow] = useState(() => Date.now())
@@ -38,8 +39,9 @@ export default function SubagentModal({ childId, onClose }: Props) {
     terminalSeenRef.current = false
 
     // The folder is created lazily on the first event (never synchronously
-    // in the effect body): a child switch re-runs the effect with a fresh
-    // closure and therefore a fresh folder.
+    // in the effect body, which the hooks lint rule forbids): a child switch
+    // re-runs the effect with a fresh closure and therefore a fresh folder,
+    // and the reset below drops the previous child's state up front.
     let activeFolder: TimelineFolder | null = null
     const ensureFolder = () => {
       if (!activeFolder) {
@@ -71,6 +73,17 @@ export default function SubagentModal({ childId, onClose }: Props) {
         ])
         if (cancelled) return
         setSession(current)
+        // Reset the fold state for this child before folding its history: a
+        // child switch re-runs this effect, and neither the previous child's
+        // items nor its SSE cursor may leak into the new view (an empty new
+        // journal would otherwise show the old timeline and open the tail
+        // with a too-high cursor). Mirrors the session view's reset.
+        // `setFolder(null)` here — not in the effect body — keeps the hooks
+        // lint rule happy; `ensureFolder` builds the fresh one on the first
+        // event.
+        setFolder(null)
+        setError(null)
+        lastSeqRef.current = null
         for (const ev of history) applyEvent(ev)
         if (isTerminal(current.status)) terminalSeenRef.current = true
         setVersion((v) => v + 1)
@@ -117,14 +130,16 @@ export default function SubagentModal({ childId, onClose }: Props) {
     if (el) el.scrollTop = el.scrollHeight
   }, [version])
 
-  const timeline = folder.items()
+  // Before this child's history arrives there is no folder yet (the previous
+  // child's, if any, was dropped by the reset above).
+  const timeline = folder ? folder.items() : []
 
   /** Load one light-history message's reasoning on demand. */
   const loadReasoning = async (seq: number): Promise<string | null> => {
     const ev = await getFullEvent(childId, seq)
     const full =
       ev.kind.kind === 'message' ? (ev.kind.reasoning_content ?? '') : ''
-    folder.patchMessage(seq, { reasoning_content: full })
+    folder?.patchMessage(seq, { reasoning_content: full })
     setVersion((v) => v + 1)
     return full
   }
@@ -133,7 +148,7 @@ export default function SubagentModal({ childId, onClose }: Props) {
   const loadToolOutput = async (seq: number): Promise<void> => {
     const ev = await getFullEvent(childId, seq)
     if (ev.kind.kind === 'tool_result') {
-      folder.patchToolResult(seq, {
+      folder?.patchToolResult(seq, {
         output: ev.kind.output,
         outputOmitted: false,
         outputChars: undefined,

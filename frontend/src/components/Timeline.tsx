@@ -325,10 +325,11 @@ export function MessageRow({
 }
 
 /** A light-history message's reasoning, loaded from
- *  `GET /api/sessions/:id/messages/:seq` the first time the block is
+ *  `GET /api/sessions/:id/history/:seq` the first time the block is
  *  expanded. The message stays `reasoning_omitted` after hydration (the
  *  caller only patches `reasoning_content`), so the details element stays
- *  mounted — and open — while the text appears. */
+ *  mounted — and open — while the text appears. A failed fetch is not
+ *  permanent: re-opening the block (or the retry button) tries again. */
 function LazyReasoning({
   message,
   onLoad,
@@ -341,9 +342,13 @@ function LazyReasoning({
   const [failed, setFailed] = useState(false)
   const [empty, setEmpty] = useState(false)
   const load = () => {
-    if (loading || failed || empty || message.reasoning_content) return
+    // `failed` is deliberately not part of the guard: a transient network
+    // error must not poison the block — re-opening it (or the retry button)
+    // tries again.
+    if (loading || empty || message.reasoning_content) return
     if (!onLoad || typeof seq !== 'number') return
     setLoading(true)
+    setFailed(false)
     onLoad(seq)
       .then((text) => {
         if (!text) setEmpty(true)
@@ -362,7 +367,15 @@ function LazyReasoning({
         {message.reasoning_content ? 'reasoning' : 'reasoning (click to load)'}
       </summary>
       {loading && <span className="muted">loading…</span>}
-      {failed && <span className="muted">failed to load reasoning</span>}
+      {failed && (
+        <span className="muted">
+          failed to load reasoning{' '}
+          {/* Same affordance as the tool-output row below. */}
+          <button type="button" className="subagent-link" onClick={load}>
+            retry
+          </button>
+        </span>
+      )}
       {empty && <span className="muted">(no reasoning)</span>}
       {message.reasoning_content && <pre>{message.reasoning_content}</pre>}
     </details>

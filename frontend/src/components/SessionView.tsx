@@ -67,7 +67,10 @@ export default function SessionView({
   // waiting for its first message) is `pending` with no pid, so its
   // composer stays usable. Local state is updated from every mutating API
   // response; the prop keeps it in sync with the sidebar's polling. */
-  const [folder, setFolder] = useState(() => new TimelineFolder())
+  // Null until the history has been folded into it (the initial folder used
+  // to be allocated here and discarded by `ensureFolder`); `timeline` below
+  // reads it defensively.
+  const [folder, setFolder] = useState<TimelineFolder | null>(null)
   // Mirrors `folder` for the streaming effect (which must not depend on it);
   // only ever touched from event handlers / effects, never during render.
   const folderRef = useRef<TimelineFolder | null>(null)
@@ -392,7 +395,7 @@ export default function SessionView({
   // fork waiting for its first message, or a deferred creation), so its
   // composer stays usable.
   const running = status === 'running' || (status === 'pending' && pid !== null)
-  const timeline = folder.items()
+  const timeline = folder ? folder.items() : []
   // The status bar shows the latest context_usage event (the worker journals
   // one per LLM call; the last one reflects the deepest context, tool
   // outputs included). Null until the first call reports usage.
@@ -443,7 +446,7 @@ export default function SessionView({
     const ev = await getFullEvent(session.id, seq)
     const full =
       ev.kind.kind === 'message' ? (ev.kind.reasoning_content ?? '') : ''
-    folder.patchMessage(seq, { reasoning_content: full })
+    folder?.patchMessage(seq, { reasoning_content: full })
     bump()
     return full
   }
@@ -454,7 +457,7 @@ export default function SessionView({
   const loadToolOutput = async (seq: number): Promise<void> => {
     const ev = await getFullEvent(session.id, seq)
     if (ev.kind.kind === 'tool_result') {
-      folder.patchToolResult(seq, {
+      folder?.patchToolResult(seq, {
         output: ev.kind.output,
         outputOmitted: false,
         outputChars: undefined,
