@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { JournalEvent, Mode, Session, SessionStatus } from '../api'
-import { getHistory, getMessage, getSession } from '../api'
+import { getHistory, getFullEvent, getSession } from '../api'
 import { TimelineFolder, isTerminal } from '../timeline'
 import { EventRow, MessageRow, ToolBlockRow } from './Timeline'
 
@@ -64,7 +64,7 @@ export default function SubagentModal({ childId, onClose }: Props) {
     ;(async () => {
       try {
         // The light history (superseded previews dropped, old reasoning
-        // omitted — expandable per message via `getMessage`).
+        // omitted — expandable per message via `getFullEvent`).
         const [current, history] = await Promise.all([
           getSession(childId),
           getHistory(childId),
@@ -121,7 +121,7 @@ export default function SubagentModal({ childId, onClose }: Props) {
 
   /** Load one light-history message's reasoning on demand. */
   const loadReasoning = async (seq: number): Promise<string | null> => {
-    const ev = await getMessage(childId, seq)
+    const ev = await getFullEvent(childId, seq)
     const full =
       ev.kind.kind === 'message' ? (ev.kind.reasoning_content ?? '') : ''
     folder.patchMessage(seq, { reasoning_content: full })

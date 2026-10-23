@@ -23,6 +23,15 @@ export interface ToolBlock {
    *  spawned a child (from the matching `subagent_started` event); the
    *  block then shows a "view subagent" affordance opening a modal. */
   childId?: string
+  /** The journal seq of this block's `tool_result` event. The lazy-output
+   *  hydration targets it (tool-call ids repeat across runs, so the id is
+   *  not a stable key). Absent while the tool is still running. */
+  resultSeq?: number | null
+  /** True when `output` is only the bounded preview served by the light
+   *  history; the UI then offers "show full output". */
+  outputOmitted?: boolean
+  /** Character count of the complete output (when `outputOmitted`). */
+  outputChars?: number
 }
 
 /** An assistant message as rendered; `streaming` marks a message whose
@@ -35,7 +44,7 @@ export interface ToolBlock {
  *  cut point of a fork, and `messageAt`/`patchMessage` use to locate the
  *  block. `reasoning_omitted` (inherited from `JournalMessage`) marks a
  *  light-history message whose reasoning can be loaded on demand via
- *  `getMessage(id, seq)`. */
+ *  `getFullEvent(id, seq)`. */
 export type MessageBlock = JournalMessage & {
   streaming?: boolean
   truncated?: boolean
@@ -211,14 +220,21 @@ export class TimelineFolder {
         if (block) {
           block.ok = kind.ok
           block.streaming = false
+          block.resultSeq = ev.seq
           // The canonical result is capped at ~1 MB while the delta stream
           // is not; keep whichever is longer so the tail is never lost when
           // the result lands (small commands still get the canonical text,
           // including the exit-code line).
           if (!block.output || kind.output.length >= block.output.length) {
             block.output = kind.output
+            // A light-history result carries only a bounded preview; the
+            // full text is loaded on demand via `patchToolResult`.
+            block.outputOmitted = kind.output_omitted === true
+            block.outputChars = kind.output_omitted ? kind.output_chars : undefined
           } else {
             block.output = `${block.output}\n\n[tool result was truncated by the harness — showing the full streamed output]`
+            block.outputOmitted = false
+            block.outputChars = undefined
           }
           this.pending.delete(kind.id)
         }
@@ -285,6 +301,17 @@ export class TimelineFolder {
   patchMessage(seq: number, patch: Partial<MessageBlock>): void {
     const message = this.messageAt(seq)
     if (message) Object.assign(message, patch)
+  }
+
+  /** Patch the tool block finalized by the `tool_result` event at `seq` —
+   *  used to hydrate a light-history block's omitted output in place. */
+  patchToolResult(seq: number, patch: Partial<ToolBlock>): void {
+    for (const item of this.items_) {
+      if (item.type === 'tool' && item.block.resultSeq === seq) {
+        Object.assign(item.block, patch)
+        return
+      }
+    }
   }
 
   // Close the delta-assembled assistant message preview. The preview can

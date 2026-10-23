@@ -444,3 +444,74 @@ describe('buildTimeline — light-history messages (reasoning omitted)', () => {
     expect(assistantMessages(items)[0].reasoning_omitted).toBe(true)
   })
 })
+
+describe('buildTimeline — lazy tool output (light history)', () => {
+  it('records the result seq and the omitted-output markers', () => {
+    const result = ev({
+      kind: 'tool_result',
+      id: 'c1',
+      name: 'bash',
+      ok: true,
+      output: 'preview',
+      output_omitted: true,
+      output_chars: 12345,
+    })
+    const items = buildTimeline([toolStart('c1'), result])
+    const item = items.find((i) => i.type === 'tool')
+    if (item?.type !== 'tool') throw new Error('expected a tool block')
+    expect(item.block.output).toBe('preview')
+    expect(item.block.outputOmitted).toBe(true)
+    expect(item.block.outputChars).toBe(12345)
+    expect(item.block.resultSeq).toBe(result.seq)
+  })
+
+  it('leaves a complete output unflagged but still records the result seq', () => {
+    const result = ev({
+      kind: 'tool_result',
+      id: 'c1',
+      name: 'bash',
+      ok: true,
+      output: 'done',
+    })
+    const items = buildTimeline([toolStart('c1'), result])
+    const item = items[0]
+    if (item.type !== 'tool') throw new Error('expected a tool block')
+    expect(item.block.outputOmitted).toBe(false)
+    expect(item.block.outputChars).toBeUndefined()
+    expect(item.block.resultSeq).toBe(result.seq)
+  })
+})
+
+describe('TimelineFolder — patchToolResult', () => {
+  it('hydrates the block finalized by that result seq', () => {
+    const folder = new TimelineFolder()
+    folder.push(toolStart('c1'))
+    const result = ev({
+      kind: 'tool_result',
+      id: 'c1',
+      name: 'bash',
+      ok: true,
+      output: 'preview',
+      output_omitted: true,
+      output_chars: 9999,
+    })
+    folder.push(result)
+    folder.patchToolResult(result.seq as number, {
+      output: 'the full text',
+      outputOmitted: false,
+    })
+    const item = folder.items()[0]
+    if (item.type !== 'tool') throw new Error('expected a tool block')
+    expect(item.block.output).toBe('the full text')
+    expect(item.block.outputOmitted).toBe(false)
+  })
+
+  it('is a no-op for an unknown seq', () => {
+    const folder = new TimelineFolder()
+    folder.push(toolStart('c1'))
+    folder.patchToolResult(9999, { output: 'nope' }) // must not throw
+    const item = folder.items()[0]
+    if (item.type !== 'tool') throw new Error('expected a tool block')
+    expect(item.block.output).toBeUndefined()
+  })
+})

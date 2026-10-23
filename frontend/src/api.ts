@@ -143,7 +143,7 @@ export interface JournalMessage {
   reasoning_content?: string | null
   /** Set by the light history projection (the default form of
    *  `GET /api/sessions/:id/history`) when a non-empty reasoning was
-   *  omitted: expand the "reasoning" block lazily via `getMessage(id, seq)`.
+   *  omitted: expand the "reasoning" block lazily via `getFullEvent(id, seq)`.
    *  Absent on SSE/streamed events, which always carry the full form. */
   reasoning_omitted?: boolean
   tool_call_id?: string | null
@@ -167,7 +167,19 @@ export interface JournalImage {
 export type JournalEventKind =
   | ({ kind: 'message' } & JournalMessage)
   | { kind: 'tool_call_start'; id: string; name: string; arguments: string }
-  | { kind: 'tool_result'; id: string; name: string; ok: boolean; output: string }
+  | {
+      kind: 'tool_result'
+      id: string
+      name: string
+      ok: boolean
+      output: string
+      /** Set by the light history projection when the output was omitted:
+       *  `output` is then a bounded preview and the complete text is loadable
+       *  via `getFullEvent(id, seq)` (this event's seq). */
+      output_omitted?: boolean
+      /** Character count of the complete output (label for the UI). */
+      output_chars?: number
+    }
   | { kind: 'status_change'; status: SessionStatus; error?: string | null }
   /** The session's system prompt, journaled by the worker on the first run
    *  and reused verbatim on every later run. Rendered as session metadata
@@ -535,7 +547,7 @@ export function forkSession(id: string, untilSeq: number): Promise<Session> {
 
 /** Journal events after `afterSeq` (all when omitted). Serves the light form
  *  by default (superseded streaming previews dropped; old reasoning omitted
- *  and marked `reasoning_omitted`, loadable per message via `getMessage`);
+ *  and marked `reasoning_omitted`, loadable per event via `getFullEvent`);
  *  `detail: 'full'` opts into the complete events. */
 export function getHistory(
   id: string,
@@ -548,10 +560,11 @@ export function getHistory(
   return http(`/api/sessions/${id}/history${q ? `?${q}` : ''}`)
 }
 
-/** The complete `message` event at `seq` (reasoning included) — hydrates a
- *  light-history message when the user expands its reasoning block. */
-export function getMessage(id: string, seq: number): Promise<JournalEvent> {
-  return http(`/api/sessions/${id}/messages/${seq}`)
+/** The complete journal event at `seq` — a `message` with its reasoning or a
+ *  `tool_result` with its full output. Hydrates a light-history row on
+ *  demand (when its reasoning block or tool block is expanded). */
+export function getFullEvent(id: string, seq: number): Promise<JournalEvent> {
+  return http(`/api/sessions/${id}/history/${seq}`)
 }
 
 export function cancelSession(id: string): Promise<Session> {

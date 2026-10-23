@@ -18,7 +18,7 @@ import {
   cancelSession,
   forkSession,
   getHistory,
-  getMessage,
+  getFullEvent,
   getModels,
   getSession,
   getSkills,
@@ -440,7 +440,7 @@ export default function SessionView({
    *  load omits it) and patch the folded block in place, so the text renders
    *  inside the already-open details element. */
   const loadReasoning = async (seq: number): Promise<string | null> => {
-    const ev = await getMessage(session.id, seq)
+    const ev = await getFullEvent(session.id, seq)
     const full =
       ev.kind.kind === 'message' ? (ev.kind.reasoning_content ?? '') : ''
     folder.patchMessage(seq, { reasoning_content: full })
