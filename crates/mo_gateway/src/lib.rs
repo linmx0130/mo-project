@@ -1,6 +1,7 @@
 //! mo_gateway library: router, state, SSE tail, process management.
 
 pub mod error;
+pub mod history;
 pub mod process;
 pub mod routes;
 pub mod sse;
