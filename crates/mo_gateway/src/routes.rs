@@ -1671,9 +1671,9 @@ struct HistoryQuery {
 ///
 /// The **light** form is the default: a long history must not ship the bulk
 /// of the journal (streaming previews + reasoning) to the browser. One
-/// message's reasoning is fetched on demand via
-/// `GET /api/sessions/:id/messages/:seq`. `detail=full` serves the complete
-/// events (tests, debugging).
+/// omitted payload (a message's reasoning, a long tool output) is fetched on
+/// demand via `GET /api/sessions/:id/history/:seq`. `detail=full` serves the
+/// complete events (tests, debugging).
 async fn history(
     State(state): State<Arc<AppState>>,
     PathParam(id): PathParam<String>,

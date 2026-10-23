@@ -11,6 +11,12 @@
 //! delta run that no canonical event finalized yet — the currently
 //! streaming message or tool, or the truncated preview of a dead run — is
 //! kept verbatim, so live reasoning/output keeps rendering after a reload.
+//!
+//! Both projections are *run-aware*, because a tool-call id is not unique
+//! across a journal: a provider may reuse a sequential id (`call_0`,
+//! `call_1`, …) in a later run, and a run that died mid-stream leaves its id
+//! behind for the resumed run to repeat. A preview is therefore only dropped
+//! when the canonical event that finalizes *its own* run follows it.
 
 use std::collections::HashSet;
 
@@ -47,29 +53,21 @@ fn slim_tool_output(output: &str) -> Option<(String, usize)> {
 ///   prefix and gains `output_omitted: true` + `output_chars`;
 /// - everything else is serialized verbatim.
 pub fn light_history(events: Vec<JournalEvent>) -> Vec<Value> {
-    let superseded_runs = superseded_message_deltas(&events);
-    let result_ids: HashSet<String> = events
-        .iter()
-        .filter_map(|event| match &event.kind {
-            JournalEventKind::ToolResult { id, .. } => Some(id.clone()),
-            _ => None,
-        })
-        .collect();
+    let superseded_messages = superseded_message_deltas(&events);
+    let superseded_tools = superseded_tool_output_deltas(&events);
 
     events
         .into_iter()
         .enumerate()
         .filter_map(|(i, event)| match &event.kind {
-            JournalEventKind::MessageDelta { .. } if superseded_runs[i] => None,
-            JournalEventKind::ToolOutputDelta { id, .. } if result_ids.contains(id.as_str()) => {
-                None
-            }
+            JournalEventKind::MessageDelta { .. } if superseded_messages[i] => None,
+            JournalEventKind::ToolOutputDelta { .. } if superseded_tools[i] => None,
             JournalEventKind::Message(m)
                 if m.reasoning_content
                     .as_deref()
                     .is_some_and(|reasoning| !reasoning.is_empty()) =>
             {
-                let mut value = serde_json::to_value(&event).unwrap_or(Value::Null);
+                let mut value = to_json(&event);
                 if let Some(kind) = value.get_mut("kind").and_then(Value::as_object_mut) {
                     kind.remove("reasoning_content");
                     kind.insert("reasoning_omitted".to_string(), json!(true));
@@ -78,7 +76,7 @@ pub fn light_history(events: Vec<JournalEvent>) -> Vec<Value> {
             }
             JournalEventKind::ToolResult { output, .. } => match slim_tool_output(output) {
                 Some((preview, total)) => {
-                    let mut value = serde_json::to_value(&event).unwrap_or(Value::Null);
+                    let mut value = to_json(&event);
                     if let Some(kind) = value.get_mut("kind").and_then(Value::as_object_mut) {
                         kind.insert("output".to_string(), json!(preview));
                         kind.insert("output_omitted".to_string(), json!(true));
@@ -86,11 +84,22 @@ pub fn light_history(events: Vec<JournalEvent>) -> Vec<Value> {
                     }
                     Some(value)
                 }
-                None => Some(serde_json::to_value(&event).unwrap_or(Value::Null)),
+                None => Some(to_json(&event)),
             },
-            _ => Some(serde_json::to_value(&event).unwrap_or(Value::Null)),
+            _ => Some(to_json(&event)),
         })
         .collect()
+}
+
+/// Serialize one journal event for the history array.
+///
+/// `JournalEvent` only holds strings, integers, booleans, options and vecs
+/// (no non-finite floats, no non-string map keys), so serialization cannot
+/// fail. A lossy fallback would be worse than a panic: a `null` element
+/// makes the frontend's `event.kind.kind` mapping throw and takes the whole
+/// history load down, silently hiding the rest of the conversation.
+fn to_json(event: &JournalEvent) -> Value {
+    serde_json::to_value(event).expect("a JournalEvent is always JSON-serializable")
 }
 
 /// Indices of `message_delta` events superseded by a canonical assistant
@@ -118,6 +127,43 @@ fn superseded_message_deltas(events: &[JournalEvent]) -> Vec<bool> {
                 run.clear();
             }
             _ => run.clear(), // unfinalized run: kept verbatim
+        }
+    }
+    superseded
+}
+
+/// Indices of `tool_output_delta` events superseded by the canonical
+/// `tool_result` of **their own** tool run.
+///
+/// Tool-call ids are not unique across a journal: providers that number their
+/// calls per response (`call_0`, `call_1`, …) reuse the ids of earlier runs,
+/// and a run that died mid-stream leaves its id for the resumed run to
+/// repeat. Dropping by id membership would therefore also drop a dead run's
+/// truncated preview — permanently, because those events sit below the SSE
+/// `after_seq` cursor — or the live preview of a tool that reuses an earlier
+/// run's id. So a delta is superseded iff the nearest id-matching event after
+/// it is a `tool_result`; a `tool_call_start` with the same id in between
+/// proves that result finalizes a *different* run.
+///
+/// Scanned backwards so each decision is a set lookup: going right-to-left,
+/// `finalized` holds the ids whose still-unclaimed result lies ahead.
+fn superseded_tool_output_deltas(events: &[JournalEvent]) -> Vec<bool> {
+    let mut superseded = vec![false; events.len()];
+    let mut finalized: HashSet<String> = HashSet::new();
+    for (i, event) in events.iter().enumerate().rev() {
+        match &event.kind {
+            JournalEventKind::ToolResult { id, .. } => {
+                finalized.insert(id.clone());
+            }
+            // A new run of this id starts here: any earlier delta belongs to
+            // it, not to the result that lies further ahead.
+            JournalEventKind::ToolCallStart { id, .. } => {
+                finalized.remove(id);
+            }
+            JournalEventKind::ToolOutputDelta { id, .. } => {
+                superseded[i] = finalized.contains(id);
+            }
+            _ => {}
         }
     }
     superseded

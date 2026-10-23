@@ -115,8 +115,10 @@ pub fn read_events_after(path: &Path, after_seq: u64) -> Result<Vec<JournalEvent
         .collect())
 }
 
-/// Return the event with `seq == target`, if present (used by the
-/// per-message endpoint: the UI loads one message's reasoning on demand).
+/// Return the event with `seq == target`, if present (used by the hydration
+/// endpoint `GET /api/sessions/:id/history/:seq`: the UI loads one light
+/// history row's omitted payload on demand — a message's reasoning or a
+/// `tool_result`'s complete output).
 ///
 /// Scans line by line and stops at the first parsed `seq` beyond `target`
 /// — journal lines are written in `seq` order — so the cost is proportional

@@ -390,6 +390,11 @@ streaming previews, omits old messages' `reasoning_content` (marked
 `reasoning_omitted`) and trims a `tool_result` output longer than 4 000
 characters to a 1 000-character preview (marked `output_omitted`, with
 `output_chars`), so opening a long chat is fast and light on client memory.
+Superseded previews are matched *per run*: a tool-call id is only unique
+within a run (providers reuse sequential ids, and a run that died mid-stream
+leaves its id for the resumed run to repeat), so a `tool_output_delta` is
+dropped only when the `tool_result` of its own run follows it — a dead run's
+truncated preview stays visible instead of losing its output forever.
 Reasoning and tool output are only ever "live" while they stream — SSE
 events are never slimmed — and both are loaded on demand via
 `GET /api/sessions/:id/history/:seq` (the complete journal event) when the

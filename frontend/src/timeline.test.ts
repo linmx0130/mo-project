@@ -7,7 +7,12 @@
 // start a fresh message instead of being appended onto the interrupted one.
 import { describe, expect, it } from 'vitest'
 import type { JournalEvent, JournalEventKind, SessionStatus, ToolCallInfo } from './api'
-import { TimelineFolder, buildTimeline, type MessageBlock } from './timeline'
+import {
+  TimelineFolder,
+  buildTimeline,
+  type MessageBlock,
+  type ToolBlock,
+} from './timeline'
 
 let seq = 0
 function ev(kind: JournalEventKind): JournalEvent {
@@ -442,6 +447,52 @@ describe('buildTimeline — light-history messages (reasoning omitted)', () => {
       ev({ kind: 'message', role: 'assistant', content: 'answer', reasoning_omitted: true }),
     ])
     expect(assistantMessages(items)[0].reasoning_omitted).toBe(true)
+  })
+})
+
+describe('buildTimeline — repeated tool-call ids across runs', () => {
+  // Providers may number their calls per response (`call_0`, `call_1`, …), so
+  // a later run can repeat an id — and a run that died mid-stream leaves its
+  // id for the resumed run to repeat. The folded timeline therefore pairs
+  // deltas/results with the *nearest preceding* `tool_call_start`, and the
+  // light history keeps both runs' previews (see the gateway's
+  // `superseded_tool_output_deltas`).
+  const toolBlocks = (items: ReturnType<typeof buildTimeline>): ToolBlock[] =>
+    items.flatMap((i) => (i.type === 'tool' ? [i.block] : []))
+
+  it("keeps a dead run's preview in its own block", () => {
+    const items = buildTimeline([
+      toolStart('call_1'),
+      toolOut('call_1', 'dead output'),
+      // The run died here (no `tool_result`); the resumed run repeats the id.
+      toolStart('call_1'),
+      toolOut('call_1', 'live output'),
+      toolRes('call_1', true, 'live output'),
+    ])
+    const blocks = toolBlocks(items)
+    expect(blocks.length).toBe(2)
+    expect(blocks[0].output).toBe('dead output')
+    // The new start closed the stale block: it no longer looks running.
+    expect(blocks[0].streaming).toBe(false)
+    expect(blocks[0].resultSeq).toBeUndefined()
+    expect(blocks[1].output).toBe('live output')
+    expect(blocks[1].streaming).toBe(false)
+    expect(blocks[1].resultSeq).toEqual(expect.any(Number))
+  })
+
+  it("does not append a new run's deltas to an earlier run's finished block", () => {
+    const items = buildTimeline([
+      toolStart('call_1'),
+      toolOut('call_1', 'run1'),
+      toolRes('call_1', true, 'run1'),
+      toolStart('call_1'),
+      toolOut('call_1', 'run2 streaming'),
+    ])
+    const blocks = toolBlocks(items)
+    expect(blocks.length).toBe(2)
+    expect(blocks[0].output).toBe('run1')
+    expect(blocks[1].output).toBe('run2 streaming')
+    expect(blocks[1].streaming).toBe(true)
   })
 })
 

@@ -1930,6 +1930,112 @@ async fn history_is_light_by_default() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
+/// The light history is run-aware about tool-call ids: a provider may reuse
+/// an id in a later run (`call_0`, `call_1`, …), and a run that died
+/// mid-stream leaves its id behind for the resumed run to repeat. A
+/// `tool_output_delta` is only dropped when a `tool_result` for *its own* run
+/// follows it; a dead run's truncated preview must survive, otherwise the UI
+/// shows that tool block with no output at all, forever (those events sit
+/// below the SSE cursor).
+#[tokio::test]
+async fn light_history_keeps_a_dead_runs_output_when_the_tool_id_repeats() {
+    let (_dir, app) = setup(false);
+    let workdir = _dir.path().join("work");
+    let (_, session) = request(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        Some(json!({ "workdir": workdir.display().to_string(), "prompt": "hi" })),
+    )
+    .await;
+    let id = session["id"].as_str().unwrap().to_string();
+    let journal_path = session["journal_path"].as_str().unwrap().to_string();
+
+    let mut journal = JournalWriter::open(Path::new(&journal_path)).unwrap();
+    // seq 0 is the user message the gateway journals at creation.
+    journal
+        .append(JournalEventKind::ToolCallStart {
+            id: "call_1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        })
+        .unwrap();
+    // Run 1 dies mid-stream: no `tool_result` ever follows.
+    journal
+        .append(JournalEventKind::ToolOutputDelta {
+            id: "call_1".into(),
+            name: "bash".into(),
+            output: "dead run output".into(),
+        })
+        .unwrap();
+    // Run 2 repeats the id and completes.
+    journal
+        .append(JournalEventKind::ToolCallStart {
+            id: "call_1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::ToolOutputDelta {
+            id: "call_1".into(),
+            name: "bash".into(),
+            output: "live run output".into(),
+        })
+        .unwrap();
+    journal
+        .append(JournalEventKind::ToolResult {
+            id: "call_1".into(),
+            name: "bash".into(),
+            ok: true,
+            output: "live run output".into(),
+        })
+        .unwrap();
+    drop(journal);
+
+    let (status, light) = request(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{id}/history"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let light = light.as_array().unwrap();
+    let kinds: Vec<&str> = light
+        .iter()
+        .map(|e| e["kind"]["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "message",
+            "tool_call_start",
+            "tool_output_delta",
+            "tool_call_start",
+            "tool_result"
+        ],
+        "{light:?}"
+    );
+    // The dead run's preview survived; run 2's preview was superseded by its
+    // own result.
+    assert_eq!(light[2]["kind"]["output"], json!("dead run output"));
+    assert_eq!(light[4]["kind"]["output"], json!("live run output"));
+
+    // `detail=full` keeps both previews.
+    let (status, full) = request(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{id}/history?detail=full"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let full = full.as_array().unwrap();
+    assert_eq!(full.len(), 6, "{full:?}");
+    assert_eq!(full[4]["kind"]["output"], json!("live run output"));
+}
+
 /// `GET /api/sessions/:id/history/:seq` serves one complete journal event
 /// (any kind — message reasoning, full tool output, …) for lazy hydration.
 /// Only unknown sessions and unknown seqs are 404s.
