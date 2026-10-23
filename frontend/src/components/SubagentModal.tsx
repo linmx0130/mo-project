@@ -18,7 +18,10 @@ interface Props {
  *  message, seeded into its journal by the parent worker). The modal
  *  watches the child's journal exactly like the session view: history +
  *  SSE tail, closing once the status is terminal and the journal drains.
- */
+ *
+ *  The parent keys the modal by child id, so one instance only ever shows
+ *  one child: switching children remounts, and no per-child state has to be
+ *  reset in place. */
 export default function SubagentModal({ childId, onClose }: Props) {
   const [session, setSession] = useState<Session | null>(null)
   // Incremental fold state (same pattern as the session view): the light
@@ -39,9 +42,7 @@ export default function SubagentModal({ childId, onClose }: Props) {
     terminalSeenRef.current = false
 
     // The folder is created lazily on the first event (never synchronously
-    // in the effect body, which the hooks lint rule forbids): a child switch
-    // re-runs the effect with a fresh closure and therefore a fresh folder,
-    // and the reset below drops the previous child's state up front.
+    // in the effect body, which the hooks lint rule forbids).
     let activeFolder: TimelineFolder | null = null
     const ensureFolder = () => {
       if (!activeFolder) {
@@ -73,17 +74,6 @@ export default function SubagentModal({ childId, onClose }: Props) {
         ])
         if (cancelled) return
         setSession(current)
-        // Reset the fold state for this child before folding its history: a
-        // child switch re-runs this effect, and neither the previous child's
-        // items nor its SSE cursor may leak into the new view (an empty new
-        // journal would otherwise show the old timeline and open the tail
-        // with a too-high cursor). Mirrors the session view's reset.
-        // `setFolder(null)` here — not in the effect body — keeps the hooks
-        // lint rule happy; `ensureFolder` builds the fresh one on the first
-        // event.
-        setFolder(null)
-        setError(null)
-        lastSeqRef.current = null
         for (const ev of history) applyEvent(ev)
         if (isTerminal(current.status)) terminalSeenRef.current = true
         setVersion((v) => v + 1)
@@ -130,8 +120,7 @@ export default function SubagentModal({ childId, onClose }: Props) {
     if (el) el.scrollTop = el.scrollHeight
   }, [version])
 
-  // Before this child's history arrives there is no folder yet (the previous
-  // child's, if any, was dropped by the reset above).
+  // Before this child's history arrives there is no folder yet.
   const timeline = folder ? folder.items() : []
 
   /** Load one light-history message's reasoning on demand. */

@@ -701,6 +701,12 @@ export default function SessionView({
 
       {subagentId && (
         <SubagentModal
+          // Keyed by child id (same idiom as `key={selected.id}` on the
+          // SessionView in App): switching children remounts the modal, so
+          // every piece of per-child state — the folder, and each row's
+          // local hydration state — resets with the child instead of
+          // leaking into the next one through index-keyed rows.
+          key={subagentId}
           childId={subagentId}
           onClose={() => setSubagentId(null)}
         />
