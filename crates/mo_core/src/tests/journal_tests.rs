@@ -504,3 +504,50 @@ fn copy_events_before_missing_source_is_empty() {
     // The destination (and its parent directory) is still created.
     assert!(read_events(&dst).unwrap().is_empty());
 }
+
+#[test]
+fn read_event_at_returns_the_event_with_that_seq() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("journal.jsonl");
+    let mut writer = JournalWriter::open(&path).unwrap();
+    writer.append(msg_event("user", "hi")).unwrap();
+    writer
+        .append(JournalEventKind::ContextUsage {
+            tokens: 5,
+            context_window: None,
+        })
+        .unwrap();
+    writer.append(msg_event("assistant", "hello")).unwrap();
+    drop(writer);
+
+    let found = read_event_at(&path, 1).unwrap().unwrap();
+    assert_eq!(found.seq, 1);
+    assert!(matches!(
+        found.kind,
+        JournalEventKind::ContextUsage { tokens: 5, .. }
+    ));
+    let first = read_event_at(&path, 0).unwrap().unwrap();
+    assert_eq!(
+        first.kind,
+        JournalEventKind::Message(JournalMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+            reasoning_content: None,
+            tool_call_id: None,
+            tool_calls: None,
+            images: vec![],
+        })
+    );
+    // Past the end: nothing.
+    assert!(read_event_at(&path, 7).unwrap().is_none());
+}
+
+#[test]
+fn read_event_at_missing_journal_is_none() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        read_event_at(&dir.path().join("nope.jsonl"), 0)
+            .unwrap()
+            .is_none()
+    );
+}

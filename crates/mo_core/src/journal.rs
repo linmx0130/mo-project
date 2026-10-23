@@ -115,6 +115,37 @@ pub fn read_events_after(path: &Path, after_seq: u64) -> Result<Vec<JournalEvent
         .collect())
 }
 
+/// Return the event with `seq == target`, if present (used by the
+/// per-message endpoint: the UI loads one message's reasoning on demand).
+///
+/// Scans line by line and stops at the first parsed `seq` beyond `target`
+/// — journal lines are written in `seq` order — so the cost is proportional
+/// to `target`, not to the whole journal. A missing journal reads as
+/// `None`; non-JSON lines are skipped as in `read_events`.
+pub fn read_event_at(path: &Path, target: u64) -> Result<Option<JournalEvent>> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<JournalEvent>(trimmed) {
+            if event.seq == target {
+                return Ok(Some(event));
+            }
+            if event.seq > target {
+                break;
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Copy the events of `src` with `seq < until_seq` into a journal at `dst`,
 /// used when a session is forked at one of its user messages: the fork keeps
 /// the history *before* that message, so the user can edit the message and
