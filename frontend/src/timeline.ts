@@ -32,7 +32,10 @@ export interface ToolBlock {
  *  mid-stream) — it keeps its partial text but is no longer streaming.
  *  `seq` is the journal seq of the message event (null for synthesized
  *  events), which the "New session from here" action uses to address the
- *  cut point of a fork. */
+ *  cut point of a fork, and `messageAt`/`patchMessage` use to locate the
+ *  block. `reasoning_omitted` (inherited from `JournalMessage`) marks a
+ *  light-history message whose reasoning can be loaded on demand via
+ *  `getMessage(id, seq)`. */
 export type MessageBlock = JournalMessage & {
   streaming?: boolean
   truncated?: boolean
@@ -51,11 +54,19 @@ export type TimelineItem =
 function isRenderableMessage(msg: JournalMessage): boolean {
   if (msg.role !== 'assistant') return true
   const hasText = (msg.content ?? '').trim().length > 0
-  const hasReasoning = (msg.reasoning_content ?? '').trim().length > 0
+  // An omitted reasoning (light history) still makes the row worth showing:
+  // it can be expanded lazily.
+  const hasReasoning =
+    (msg.reasoning_content ?? '').trim().length > 0 || msg.reasoning_omitted === true
   return hasText || hasReasoning || (msg.tool_calls?.length ?? 0) === 0
 }
 
-/** Fold the journal event stream into renderable items.
+/** Incremental timeline folder: fold journal events into renderable items
+ *  one at a time (`push`), so a live SSE stream never has to copy the event
+ *  list or re-fold the whole history on every token. `buildTimeline` is the
+ *  batch convenience wrapper over a fresh folder.
+ *
+ *  Fold semantics:
  *
  * - `message_delta` events append to the assistant message currently being
  *   assembled (token-by-token preview of both the visible text and the
@@ -89,55 +100,28 @@ function isRenderableMessage(msg: JournalMessage): boolean {
  * "streaming" (and are marked `truncated` when no canonical `message` ever
  * finalized them), and the next run's deltas start a new message.
  */
-export function buildTimeline(events: JournalEvent[]): TimelineItem[] {
-  const items: TimelineItem[] = []
-  const pending = new Map<string, ToolBlock>()
-  let openMessage: MessageBlock | null = null
-  // Index in `items` of the block `openMessage` references, so it can be
+export class TimelineFolder {
+  private items_: TimelineItem[] = []
+  private pending = new Map<string, ToolBlock>()
+  private openMessage: MessageBlock | null = null
+  // Index in `items_` of the block `openMessage` references, so it can be
   // removed when the final message turns out to be a bare tool-call wrapper
   // (no text, no reasoning). `items.pop()` would be unsafe here because
   // `context_usage` events land between the deltas and the final message.
-  let openIdx = -1
+  private openIdx = -1
 
-  // Close the delta-assembled assistant message preview. The preview can
-  // never be open while tool events / tool-journaled requests arrive (the
-  // assistant `message` is always finalized before tools run), so closing
-  // it at any non-delta event is safe: it keeps its partial text but stops
-  // "streaming" and is marked `truncated` when no canonical `message` ever
-  // finalized it (see the doc comment above).
-  const closeOpenMessage = () => {
-    if (openMessage) {
-      openMessage.streaming = false
-      openMessage.truncated = true
-      openMessage = null
-      openIdx = -1
-    }
-  }
-  // Close every streaming tool block. Unlike the open message, this is only
-  // safe at *true* turn boundaries: events that can never arrive while a
-  // sibling tool is legitimately running. (`subagent_started`,
-  // `mode_change_request` and `ask_user_request` are journaled by tools
-  // mid-execution, so they must not close a streaming bash block.)
-  const closeStreamingTools = () => {
-    for (const block of pending.values()) block.streaming = false
-  }
-  // A true turn boundary closes both.
-  const closeTurn = () => {
-    closeOpenMessage()
-    closeStreamingTools()
-  }
-
-  for (const ev of events) {
+  /** Fold one journal event into the timeline (in journal order). */
+  push(ev: JournalEvent): void {
     const kind = ev.kind
     switch (kind.kind) {
       case 'message_delta': {
         // A delta is a stream continuation — never a boundary.
         const reasoning = kind.reasoning_content ?? ''
-        if (openMessage) {
-          if (kind.content) openMessage.content += kind.content
+        if (this.openMessage) {
+          if (kind.content) this.openMessage.content += kind.content
           if (reasoning) {
-            openMessage.reasoning_content =
-              (openMessage.reasoning_content ?? '') + reasoning
+            this.openMessage.reasoning_content =
+              (this.openMessage.reasoning_content ?? '') + reasoning
           }
         } else {
           const block: MessageBlock = {
@@ -147,43 +131,45 @@ export function buildTimeline(events: JournalEvent[]): TimelineItem[] {
             streaming: true,
             seq: ev.seq,
           }
-          openMessage = block
-          openIdx = items.length
-          items.push({ type: 'message', message: block })
+          this.openMessage = block
+          this.openIdx = this.items_.length
+          this.items_.push({ type: 'message', message: block })
         }
         break
       }
       case 'message': {
-        if (kind.role === 'assistant' && openMessage) {
+        if (kind.role === 'assistant' && this.openMessage) {
           // Finalize the delta-built preview with the canonical message.
-          openMessage.content = kind.content
-          openMessage.reasoning_content = kind.reasoning_content ?? null
-          openMessage.tool_call_id = kind.tool_call_id ?? null
-          openMessage.tool_calls = kind.tool_calls ?? null
-          openMessage.seq = ev.seq
-          openMessage.streaming = false
-          openMessage.truncated = false
-          if (!isRenderableMessage(openMessage)) {
+          this.openMessage.content = kind.content
+          this.openMessage.reasoning_content = kind.reasoning_content ?? null
+          this.openMessage.reasoning_omitted = kind.reasoning_omitted
+          this.openMessage.tool_call_id = kind.tool_call_id ?? null
+          this.openMessage.tool_calls = kind.tool_calls ?? null
+          this.openMessage.seq = ev.seq
+          this.openMessage.streaming = false
+          this.openMessage.truncated = false
+          if (!isRenderableMessage(this.openMessage!)) {
             // A bare tool-call turn (no text, no reasoning): the streamed
             // preview is dropped and the tool blocks carry the action.
-            items.splice(openIdx, 1)
+            this.items_.splice(this.openIdx, 1)
           }
-          openMessage = null
+          this.openMessage = null
           // The finalized message is a boundary: stale streaming tool
           // blocks from an interrupted earlier run are closed too.
-          closeStreamingTools()
+          this.closeStreamingTools()
         } else if (isRenderableMessage(kind)) {
           // A message that does not finalize the in-flight preview — e.g.
           // the user's followup after an interrupted run — is a turn
           // boundary. Closing the stale open preview here is what keeps the
           // next run's `message_delta`s from being appended onto it.
-          closeTurn()
-          items.push({
+          this.closeTurn()
+          this.items_.push({
             type: 'message',
             message: {
               role: kind.role,
               content: kind.content,
               reasoning_content: kind.reasoning_content ?? null,
+              reasoning_omitted: kind.reasoning_omitted,
               tool_call_id: kind.tool_call_id ?? null,
               tool_calls: kind.tool_calls ?? null,
               images: kind.images ?? [],
@@ -198,20 +184,20 @@ export function buildTimeline(events: JournalEvent[]): TimelineItem[] {
         // from a dead run is stale. (Sibling `tool_call_start`s of the same
         // message are journaled back-to-back before any output streams, so
         // closing streaming tools here is a no-op in the normal flow.)
-        closeTurn()
+        this.closeTurn()
         const block: ToolBlock = {
           id: kind.id,
           name: kind.name,
           arguments: kind.arguments,
           startedAt: new Date(ev.ts).getTime(),
         }
-        pending.set(kind.id, block)
-        items.push({ type: 'tool', block })
+        this.pending.set(kind.id, block)
+        this.items_.push({ type: 'tool', block })
         break
       }
       case 'tool_output_delta': {
         // A delta is a stream continuation — never a boundary.
-        const block = pending.get(kind.id)
+        const block = this.pending.get(kind.id)
         if (block) {
           block.output = (block.output ?? '') + kind.output
           block.streaming = true
@@ -221,7 +207,7 @@ export function buildTimeline(events: JournalEvent[]): TimelineItem[] {
       case 'tool_result': {
         // Finalizes only its own block — sibling blocks may legitimately
         // still be streaming (parallel tool calls), so no boundary close.
-        const block = pending.get(kind.id)
+        const block = this.pending.get(kind.id)
         if (block) {
           block.ok = kind.ok
           block.streaming = false
@@ -234,7 +220,7 @@ export function buildTimeline(events: JournalEvent[]): TimelineItem[] {
           } else {
             block.output = `${block.output}\n\n[tool result was truncated by the harness — showing the full streamed output]`
           }
-          pending.delete(kind.id)
+          this.pending.delete(kind.id)
         }
         break
       }
@@ -244,8 +230,8 @@ export function buildTimeline(events: JournalEvent[]): TimelineItem[] {
         // event is journaled by the `spawn_subagent` tool *mid-execution*:
         // sibling tools may still be legitimately streaming, so only the
         // open message preview is closed (a no-op in the normal flow).
-        closeOpenMessage()
-        const block = pending.get(kind.tool_call_id)
+        this.closeOpenMessage()
+        const block = this.pending.get(kind.tool_call_id)
         if (block) block.childId = kind.child_id
         break
       }
@@ -254,14 +240,14 @@ export function buildTimeline(events: JournalEvent[]): TimelineItem[] {
       case 'permission_request':
         // Journaled by their tools mid-execution; sibling tools may still
         // be streaming, so only the open message preview is closed.
-        closeOpenMessage()
-        items.push({ type: 'event', event: ev })
+        this.closeOpenMessage()
+        this.items_.push({ type: 'event', event: ev })
         break
       case 'system_prompt':
         // Session metadata (the system prompt journaled on the first run);
         // never rendered as a chat message. Never coexists with a streaming
         // preview, but closing keeps the invariant uniform.
-        closeTurn()
+        this.closeTurn()
         break
       case 'context_usage':
         // The worker journals this *between* the deltas and the final
@@ -270,15 +256,71 @@ export function buildTimeline(events: JournalEvent[]): TimelineItem[] {
         // final `message` land as a second row. It does end any stale
         // streaming tool block (all of the previous turn's tools have
         // finished by the time the next generate reports usage).
-        closeStreamingTools()
-        items.push({ type: 'event', event: ev })
+        this.closeStreamingTools()
+        this.items_.push({ type: 'event', event: ev })
         break
       default:
         // status_change, mode_change, ask_user_answered,
         // mode_change_request_declined, handoff — all true turn boundaries.
-        closeTurn()
-        items.push({ type: 'event', event: ev })
+        this.closeTurn()
+        this.items_.push({ type: 'event', event: ev })
     }
   }
-  return items
+
+  /** The folded rows (stable array identity — mutated in place by `push`). */
+  items(): TimelineItem[] {
+    return this.items_
+  }
+
+  /** The message block journaled at `seq`, if it is rendered. */
+  messageAt(seq: number): MessageBlock | null {
+    for (const item of this.items_) {
+      if (item.type === 'message' && item.message.seq === seq) return item.message
+    }
+    return null
+  }
+
+  /** Patch a rendered message block in place — used to hydrate a
+   *  light-history message's reasoning once it is fetched on demand. */
+  patchMessage(seq: number, patch: Partial<MessageBlock>): void {
+    const message = this.messageAt(seq)
+    if (message) Object.assign(message, patch)
+  }
+
+  // Close the delta-assembled assistant message preview. The preview can
+  // never be open while tool events / tool-journaled requests arrive (the
+  // assistant `message` is always finalized before tools run), so closing
+  // it at any non-delta event is safe: it keeps its partial text but stops
+  // "streaming" and is marked `truncated` when no canonical `message` ever
+  // finalized it (see the class doc above).
+  private closeOpenMessage(): void {
+    if (this.openMessage) {
+      this.openMessage.streaming = false
+      this.openMessage.truncated = true
+      this.openMessage = null
+      this.openIdx = -1
+    }
+  }
+
+  // Close every streaming tool block. Unlike the open message, this is only
+  // safe at *true* turn boundaries: events that can never arrive while a
+  // sibling tool is legitimately running. (`subagent_started`,
+  // `mode_change_request` and `ask_user_request` are journaled by tools
+  // mid-execution, so they must not close a streaming bash block.)
+  private closeStreamingTools(): void {
+    for (const block of this.pending.values()) block.streaming = false
+  }
+
+  // A true turn boundary closes both.
+  private closeTurn(): void {
+    this.closeOpenMessage()
+    this.closeStreamingTools()
+  }
+}
+
+/** Fold a complete journal event list into renderable items. */
+export function buildTimeline(events: JournalEvent[]): TimelineItem[] {
+  const folder = new TimelineFolder()
+  for (const ev of events) folder.push(ev)
+  return folder.items()
 }

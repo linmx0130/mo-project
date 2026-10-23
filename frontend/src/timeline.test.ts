@@ -7,7 +7,7 @@
 // start a fresh message instead of being appended onto the interrupted one.
 import { describe, expect, it } from 'vitest'
 import type { JournalEvent, JournalEventKind, SessionStatus, ToolCallInfo } from './api'
-import { buildTimeline, type MessageBlock } from './timeline'
+import { TimelineFolder, buildTimeline, type MessageBlock } from './timeline'
 
 let seq = 0
 function ev(kind: JournalEventKind): JournalEvent {
@@ -375,5 +375,72 @@ describe('buildTimeline — the journal seq on message blocks', () => {
     const [asst] = assistantMessages(items)
     expect(asst.content).toBe('final')
     expect(asst.seq).toBe(message.seq)
+  })
+})
+
+describe('TimelineFolder — incremental folding (SSE events folded onto history)', () => {
+  it('matches buildTimeline when events are pushed one by one', () => {
+    const events = [
+      userMsg('hi'),
+      status('running'),
+      delta('he'),
+      delta('llo'),
+      asstMsg('hello'),
+      toolStart('c1'),
+      toolOut('c1', 'partial'),
+      toolRes('c1'),
+    ]
+    const folder = new TimelineFolder()
+    for (const e of events) folder.push(e)
+    expect(folder.items()).toEqual(buildTimeline(events))
+  })
+
+  it('patches a message block in place by seq (lazy reasoning hydration)', () => {
+    const message = asstMsg('hello')
+    const seq = message.seq as number
+    const folder = new TimelineFolder()
+    folder.push(message)
+    expect(folder.messageAt(seq)?.content).toBe('hello')
+    expect(folder.messageAt(seq)?.reasoning_content).toBeFalsy()
+    folder.patchMessage(seq, { reasoning_content: 'deep thoughts' })
+    expect(folder.messageAt(seq)?.reasoning_content).toBe('deep thoughts')
+  })
+
+  it('messageAt returns null and patchMessage is a no-op for unknown seqs', () => {
+    const folder = new TimelineFolder()
+    folder.push(asstMsg('hi'))
+    expect(folder.messageAt(9999)).toBeNull()
+    folder.patchMessage(9999, { reasoning_content: 'x' })
+  })
+})
+
+describe('buildTimeline — light-history messages (reasoning omitted)', () => {
+  it('renders a reasoning_omitted tool-call message as its own row', () => {
+    // Without the flag this assistant message would be an unrenderable bare
+    // tool-call wrapper; the omitted reasoning makes it worth a row (it can
+    // be expanded lazily).
+    const toolCalls: ToolCallInfo[] = [{ id: 'c1', name: 'bash', arguments: '{}' }]
+    const items = buildTimeline([
+      userMsg('do it'),
+      ev({
+        kind: 'message',
+        role: 'assistant',
+        content: '',
+        reasoning_omitted: true,
+        tool_calls: toolCalls,
+      }),
+      toolStart('c1'),
+      toolRes('c1'),
+    ])
+    const assistants = assistantMessages(items)
+    expect(assistants).toHaveLength(1)
+    expect(assistants[0].reasoning_omitted).toBe(true)
+  })
+
+  it('keeps the flag on a plain light message block', () => {
+    const items = buildTimeline([
+      ev({ kind: 'message', role: 'assistant', content: 'answer', reasoning_omitted: true }),
+    ])
+    expect(assistantMessages(items)[0].reasoning_omitted).toBe(true)
   })
 })
