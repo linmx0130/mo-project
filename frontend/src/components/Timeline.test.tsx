@@ -176,3 +176,43 @@ describe('MessageRow — lazy reasoning (light history)', () => {
     expect(html).not.toContain('click to load')
   })
 })
+
+describe('ToolBlockRow — lazy tool output (light history)', () => {
+  const omitted: ToolBlock = {
+    id: 'c1',
+    name: 'bash',
+    arguments: '{"command":"cat big.log"}',
+    output: 'first lines…',
+    ok: true,
+    resultSeq: 7,
+    outputOmitted: true,
+    outputChars: 12345,
+  }
+
+  it('offers the full-output affordance and hides copy while omitted', () => {
+    const html = renderToStaticMarkup(
+      <ToolBlockRow
+        block={omitted}
+        now={Date.now()}
+        onLoadOutput={async () => {}}
+      />,
+    )
+    expect(html).toContain('show full output')
+    expect(html).toContain('12345 characters in total')
+    expect(html).toContain('first lines…')
+    expect(html).not.toContain('copy-btn')
+  })
+
+  it('renders the complete output with copy once hydrated', () => {
+    const html = renderToStaticMarkup(
+      <ToolBlockRow
+        block={{ ...omitted, output: 'the complete text', outputOmitted: false }}
+        now={Date.now()}
+        onLoadOutput={async () => {}}
+      />,
+    )
+    expect(html).toContain('the complete text')
+    expect(html).not.toContain('show full output')
+    expect(html).toContain('copy-btn')
+  })
+})

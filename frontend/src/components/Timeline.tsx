@@ -373,13 +373,19 @@ export function ToolBlockRow({
   block,
   now,
   onOpenSubagent,
+  onLoadOutput,
 }: {
   block: ToolBlock
   now: number
   /** Called with the subagent session id when the "view subagent" button
    *  is clicked (only for `spawn_subagent` blocks that spawned a child). */
   onOpenSubagent?: (childId: string) => void
+  /** Load a light-history tool block's complete output (the caller patches
+   *  the folded block, so the preview is replaced in place). */
+  onLoadOutput?: (resultSeq: number) => Promise<void>
 }) {
+  const [loadingOutput, setLoadingOutput] = useState(false)
+  const [outputFailed, setOutputFailed] = useState(false)
   const elapsedSecs =
     block.startedAt !== undefined
       ? Math.max(0, Math.floor((now - block.startedAt) / 1000))
@@ -409,15 +415,19 @@ export function ToolBlockRow({
             {block.ok ? 'ok' : 'error'}
           </span>
         )}
-        {block.output !== undefined && block.output.length > 0 && (
-          // Copy the tool's output (what the model received). The wrapper
-          // stops the click from toggling the surrounding <details>, like
-          // the "view subagent" button below. Disabled while output is still
-          // streaming so the user can't grab a partial result.
-          <span className="tool-copy" onClick={(e) => e.stopPropagation()}>
-            <CopyButton content={block.output} disabled={block.streaming} />
-          </span>
-        )}
+        {!block.outputOmitted &&
+          block.output !== undefined &&
+          block.output.length > 0 && (
+            // Copy the tool's output (what the model received). The wrapper
+            // stops the click from toggling the surrounding <details>, like
+            // the "view subagent" button below. Disabled while output is
+            // still streaming so the user can't grab a partial result, and
+            // hidden while only a light-history preview is loaded (copying
+            // a preview would be wrong).
+            <span className="tool-copy" onClick={(e) => e.stopPropagation()}>
+              <CopyButton content={block.output} disabled={block.streaming} />
+            </span>
+          )}
         {block.childId && (
           <button
             type="button"
@@ -435,6 +445,38 @@ export function ToolBlockRow({
       </summary>
       {block.output !== undefined && (
         <pre className="tool-output">{block.output}</pre>
+      )}
+      {block.outputOmitted && (
+        // The light history served only a bounded preview of this output;
+        // the complete text is fetched on demand (and patches the block in
+        // place, keeping this <details> open).
+        <div className="tool-load-row">
+          <span className="muted">
+            truncated preview
+            {block.outputChars !== undefined
+              ? ` — ${block.outputChars} characters in total`
+              : ''}
+          </span>
+          <button
+            type="button"
+            className="subagent-link"
+            disabled={loadingOutput || typeof block.resultSeq !== 'number'}
+            onClick={() => {
+              if (!onLoadOutput || typeof block.resultSeq !== 'number') return
+              setLoadingOutput(true)
+              setOutputFailed(false)
+              onLoadOutput(block.resultSeq)
+                .catch(() => setOutputFailed(true))
+                .finally(() => setLoadingOutput(false))
+            }}
+          >
+            {loadingOutput
+              ? 'loading…'
+              : outputFailed
+                ? 'failed — retry'
+                : 'show full output'}
+          </button>
+        </div>
       )}
     </details>
   )

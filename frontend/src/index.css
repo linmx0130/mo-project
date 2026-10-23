@@ -1533,6 +1533,14 @@ p {
   display: inline-flex;
 }
 
+.tool-load-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px 10px;
+  font-size: 12px;
+}
+
 .tool-output {
   margin: 0;
   padding: 10px 14px;

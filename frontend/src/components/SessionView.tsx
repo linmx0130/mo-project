@@ -448,6 +448,21 @@ export default function SessionView({
     return full
   }
 
+  /** Load a light-history tool block's complete output on demand (the
+   *  history load serves a bounded preview) and patch the folded block in
+   *  place, so the text renders inside the already-open details element. */
+  const loadToolOutput = async (seq: number): Promise<void> => {
+    const ev = await getFullEvent(session.id, seq)
+    if (ev.kind.kind === 'tool_result') {
+      folder.patchToolResult(seq, {
+        output: ev.kind.output,
+        outputOmitted: false,
+        outputChars: undefined,
+      })
+      bump()
+    }
+  }
+
   /** Approve the pending mode-change request: the backend switches the
    *  session's mode to the requested one and continues the run with a
    *  single mode-change message. */
@@ -585,6 +600,7 @@ export default function SessionView({
                   block={item.block}
                   now={now}
                   onOpenSubagent={(childId) => setSubagentId(childId)}
+                  onLoadOutput={(seq) => loadToolOutput(seq)}
                 />
               )
             case 'event':

@@ -128,6 +128,19 @@ export default function SubagentModal({ childId, onClose }: Props) {
     setVersion((v) => v + 1)
     return full
   }
+
+  /** Load a light-history tool block's complete output on demand. */
+  const loadToolOutput = async (seq: number): Promise<void> => {
+    const ev = await getFullEvent(childId, seq)
+    if (ev.kind.kind === 'tool_result') {
+      folder.patchToolResult(seq, {
+        output: ev.kind.output,
+        outputOmitted: false,
+        outputChars: undefined,
+      })
+      setVersion((v) => v + 1)
+    }
+  }
   const anyToolStreaming = timeline.some(
     (item) => item.type === 'tool' && item.block.streaming,
   )
@@ -188,6 +201,7 @@ export default function SubagentModal({ childId, onClose }: Props) {
                     key={`${item.block.id}-${i}`}
                     block={item.block}
                     now={now}
+                    onLoadOutput={(seq) => loadToolOutput(seq)}
                   />
                 )
               case 'event':
