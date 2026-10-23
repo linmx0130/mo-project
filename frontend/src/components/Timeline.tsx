@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { imageUrl } from '../api'
@@ -171,6 +172,7 @@ export function MessageRow({
   sessionId,
   onFork,
   forkingSeq = null,
+  onLoadReasoning,
 }: {
   message: MessageBlock
   /** The session the message belongs to, for rendering attached images
@@ -184,6 +186,10 @@ export function MessageRow({
   /** The seq of the message whose fork request is in flight: that row shows
    *  "Creating…" and every fork button is disabled until it settles. */
   forkingSeq?: number | null
+  /** Load a light-history message's reasoning on demand (the history
+   *  endpoint omits it and marks the message `reasoning_omitted`); the
+   *  caller patches the message block with the loaded text. */
+  onLoadReasoning?: (seq: number) => Promise<string | null>
 }) {
   const role = message.role
   if (role === 'tool') {
@@ -282,14 +288,20 @@ export function MessageRow({
           <CopyButton content={message.content} disabled={message.streaming} />
         )}
       </div>
-      {message.reasoning_content && (
-        // While reasoning is streaming, force the block open so the tokens
-        // are visible as they arrive; once the run settles the `open` prop
-        // is removed and the details stay in whatever state the user left.
-        <details className="reasoning" open={message.streaming || undefined}>
-          <summary>reasoning</summary>
-          <pre>{message.reasoning_content}</pre>
-        </details>
+      {message.reasoning_omitted ? (
+        // A light-history message: the reasoning was omitted from the
+        // history load and is fetched the first time the block is expanded.
+        <LazyReasoning message={message} onLoad={onLoadReasoning} />
+      ) : (
+        message.reasoning_content && (
+          // While reasoning is streaming, force the block open so the tokens
+          // are visible as they arrive; once the run settles the `open` prop
+          // is removed and the details stay in whatever state the user left.
+          <details className="reasoning" open={message.streaming || undefined}>
+            <summary>reasoning</summary>
+            <pre>{message.reasoning_content}</pre>
+          </details>
+        )
       )}
       {message.content && (
         <div className="msg-content markdown">
@@ -312,17 +324,81 @@ export function MessageRow({
   )
 }
 
+/** A light-history message's reasoning, loaded from
+ *  `GET /api/sessions/:id/history/:seq` the first time the block is
+ *  expanded. The message stays `reasoning_omitted` after hydration (the
+ *  caller only patches `reasoning_content`), so the details element stays
+ *  mounted — and open — while the text appears. A failed fetch is not
+ *  permanent: re-opening the block (or the retry button) tries again. */
+function LazyReasoning({
+  message,
+  onLoad,
+}: {
+  message: MessageBlock
+  onLoad?: (seq: number) => Promise<string | null>
+}) {
+  const seq = message.seq
+  const [loading, setLoading] = useState(false)
+  const [failed, setFailed] = useState(false)
+  const [empty, setEmpty] = useState(false)
+  const load = () => {
+    // `failed` is deliberately not part of the guard: a transient network
+    // error must not poison the block — re-opening it (or the retry button)
+    // tries again.
+    if (loading || empty || message.reasoning_content) return
+    if (!onLoad || typeof seq !== 'number') return
+    setLoading(true)
+    setFailed(false)
+    onLoad(seq)
+      .then((text) => {
+        if (!text) setEmpty(true)
+      })
+      .catch(() => setFailed(true))
+      .finally(() => setLoading(false))
+  }
+  return (
+    <details
+      className="reasoning"
+      onToggle={(e) => {
+        if ((e.target as HTMLDetailsElement).open) load()
+      }}
+    >
+      <summary>
+        {message.reasoning_content ? 'reasoning' : 'reasoning (click to load)'}
+      </summary>
+      {loading && <span className="muted">loading…</span>}
+      {failed && (
+        <span className="muted">
+          failed to load reasoning{' '}
+          {/* Same affordance as the tool-output row below. */}
+          <button type="button" className="subagent-link" onClick={load}>
+            retry
+          </button>
+        </span>
+      )}
+      {empty && <span className="muted">(no reasoning)</span>}
+      {message.reasoning_content && <pre>{message.reasoning_content}</pre>}
+    </details>
+  )
+}
+
 export function ToolBlockRow({
   block,
   now,
   onOpenSubagent,
+  onLoadOutput,
 }: {
   block: ToolBlock
   now: number
   /** Called with the subagent session id when the "view subagent" button
    *  is clicked (only for `spawn_subagent` blocks that spawned a child). */
   onOpenSubagent?: (childId: string) => void
+  /** Load a light-history tool block's complete output (the caller patches
+   *  the folded block, so the preview is replaced in place). */
+  onLoadOutput?: (resultSeq: number) => Promise<void>
 }) {
+  const [loadingOutput, setLoadingOutput] = useState(false)
+  const [outputFailed, setOutputFailed] = useState(false)
   const elapsedSecs =
     block.startedAt !== undefined
       ? Math.max(0, Math.floor((now - block.startedAt) / 1000))
@@ -352,15 +428,19 @@ export function ToolBlockRow({
             {block.ok ? 'ok' : 'error'}
           </span>
         )}
-        {block.output !== undefined && block.output.length > 0 && (
-          // Copy the tool's output (what the model received). The wrapper
-          // stops the click from toggling the surrounding <details>, like
-          // the "view subagent" button below. Disabled while output is still
-          // streaming so the user can't grab a partial result.
-          <span className="tool-copy" onClick={(e) => e.stopPropagation()}>
-            <CopyButton content={block.output} disabled={block.streaming} />
-          </span>
-        )}
+        {!block.outputOmitted &&
+          block.output !== undefined &&
+          block.output.length > 0 && (
+            // Copy the tool's output (what the model received). The wrapper
+            // stops the click from toggling the surrounding <details>, like
+            // the "view subagent" button below. Disabled while output is
+            // still streaming so the user can't grab a partial result, and
+            // hidden while only a light-history preview is loaded (copying
+            // a preview would be wrong).
+            <span className="tool-copy" onClick={(e) => e.stopPropagation()}>
+              <CopyButton content={block.output} disabled={block.streaming} />
+            </span>
+          )}
         {block.childId && (
           <button
             type="button"
@@ -378,6 +458,38 @@ export function ToolBlockRow({
       </summary>
       {block.output !== undefined && (
         <pre className="tool-output">{block.output}</pre>
+      )}
+      {block.outputOmitted && (
+        // The light history served only a bounded preview of this output;
+        // the complete text is fetched on demand (and patches the block in
+        // place, keeping this <details> open).
+        <div className="tool-load-row">
+          <span className="muted">
+            truncated preview
+            {block.outputChars !== undefined
+              ? ` — ${block.outputChars} characters in total`
+              : ''}
+          </span>
+          <button
+            type="button"
+            className="subagent-link"
+            disabled={loadingOutput || typeof block.resultSeq !== 'number'}
+            onClick={() => {
+              if (!onLoadOutput || typeof block.resultSeq !== 'number') return
+              setLoadingOutput(true)
+              setOutputFailed(false)
+              onLoadOutput(block.resultSeq)
+                .catch(() => setOutputFailed(true))
+                .finally(() => setLoadingOutput(false))
+            }}
+          >
+            {loadingOutput
+              ? 'loading…'
+              : outputFailed
+                ? 'failed — retry'
+                : 'show full output'}
+          </button>
+        </div>
       )}
     </details>
   )

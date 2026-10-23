@@ -576,7 +576,13 @@ pub enum JournalEventKind {
     ///
     /// `id` matches the tool call id of the preceding `ToolCallStart`
     /// event; readers append the chunks to that tool block until the final
-    /// `ToolResult` event (with the complete, capped output) arrives.
+    /// `ToolResult` event (with the complete, capped output) arrives. The id
+    /// is only unique *within a run*: providers may number their calls per
+    /// response (`call_0`, `call_1`, …) and reuse those ids in a later run,
+    /// and a run that died mid-stream leaves its id for the resumed run to
+    /// repeat. Readers must therefore pair a delta with the nearest
+    /// preceding `ToolCallStart` of that id, never with "the" result for the
+    /// id (the light history in `mo_gateway::history` does exactly that).
     ToolOutputDelta {
         id: String,
         name: String,

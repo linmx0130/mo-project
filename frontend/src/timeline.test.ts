@@ -7,7 +7,12 @@
 // start a fresh message instead of being appended onto the interrupted one.
 import { describe, expect, it } from 'vitest'
 import type { JournalEvent, JournalEventKind, SessionStatus, ToolCallInfo } from './api'
-import { buildTimeline, type MessageBlock } from './timeline'
+import {
+  TimelineFolder,
+  buildTimeline,
+  type MessageBlock,
+  type ToolBlock,
+} from './timeline'
 
 let seq = 0
 function ev(kind: JournalEventKind): JournalEvent {
@@ -375,5 +380,189 @@ describe('buildTimeline — the journal seq on message blocks', () => {
     const [asst] = assistantMessages(items)
     expect(asst.content).toBe('final')
     expect(asst.seq).toBe(message.seq)
+  })
+})
+
+describe('TimelineFolder — incremental folding (SSE events folded onto history)', () => {
+  it('matches buildTimeline when events are pushed one by one', () => {
+    const events = [
+      userMsg('hi'),
+      status('running'),
+      delta('he'),
+      delta('llo'),
+      asstMsg('hello'),
+      toolStart('c1'),
+      toolOut('c1', 'partial'),
+      toolRes('c1'),
+    ]
+    const folder = new TimelineFolder()
+    for (const e of events) folder.push(e)
+    expect(folder.items()).toEqual(buildTimeline(events))
+  })
+
+  it('patches a message block in place by seq (lazy reasoning hydration)', () => {
+    const message = asstMsg('hello')
+    const seq = message.seq as number
+    const folder = new TimelineFolder()
+    folder.push(message)
+    expect(folder.messageAt(seq)?.content).toBe('hello')
+    expect(folder.messageAt(seq)?.reasoning_content).toBeFalsy()
+    folder.patchMessage(seq, { reasoning_content: 'deep thoughts' })
+    expect(folder.messageAt(seq)?.reasoning_content).toBe('deep thoughts')
+  })
+
+  it('messageAt returns null and patchMessage is a no-op for unknown seqs', () => {
+    const folder = new TimelineFolder()
+    folder.push(asstMsg('hi'))
+    expect(folder.messageAt(9999)).toBeNull()
+    folder.patchMessage(9999, { reasoning_content: 'x' })
+  })
+})
+
+describe('buildTimeline — light-history messages (reasoning omitted)', () => {
+  it('renders a reasoning_omitted tool-call message as its own row', () => {
+    // Without the flag this assistant message would be an unrenderable bare
+    // tool-call wrapper; the omitted reasoning makes it worth a row (it can
+    // be expanded lazily).
+    const toolCalls: ToolCallInfo[] = [{ id: 'c1', name: 'bash', arguments: '{}' }]
+    const items = buildTimeline([
+      userMsg('do it'),
+      ev({
+        kind: 'message',
+        role: 'assistant',
+        content: '',
+        reasoning_omitted: true,
+        tool_calls: toolCalls,
+      }),
+      toolStart('c1'),
+      toolRes('c1'),
+    ])
+    const assistants = assistantMessages(items)
+    expect(assistants).toHaveLength(1)
+    expect(assistants[0].reasoning_omitted).toBe(true)
+  })
+
+  it('keeps the flag on a plain light message block', () => {
+    const items = buildTimeline([
+      ev({ kind: 'message', role: 'assistant', content: 'answer', reasoning_omitted: true }),
+    ])
+    expect(assistantMessages(items)[0].reasoning_omitted).toBe(true)
+  })
+})
+
+describe('buildTimeline — repeated tool-call ids across runs', () => {
+  // Providers may number their calls per response (`call_0`, `call_1`, …), so
+  // a later run can repeat an id — and a run that died mid-stream leaves its
+  // id for the resumed run to repeat. The folded timeline therefore pairs
+  // deltas/results with the *nearest preceding* `tool_call_start`, and the
+  // light history keeps both runs' previews (see the gateway's
+  // `superseded_tool_output_deltas`).
+  const toolBlocks = (items: ReturnType<typeof buildTimeline>): ToolBlock[] =>
+    items.flatMap((i) => (i.type === 'tool' ? [i.block] : []))
+
+  it("keeps a dead run's preview in its own block", () => {
+    const items = buildTimeline([
+      toolStart('call_1'),
+      toolOut('call_1', 'dead output'),
+      // The run died here (no `tool_result`); the resumed run repeats the id.
+      toolStart('call_1'),
+      toolOut('call_1', 'live output'),
+      toolRes('call_1', true, 'live output'),
+    ])
+    const blocks = toolBlocks(items)
+    expect(blocks.length).toBe(2)
+    expect(blocks[0].output).toBe('dead output')
+    // The new start closed the stale block: it no longer looks running.
+    expect(blocks[0].streaming).toBe(false)
+    expect(blocks[0].resultSeq).toBeUndefined()
+    expect(blocks[1].output).toBe('live output')
+    expect(blocks[1].streaming).toBe(false)
+    expect(blocks[1].resultSeq).toEqual(expect.any(Number))
+  })
+
+  it("does not append a new run's deltas to an earlier run's finished block", () => {
+    const items = buildTimeline([
+      toolStart('call_1'),
+      toolOut('call_1', 'run1'),
+      toolRes('call_1', true, 'run1'),
+      toolStart('call_1'),
+      toolOut('call_1', 'run2 streaming'),
+    ])
+    const blocks = toolBlocks(items)
+    expect(blocks.length).toBe(2)
+    expect(blocks[0].output).toBe('run1')
+    expect(blocks[1].output).toBe('run2 streaming')
+    expect(blocks[1].streaming).toBe(true)
+  })
+})
+
+describe('buildTimeline — lazy tool output (light history)', () => {
+  it('records the result seq and the omitted-output markers', () => {
+    const result = ev({
+      kind: 'tool_result',
+      id: 'c1',
+      name: 'bash',
+      ok: true,
+      output: 'preview',
+      output_omitted: true,
+      output_chars: 12345,
+    })
+    const items = buildTimeline([toolStart('c1'), result])
+    const item = items.find((i) => i.type === 'tool')
+    if (item?.type !== 'tool') throw new Error('expected a tool block')
+    expect(item.block.output).toBe('preview')
+    expect(item.block.outputOmitted).toBe(true)
+    expect(item.block.outputChars).toBe(12345)
+    expect(item.block.resultSeq).toBe(result.seq)
+  })
+
+  it('leaves a complete output unflagged but still records the result seq', () => {
+    const result = ev({
+      kind: 'tool_result',
+      id: 'c1',
+      name: 'bash',
+      ok: true,
+      output: 'done',
+    })
+    const items = buildTimeline([toolStart('c1'), result])
+    const item = items[0]
+    if (item.type !== 'tool') throw new Error('expected a tool block')
+    expect(item.block.outputOmitted).toBe(false)
+    expect(item.block.outputChars).toBeUndefined()
+    expect(item.block.resultSeq).toBe(result.seq)
+  })
+})
+
+describe('TimelineFolder — patchToolResult', () => {
+  it('hydrates the block finalized by that result seq', () => {
+    const folder = new TimelineFolder()
+    folder.push(toolStart('c1'))
+    const result = ev({
+      kind: 'tool_result',
+      id: 'c1',
+      name: 'bash',
+      ok: true,
+      output: 'preview',
+      output_omitted: true,
+      output_chars: 9999,
+    })
+    folder.push(result)
+    folder.patchToolResult(result.seq as number, {
+      output: 'the full text',
+      outputOmitted: false,
+    })
+    const item = folder.items()[0]
+    if (item.type !== 'tool') throw new Error('expected a tool block')
+    expect(item.block.output).toBe('the full text')
+    expect(item.block.outputOmitted).toBe(false)
+  })
+
+  it('is a no-op for an unknown seq', () => {
+    const folder = new TimelineFolder()
+    folder.push(toolStart('c1'))
+    folder.patchToolResult(9999, { output: 'nope' }) // must not throw
+    const item = folder.items()[0]
+    if (item.type !== 'tool') throw new Error('expected a tool block')
+    expect(item.block.output).toBeUndefined()
   })
 })

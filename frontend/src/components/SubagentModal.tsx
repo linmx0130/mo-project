@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { JournalEvent, Mode, Session, SessionStatus } from '../api'
-import { getHistory, getSession } from '../api'
-import { buildTimeline, isTerminal } from '../timeline'
+import { getHistory, getFullEvent, getSession } from '../api'
+import { TimelineFolder, isTerminal } from '../timeline'
 import { EventRow, MessageRow, ToolBlockRow } from './Timeline'
 
 interface Props {
@@ -18,10 +18,18 @@ interface Props {
  *  message, seeded into its journal by the parent worker). The modal
  *  watches the child's journal exactly like the session view: history +
  *  SSE tail, closing once the status is terminal and the journal drains.
- */
+ *
+ *  The parent keys the modal by child id, so one instance only ever shows
+ *  one child: switching children remounts, and no per-child state has to be
+ *  reset in place. */
 export default function SubagentModal({ childId, onClose }: Props) {
   const [session, setSession] = useState<Session | null>(null)
-  const [events, setEvents] = useState<JournalEvent[]>([])
+  // Incremental fold state (same pattern as the session view): the light
+  // history seeds the folder once, the SSE tail folds into it in place.
+  // The folder lives in state because it is read during render; it stays
+  // null until this child's history has arrived (see the effect).
+  const [folder, setFolder] = useState<TimelineFolder | null>(null)
+  const [version, setVersion] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [now, setNow] = useState(() => Date.now())
   const lastSeqRef = useRef<number | null>(null)
@@ -33,18 +41,42 @@ export default function SubagentModal({ childId, onClose }: Props) {
     let es: EventSource | null = null
     terminalSeenRef.current = false
 
+    // The folder is created lazily on the first event (never synchronously
+    // in the effect body, which the hooks lint rule forbids).
+    let activeFolder: TimelineFolder | null = null
+    const ensureFolder = () => {
+      if (!activeFolder) {
+        activeFolder = new TimelineFolder()
+        setFolder(activeFolder)
+      }
+      return activeFolder
+    }
+    const applyEvent = (ev: JournalEvent) => {
+      if (typeof ev.seq === 'number') lastSeqRef.current = ev.seq
+      ensureFolder().push(ev)
+      if (ev.kind.kind === 'status_change') {
+        const newStatus = ev.kind.status
+        const newError = ev.kind.error ?? null
+        setSession((prev) =>
+          prev ? { ...prev, status: newStatus, error: newError } : prev,
+        )
+        if (isTerminal(newStatus)) terminalSeenRef.current = true
+      }
+    }
+
     ;(async () => {
       try {
+        // The light history (superseded previews dropped, old reasoning
+        // omitted — expandable per message via `getFullEvent`).
         const [current, history] = await Promise.all([
           getSession(childId),
           getHistory(childId),
         ])
         if (cancelled) return
         setSession(current)
-        setEvents(history)
-        lastSeqRef.current =
-          history.length > 0 ? history[history.length - 1].seq : null
+        for (const ev of history) applyEvent(ev)
         if (isTerminal(current.status)) terminalSeenRef.current = true
+        setVersion((v) => v + 1)
 
         const cursor =
           lastSeqRef.current !== null
@@ -52,17 +84,8 @@ export default function SubagentModal({ childId, onClose }: Props) {
             : ''
         es = new EventSource(`/api/sessions/${childId}/events${cursor}`)
         es.onmessage = (msg) => {
-          const ev = JSON.parse(msg.data) as JournalEvent
-          if (typeof ev.seq === 'number') lastSeqRef.current = ev.seq
-          setEvents((prev) => [...prev, ev])
-          if (ev.kind.kind === 'status_change') {
-            const newStatus = ev.kind.status
-            const newError = ev.kind.error ?? null
-            setSession((prev) =>
-              prev ? { ...prev, status: newStatus, error: newError } : prev,
-            )
-            if (isTerminal(newStatus)) terminalSeenRef.current = true
-          }
+          applyEvent(JSON.parse(msg.data) as JournalEvent)
+          setVersion((v) => v + 1)
         }
         es.onerror = () => {
           // The gateway closes the stream once the session is terminal and
@@ -95,9 +118,33 @@ export default function SubagentModal({ childId, onClose }: Props) {
   useEffect(() => {
     const el = timelineRef.current
     if (el) el.scrollTop = el.scrollHeight
-  }, [events])
+  }, [version])
 
-  const timeline = buildTimeline(events)
+  // Before this child's history arrives there is no folder yet.
+  const timeline = folder ? folder.items() : []
+
+  /** Load one light-history message's reasoning on demand. */
+  const loadReasoning = async (seq: number): Promise<string | null> => {
+    const ev = await getFullEvent(childId, seq)
+    const full =
+      ev.kind.kind === 'message' ? (ev.kind.reasoning_content ?? '') : ''
+    folder?.patchMessage(seq, { reasoning_content: full })
+    setVersion((v) => v + 1)
+    return full
+  }
+
+  /** Load a light-history tool block's complete output on demand. */
+  const loadToolOutput = async (seq: number): Promise<void> => {
+    const ev = await getFullEvent(childId, seq)
+    if (ev.kind.kind === 'tool_result') {
+      folder?.patchToolResult(seq, {
+        output: ev.kind.output,
+        outputOmitted: false,
+        outputChars: undefined,
+      })
+      setVersion((v) => v + 1)
+    }
+  }
   const anyToolStreaming = timeline.some(
     (item) => item.type === 'tool' && item.block.streaming,
   )
@@ -145,13 +192,20 @@ export default function SubagentModal({ childId, onClose }: Props) {
           {timeline.map((item, i) => {
             switch (item.type) {
               case 'message':
-                return <MessageRow key={`msg-${i}`} message={item.message} />
+                return (
+                  <MessageRow
+                    key={`msg-${i}`}
+                    message={item.message}
+                    onLoadReasoning={(seq) => loadReasoning(seq)}
+                  />
+                )
               case 'tool':
                 return (
                   <ToolBlockRow
                     key={`${item.block.id}-${i}`}
                     block={item.block}
                     now={now}
+                    onLoadOutput={(seq) => loadToolOutput(seq)}
                   />
                 )
               case 'event':

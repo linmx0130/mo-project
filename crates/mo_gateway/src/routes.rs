@@ -55,6 +55,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/history", get(history))
         .route("/api/sessions/{id}/events", get(sse::events))
         .route("/api/sessions/{id}/messages", post(send_message))
+        .route("/api/sessions/{id}/history/{seq}", get(event_at))
         .route("/api/sessions/{id}/fork", post(fork_session))
         .route("/api/sessions/{id}/skills/load", post(load_skill))
         .route("/api/sessions/{id}/mode", post(switch_mode))
@@ -1659,14 +1660,25 @@ fn delete_descendants(state: &AppState, id: &str) {
 #[derive(Deserialize)]
 struct HistoryQuery {
     after_seq: Option<u64>,
+    /// `light`/absent (the default) = the light projection (superseded
+    /// streaming previews dropped, reasoning stripped from finalized
+    /// assistant messages); `full` = the complete journal events (opt-in).
+    detail: Option<String>,
 }
 
-/// GET /api/sessions/:id/history?after_seq=N — journal events after N.
+/// GET /api/sessions/:id/history?after_seq=N&detail=light|full — journal
+/// events after N.
+///
+/// The **light** form is the default: a long history must not ship the bulk
+/// of the journal (streaming previews + reasoning) to the browser. One
+/// omitted payload (a message's reasoning, a long tool output) is fetched on
+/// demand via `GET /api/sessions/:id/history/:seq`. `detail=full` serves the
+/// complete events (tests, debugging).
 async fn history(
     State(state): State<Arc<AppState>>,
     PathParam(id): PathParam<String>,
     Query(query): Query<HistoryQuery>,
-) -> ApiResult<Json<Vec<JournalEvent>>> {
+) -> ApiResult<Json<Vec<serde_json::Value>>> {
     let journal_path = {
         let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
         match db::get_session(&conn, &id).map_err(ApiError::internal)? {
@@ -1679,7 +1691,40 @@ async fn history(
         Some(after) => mo_core::read_events_after(Path::new(&journal_path), after),
     }
     .map_err(ApiError::internal)?;
-    Ok(Json(events))
+    let body = match query.detail.as_deref() {
+        Some("full") => events
+            .into_iter()
+            .map(|event| serde_json::to_value(event).map_err(ApiError::internal))
+            .collect::<ApiResult<Vec<_>>>()?,
+        None | Some("light") => crate::history::light_history(events),
+        Some(other) => {
+            return Err(ApiError::bad_request(format!(
+                "unknown detail: {other} (expected light or full)"
+            )));
+        }
+    };
+    Ok(Json(body))
+}
+
+/// GET /api/sessions/:id/history/:seq — the complete journal event at `seq`
+/// (any kind: a `message` with its reasoning, a `tool_result` with its full
+/// output, …), for the UI's lazy hydration of the light history. 404 for
+/// unknown sessions and unknown seqs.
+async fn event_at(
+    State(state): State<Arc<AppState>>,
+    PathParam((id, seq)): PathParam<(String, u64)>,
+) -> ApiResult<Json<JournalEvent>> {
+    let journal_path = {
+        let conn = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        match db::get_session(&conn, &id).map_err(ApiError::internal)? {
+            Some(session) => session.journal_path,
+            None => return Err(ApiError::not_found("session not found")),
+        }
+    };
+    match mo_core::read_event_at(Path::new(&journal_path), seq).map_err(ApiError::internal)? {
+        Some(event) => Ok(Json(event)),
+        None => Err(ApiError::not_found("event not found")),
+    }
 }
 
 /// POST /api/sessions/:id/cancel — SIGTERM/SIGKILL the worker tree, mark
